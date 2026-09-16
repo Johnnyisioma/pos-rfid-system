@@ -1,0 +1,15 @@
+# Nixpacks build plan for Railway.
+# The client is a separate npm workspace, so the build step installs and
+# compiles it before the server is started.
+
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm install --no-audit --no-fund"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "npm start"
