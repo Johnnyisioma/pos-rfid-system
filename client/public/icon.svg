@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="POS RFID">
+  <rect width="512" height="512" rx="96" fill="#0f172a"/>
+  <rect x="112" y="150" width="288" height="212" rx="24" fill="#1e293b" stroke="#337dff" stroke-width="12"/>
+  <rect x="150" y="192" width="212" height="52" rx="10" fill="#337dff" opacity="0.9"/>
+  <circle cx="176" cy="300" r="16" fill="#94a3b8"/>
+  <circle cx="232" cy="300" r="16" fill="#94a3b8"/>
+  <circle cx="288" cy="300" r="16" fill="#94a3b8"/>
+  <circle cx="344" cy="300" r="16" fill="#22c55e"/>
+  <g stroke="#22c55e" stroke-width="14" fill="none" stroke-linecap="round">
+    <path d="M392 196a56 56 0 0 1 0 120"/>
+    <path d="M414 168a92 92 0 0 1 0 176" opacity="0.6"/>
+  </g>
+</svg>
