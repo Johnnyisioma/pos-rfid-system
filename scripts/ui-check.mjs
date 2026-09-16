@@ -1,0 +1,195 @@
+/**
+ * Headless UI smoke test: logs in, visits every screen, records console errors
+ * and failed requests, and saves screenshots.
+ *
+ *   node scripts/ui-check.mjs [--shots]
+ */
+import { chromium } from 'playwright';
+import fs from 'fs';
+import path from 'path';
+
+const BASE = process.env.BASE || 'http://localhost:3000';
+const SHOT_DIR = process.env.SHOT_DIR || '/tmp/pos-shots';
+const wantShots = process.argv.includes('--shots');
+
+const PAGES = [
+  ['dashboard', '/'],
+  ['pos', '/pos'],
+  ['products', '/products'],
+  ['product-new', '/products/new'],
+  ['import-export', '/import-export'],
+  ['inventory', '/inventory'],
+  ['purchases', '/purchases'],
+  ['transfers', '/transfers'],
+  ['rfid-units', '/rfid'],
+  ['rfid-scan', '/rfid/scan'],
+  ['rfid-stock-take', '/rfid/stock-take'],
+  ['rfid-find', '/rfid/find'],
+  ['customers', '/customers'],
+  ['sales', '/sales'],
+  ['returns', '/returns'],
+  ['register', '/register'],
+  ['expenses', '/expenses'],
+  ['reports', '/reports'],
+  ['settings', '/settings'],
+  ['devices', '/devices'],
+  ['audit', '/audit'],
+  ['stock-take-mode', '/stock-take-mode'],
+];
+
+const IGNORE = [
+  /favicon/i,
+  /ServiceWorker/i,
+  /sw\.js/i,
+  /Download the React DevTools/i,
+  /net::ERR_ABORTED/i,   // in-flight request cancelled by the next navigation
+];
+
+fs.mkdirSync(SHOT_DIR, { recursive: true });
+
+const problems = [];
+
+async function run() {
+  const browser = await chromium.launch({
+    args: ['--no-sandbox'],
+    executablePath: process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
+  });
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 950 } });
+  const page = await ctx.newPage();
+
+  let currentLabel = 'startup';
+  page.on('console', (msg) => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (IGNORE.some((r) => r.test(text))) return;
+    problems.push({ page: currentLabel, kind: 'console', text });
+  });
+  page.on('pageerror', (err) => {
+    problems.push({ page: currentLabel, kind: 'pageerror', text: err.message });
+  });
+  page.on('requestfailed', (req) => {
+    const text = `${req.method()} ${req.url()} — ${req.failure()?.errorText}`;
+    if (IGNORE.some((r) => r.test(text))) return;
+    problems.push({ page: currentLabel, kind: 'requestfailed', text });
+  });
+  page.on('response', (res) => {
+    if (res.status() >= 400 && res.url().includes('/api/')) {
+      problems.push({ page: currentLabel, kind: 'http', text: `${res.status()} ${res.url()}` });
+    }
+  });
+
+  // --- login ---
+  currentLabel = 'login';
+  await page.goto(`${BASE}/login`, { waitUntil: 'networkidle' });
+  await page.fill('input[type=email]', 'admin@millzee.test');
+  await page.fill('input[type=password]', 'password123');
+  await page.click('button:has-text("Sign in")');
+  await page.waitForURL((u) => !u.pathname.startsWith('/login'), { timeout: 15000 });
+  await page.waitForLoadState('networkidle');
+  if (wantShots) await page.screenshot({ path: path.join(SHOT_DIR, '00-login-done.png') });
+
+  let i = 0;
+  for (const [label, route] of PAGES) {
+    i += 1;
+    currentLabel = label;
+    await page.goto(BASE + route, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(700);
+
+    const body = await page.textContent('body');
+    if (!body || body.trim().length < 40) {
+      problems.push({ page: label, kind: 'blank', text: 'Page rendered (almost) nothing' });
+    }
+    if (/Cannot read propert|is not a function|Unexpected token/i.test(body || '')) {
+      problems.push({ page: label, kind: 'error-text', text: 'Error text visible on the page' });
+    }
+    if (wantShots) {
+      await page.screenshot({
+        path: path.join(SHOT_DIR, `${String(i).padStart(2, '0')}-${label}.png`),
+        fullPage: label !== 'stock-take-mode',
+      });
+    }
+  }
+
+  // --- a real interaction pass on the till ---
+  currentLabel = 'pos-interaction';
+  await page.goto(`${BASE}/pos`, { waitUntil: 'networkidle' });
+  await page.fill('input[placeholder*="Search by product"]', 'oxford');
+  await page.waitForTimeout(900);
+  const card = page.locator('button.card:not([disabled])').first();
+  if (await card.count()) {
+    await card.click();
+    await page.waitForTimeout(400);
+    const charge = page.locator('button:has-text("Charge")');
+    if (await charge.count()) {
+      await charge.click();
+      await page.waitForTimeout(600);
+      if (wantShots) await page.screenshot({ path: path.join(SHOT_DIR, '90-pos-payment.png') });
+      const complete = page.locator('button:has-text("Complete")').first();
+      if (await complete.count()) {
+        await complete.click();
+        await page.waitForTimeout(1500);
+        const receiptVisible = await page.locator('#receipt').count();
+        if (!receiptVisible) problems.push({ page: 'pos-interaction', kind: 'flow', text: 'No receipt after completing a sale' });
+        if (wantShots) await page.screenshot({ path: path.join(SHOT_DIR, '91-pos-receipt.png') });
+      } else {
+        problems.push({ page: 'pos-interaction', kind: 'flow', text: 'Complete button not found' });
+      }
+    } else {
+      problems.push({ page: 'pos-interaction', kind: 'flow', text: 'Charge button not found' });
+    }
+  } else {
+    problems.push({ page: 'pos-interaction', kind: 'flow', text: 'No product results for "oxford"' });
+  }
+
+  // --- mobile viewport pass ---
+  currentLabel = 'mobile';
+  const mobile = await browser.newContext({
+    viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true,
+    deviceScaleFactor: 2,
+  });
+  const mp = await mobile.newPage();
+  mp.on('pageerror', (err) => problems.push({ page: 'mobile', kind: 'pageerror', text: err.message }));
+  await mp.goto(`${BASE}/login`, { waitUntil: 'networkidle' });
+  await mp.fill('input[type=email]', 'cashier@millzee.test');
+  await mp.fill('input[type=password]', 'password123');
+  await mp.click('button:has-text("Sign in")');
+  await mp.waitForURL((u) => !u.pathname.startsWith('/login'), { timeout: 15000 });
+  for (const [label, route] of [['m-pos', '/pos'], ['m-stock-take-mode', '/stock-take-mode'], ['m-sales', '/sales']]) {
+    currentLabel = label;
+    await mp.goto(BASE + route, { waitUntil: 'networkidle' });
+    await mp.waitForTimeout(600);
+    const overflow = await mp.evaluate(() =>
+      document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    if (overflow > 4) problems.push({ page: label, kind: 'layout', text: `Horizontal overflow of ${overflow}px` });
+    if (wantShots) await mp.screenshot({ path: path.join(SHOT_DIR, `95-${label}.png`), fullPage: true });
+  }
+
+  // --- PWA manifest + icons ---
+  currentLabel = 'pwa';
+  for (const asset of ['/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/sw.js']) {
+    const res = await page.request.get(BASE + asset);
+    if (!res.ok()) problems.push({ page: 'pwa', kind: 'asset', text: `${asset} → ${res.status()}` });
+  }
+
+  await browser.close();
+
+  const byPage = {};
+  for (const p of problems) (byPage[p.page] ||= []).push(p);
+
+  console.log(`\nUI check — ${PAGES.length} screens + interaction & mobile passes`);
+  console.log('-'.repeat(64));
+  if (!problems.length) {
+    console.log('  No console errors, failed requests, blank screens or overflow found.');
+  } else {
+    for (const [pg, list] of Object.entries(byPage)) {
+      console.log(`\n  ${pg}`);
+      list.slice(0, 8).forEach((p) => console.log(`    [${p.kind}] ${p.text.slice(0, 220)}`));
+      if (list.length > 8) console.log(`    …and ${list.length - 8} more`);
+    }
+  }
+  console.log('-'.repeat(64));
+  console.log(`${problems.length} problem(s)${wantShots ? `, screenshots in ${SHOT_DIR}` : ''}\n`);
+  process.exit(problems.length ? 1 : 0);
+}
+
+run().catch((e) => { console.error('UI check crashed:', e); process.exit(2); });
