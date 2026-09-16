@@ -4,9 +4,11 @@ import {
   h, bad, notFound, forbidden, str, num, int, bool, paging, nextInvoiceNo, getSettings, money,
 } from '../lib/util.js';
 import { requirePerm } from '../middleware/auth.js';
+import { can } from '../lib/permissions.js';
 import { audit } from '../lib/audit.js';
 import { computeTotals } from '../services/pricing.js';
 import { allocateUnits, markUnitsSold, setUnitStatus, moveStock, bundleComponents } from '../services/inventory.js';
+import { many as manyRows } from '../db/index.js';
 import { normalizeEpc } from '../services/epc.js';
 
 const r = Router();
@@ -275,6 +277,319 @@ export async function createSale(c, body, ctx) {
   return sale;
 }
 
+
+/* ------------------------------------------------------------------ */
+/*  Amending an already-issued sale                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Re-read every line from the database so an amendment can never be used to
+ * invent a price. Mirrors the resolution step in createSale.
+ */
+async function resolveLines(c, rawItems, locationId, settings) {
+  const lines = [];
+  for (const it of rawItems) {
+    const variantId = int(it.variant_id);
+    if (!variantId) throw bad('Every line needs a product');
+    const { rows } = await c.query(
+      `SELECT v.id, v.sku, v.size, v.color, v.cost_price,
+              COALESCE(lp.selling_price, v.selling_price) AS price,
+              p.name, p.tax_rate, p.type
+         FROM product_variants v
+         JOIN products p ON p.id=v.product_id
+         LEFT JOIN location_prices lp ON lp.variant_id=v.id AND lp.location_id=$2
+        WHERE v.id=$1`, [variantId, locationId]);
+    if (!rows.length) throw bad(`Product variant ${variantId} not found`);
+    const v = rows[0];
+    const qty = num(it.quantity, 1);
+    if (qty <= 0) throw bad(`Quantity must be greater than zero for ${v.name}`);
+    lines.push({
+      variant_id: v.id, product_name: v.name, sku: v.sku, product_type: v.type,
+      variant_label: [v.size, v.color].filter(Boolean).join(' / '),
+      quantity: qty,
+      unit_price: num(it.unit_price, Number(v.price)),
+      discount_amount: num(it.discount_amount, 0),
+      tax_rate: num(it.tax_rate, Number(v.tax_rate)),
+      cost_price: Number(v.cost_price),
+    });
+  }
+  return lines;
+}
+
+/**
+ * Amend a completed sale in place.
+ *
+ * The invoice number, its sequence position and the original timestamp never
+ * change — a VAT invoice sequence has to stay unbroken — so an amendment is
+ * recorded as a revision with a full before/after snapshot rather than as a
+ * new document. Stock is unwound line by line (the exact tagged units go back
+ * on the shelf) and then re-allocated against the new lines.
+ */
+export async function amendSale(c, saleId, body, ctx) {
+  const { user, settings } = ctx;
+
+  const { rows: saleRows } = await c.query('SELECT * FROM sales WHERE id=$1 FOR UPDATE', [saleId]);
+  const sale = saleRows[0];
+  if (!sale) throw notFound('Sale not found');
+
+  if (!['completed', 'layaway'].includes(sale.status))
+    throw bad(`A sale with status "${sale.status}" cannot be amended.`);
+
+  const { rows: returned } = await c.query(
+    'SELECT COALESCE(SUM(returned_quantity),0) AS n FROM sale_items WHERE sale_id=$1', [saleId]);
+  if (Number(returned[0].n) > 0)
+    throw bad('This sale already has a return against it. Reverse the return first, or process another return instead of editing.');
+
+  const windowDays = int(settings.sale_edit_window_days, 30);
+  const ageDays = (Date.now() - new Date(sale.created_at).getTime()) / 86400000;
+  if (ageDays > windowDays)
+    throw forbidden(`This sale is ${Math.floor(ageDays)} days old. Sales can only be edited within ${windowDays} days of being issued.`);
+
+  const reason = str(body.reason).trim();
+  if (!reason) throw bad('Give a reason for the amendment — it is kept on the record.');
+
+  const before = await loadSale(saleId);
+  const locationId = sale.location_id;
+  const allocatedTags = {};
+
+  /* ---- 1. unwind the original lines ---- */
+  const { rows: oldItems } = await c.query('SELECT * FROM sale_items WHERE sale_id=$1 ORDER BY id', [saleId]);
+  for (const item of oldItems) {
+    const { rows: unitRows } = await c.query(
+      'SELECT unit_id FROM sale_item_units WHERE sale_item_id=$1', [item.id]);
+    const unitIds = unitRows.map((u) => u.unit_id);
+    if (unitIds.length) {
+      await c.query(
+        `UPDATE stock_units SET status='in_stock', location_id=$2, sale_id=NULL, sold_at=NULL,
+                last_seen_at=now()
+          WHERE id = ANY($1::bigint[])`, [unitIds, locationId]);
+    }
+    if (!item.variant_id) continue;
+    const { rows: vt } = await c.query(
+      `SELECT p.type FROM product_variants v JOIN products p ON p.id=v.product_id WHERE v.id=$1`,
+      [item.variant_id]);
+    const deductions = vt[0]?.type === 'bundle'
+      ? (await bundleComponents(c, item.variant_id)).map((b) => ({
+          variantId: b.variant_id, qty: Number(b.quantity) * Number(item.quantity) }))
+      : [{ variantId: item.variant_id, qty: Number(item.quantity) }];
+    for (const d of deductions) {
+      await moveStock(c, {
+        variantId: d.variantId, locationId, delta: d.qty, type: 'adjustment',
+        referenceType: 'sale_amendment', referenceId: saleId,
+        reason: `Amendment of ${sale.invoice_no}: original line reversed`, userId: user.id,
+      });
+    }
+  }
+  await c.query('DELETE FROM sale_items WHERE sale_id=$1', [saleId]);
+
+  /* ---- 2. price the new lines ---- */
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (!rawItems.length) throw bad('An amended sale still needs at least one line. Process a full return instead.');
+  const lines = await resolveLines(c, rawItems, locationId, settings);
+
+  let customer = null;
+  const newCustomerId = body.customer_id === null ? null : (int(body.customer_id) || sale.customer_id);
+  if (newCustomerId) {
+    const { rows } = await c.query(
+      `SELECT cu.*, g.discount_percent AS group_discount FROM customers cu
+         LEFT JOIN customer_groups g ON g.id=cu.group_id WHERE cu.id=$1`, [newCustomerId]);
+    customer = rows[0] || null;
+  }
+
+  const cartDiscount = {
+    type: body.discount?.type === 'percent' ? 'percent' : 'fixed',
+    value: num(body.discount?.value, 0),
+  };
+  const totals = computeTotals(lines, cartDiscount, settings);
+
+  const maxPct = user.role === 'admin' || user.role === 'manager' ? 100 : Number(user.max_discount_percent || 0);
+  const effectivePct = totals.subtotal > 0 ? (totals.discount_amount / totals.subtotal) * 100 : 0;
+  if (effectivePct > maxPct + 0.001)
+    throw forbidden(`That discount is ${effectivePct.toFixed(1)}% — your limit is ${maxPct}%.`);
+
+  /* ---- 3. re-allocate stock against the new lines ---- */
+  for (const line of lines) {
+    const deductions = line.product_type === 'bundle'
+      ? (await bundleComponents(c, line.variant_id)).map((b) => ({
+          variantId: b.variant_id, qty: Number(b.quantity) * line.quantity }))
+      : [{ variantId: line.variant_id, qty: line.quantity }];
+    for (const d of deductions) {
+      const { rows } = await c.query(
+        'SELECT COALESCE(quantity,0) AS q FROM inventory WHERE variant_id=$1 AND location_id=$2',
+        [d.variantId, locationId]);
+      const have = rows.length ? Number(rows[0].q) : 0;
+      if (have < d.qty)
+        throw bad(`Not enough stock for ${line.product_name} ${line.variant_label} — ${have} on hand after unwinding the original sale.`);
+    }
+    line._deductions = deductions;
+  }
+
+  for (let i = 0; i < totals.lines.length; i++) {
+    const l = totals.lines[i];
+    const { rows: itemRows } = await c.query(
+      `INSERT INTO sale_items (sale_id, variant_id, product_name, variant_label, sku, quantity,
+                               unit_price, discount_amount, tax_rate, tax_amount, line_total, cost_price)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      [saleId, l.variant_id, l.product_name, l.variant_label, l.sku, l.quantity,
+       l.unit_price, l.discount_amount, l.tax_rate, l.tax_amount, l.line_total, l.cost_price]);
+    const itemId = itemRows[0].id;
+
+    if (l.product_type !== 'bundle') {
+      const units = await allocateUnits(c, {
+        variantId: l.variant_id, locationId, quantity: Math.round(l.quantity),
+        preferredUnitIds: Array.isArray(rawItems[i]?.unit_ids) ? rawItems[i].unit_ids.map(Number) : [],
+      });
+      for (const u of units) {
+        await c.query('INSERT INTO sale_item_units (sale_item_id, unit_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+          [itemId, u.id]);
+      }
+      await markUnitsSold(c, units.map((u) => u.id), saleId);
+      allocatedTags[i] = units.map((u) => u.epc_readable || u.epc);
+    }
+    for (const d of (lines[i]._deductions || [])) {
+      await moveStock(c, {
+        variantId: d.variantId, locationId, delta: -d.qty, type: 'sale',
+        referenceType: 'sale_amendment', referenceId: saleId,
+        reason: `Amendment of ${sale.invoice_no}`, userId: user.id,
+      });
+    }
+  }
+
+  /* ---- 4. money ---- */
+  const paid = Number(sale.amount_paid);
+  const balanceDue = Math.max(0, money(totals.total - paid));
+  const changeDue = Math.max(0, money(paid - totals.total));
+
+  const oldPoints = Number(sale.points_earned) || 0;
+  const newPoints = settings.loyalty_enabled && customer && sale.status === 'completed'
+    ? Math.floor(totals.total / Number(settings.loyalty_earn_per || 1000)) : 0;
+
+  const { rows: updated } = await c.query(
+    `UPDATE sales SET customer_id=$2, subtotal=$3, discount_amount=$4, discount_type=$5,
+            discount_value=$6, tax_amount=$7, total=$8, cost_total=$9, balance_due=$10,
+            change_due=$11, is_credit=$12, points_earned=$13, note=COALESCE($14, note),
+            updated_at=now(), edited_at=now(), edited_by=$15, edit_count=edit_count+1
+      WHERE id=$1 RETURNING *`,
+    [saleId, customer?.id || null, totals.subtotal, totals.discount_amount, cartDiscount.type,
+     cartDiscount.value, totals.tax_amount, totals.total, totals.cost_total, balanceDue,
+     changeDue, balanceDue > 0, newPoints, body.note ?? null, user.id]);
+
+  /* ---- 5. customer ledgers ---- */
+  const oldBalance = Number(sale.balance_due) || 0;
+  if (sale.customer_id && sale.customer_id !== (customer?.id || null) && oldBalance > 0) {
+    await c.query('UPDATE customers SET balance = GREATEST(0, balance - $2) WHERE id=$1',
+      [sale.customer_id, oldBalance]);
+  }
+  if (customer) {
+    const delta = customer.id === sale.customer_id ? balanceDue - oldBalance : balanceDue;
+    if (delta !== 0) {
+      await c.query('UPDATE customers SET balance = GREATEST(0, balance + $2) WHERE id=$1',
+        [customer.id, delta]);
+    }
+    const pointDelta = newPoints - (customer.id === sale.customer_id ? oldPoints : 0);
+    if (pointDelta !== 0) {
+      await c.query('UPDATE customers SET loyalty_points = GREATEST(0, loyalty_points + $2) WHERE id=$1',
+        [customer.id, pointDelta]);
+      await c.query(`INSERT INTO loyalty_ledger (customer_id, points, type, sale_id) VALUES ($1,$2,'amend',$3)`,
+        [customer.id, pointDelta, saleId]);
+    }
+  } else if (sale.customer_id && oldPoints > 0) {
+    await c.query('UPDATE customers SET loyalty_points = GREATEST(0, loyalty_points - $2) WHERE id=$1',
+      [sale.customer_id, oldPoints]);
+  }
+
+  /* ---- 6. the permanent record ---- */
+  const after = {
+    invoice_no: updated[0].invoice_no,
+    customer_name: customer?.name || null,
+    subtotal: totals.subtotal,
+    discount_amount: totals.discount_amount,
+    tax_amount: totals.tax_amount,
+    total: totals.total,
+    amount_paid: paid,
+    balance_due: balanceDue,
+    items: totals.lines.map((l, i) => ({
+      product_name: l.product_name, variant_label: l.variant_label, sku: l.sku,
+      quantity: l.quantity, unit_price: l.unit_price, discount_amount: l.discount_amount,
+      line_total: l.line_total,
+      units: (allocatedTags[i] || []).map((t) => ({ readable: t })),
+    })),
+  };
+
+  await c.query(
+    `INSERT INTO sale_revisions (sale_id, revision, reason, before_json, after_json, user_id, user_name)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [saleId, Number(updated[0].edit_count), reason,
+     JSON.stringify(snapshot(before)), JSON.stringify(snapshot(after)), user.id, user.name]);
+
+  return { sale: updated[0], before, after };
+}
+
+/** Trim a loaded sale down to what is worth keeping in the revision log. */
+function snapshot(sale) {
+  if (!sale) return {};
+  return {
+    invoice_no: sale.invoice_no,
+    customer: sale.customer_name || null,
+    subtotal: Number(sale.subtotal),
+    discount_amount: Number(sale.discount_amount),
+    tax_amount: Number(sale.tax_amount),
+    total: Number(sale.total),
+    amount_paid: Number(sale.amount_paid),
+    balance_due: Number(sale.balance_due),
+    items: (sale.items || []).map((i) => ({
+      product: i.product_name, variant: i.variant_label, sku: i.sku,
+      quantity: Number(i.quantity), unit_price: Number(i.unit_price),
+      discount: Number(i.discount_amount), line_total: Number(i.line_total),
+      tags: (i.units || []).map((u) => u.readable || u.epc),
+    })),
+  };
+}
+
+r.put('/:id', requirePerm('sales.edit'), h(async (req, res) => {
+  const settings = await getSettings();
+  const out = await tx((c) => amendSale(c, int(req.params.id), req.body, { user: req.user, settings }));
+  await audit(req, 'amend', 'sale', req.params.id, {
+    invoice: out.sale.invoice_no,
+    reason: str(req.body.reason),
+    total_before: Number(out.before.total),
+    total_after: Number(out.sale.total),
+  });
+  res.json(await loadSale(int(req.params.id)));
+}));
+
+/** Whether the signed-in user may still edit this sale, and why not. */
+r.get('/:id/editable', h(async (req, res) => {
+  const settings = await getSettings();
+  const sale = await one('SELECT * FROM sales WHERE id=$1', [req.params.id]);
+  if (!sale) throw notFound('Sale not found');
+  const windowDays = int(settings.sale_edit_window_days, 30);
+  const ageDays = (Date.now() - new Date(sale.created_at).getTime()) / 86400000;
+  const returned = await one(
+    'SELECT COALESCE(SUM(returned_quantity),0) AS n FROM sale_items WHERE sale_id=$1', [req.params.id]);
+
+  const reasons = [];
+  if (!can(req.user.role, 'sales.edit')) reasons.push('Your role cannot edit issued sales.');
+  if (!['completed', 'layaway'].includes(sale.status)) reasons.push(`Status is "${sale.status}".`);
+  if (Number(returned.n) > 0) reasons.push('A return has already been processed against it.');
+  if (ageDays > windowDays) reasons.push(`It is ${Math.floor(ageDays)} days old; the limit is ${windowDays} days.`);
+
+  res.json({
+    editable: reasons.length === 0,
+    reasons,
+    window_days: windowDays,
+    days_remaining: Math.max(0, Math.ceil(windowDays - ageDays)),
+    edit_count: Number(sale.edit_count || 0),
+  });
+}));
+
+r.get('/:id/revisions', h(async (req, res) => {
+  const rows = await manyRows(
+    `SELECT id, revision, reason, before_json, after_json, user_name, created_at
+       FROM sale_revisions WHERE sale_id=$1 ORDER BY revision DESC`, [req.params.id]);
+  res.json(rows);
+}));
+
 /* ------------------------------------------------------------------ */
 r.post('/', requirePerm('sales.create'), h(async (req, res) => {
   const settings = await getSettings();
@@ -432,9 +747,13 @@ r.get('/:id/receipt', h(async (req, res) => {
     business: {
       name: settings.name, legal_name: settings.legal_name, tin: settings.tin,
       rc_number: settings.rc_number, address: settings.address, phone: settings.phone,
-      email: settings.email, logo_url: settings.logo_url, footer: settings.receipt_footer,
+      email: settings.email, footer: settings.receipt_footer,
       currency_symbol: settings.currency_symbol, vat_rate: settings.vat_rate,
       prices_include_vat: settings.prices_include_vat,
+      logo_url: settings.receipt_show_logo ? settings.logo_url : '',
+      logo_width_mm: settings.logo_width_mm,
+      font_size: settings.receipt_font_size,
+      paper: settings.receipt_paper,
     },
     sale: gift
       ? {

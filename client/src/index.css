@@ -52,14 +52,21 @@
   .nav-link.active { @apply bg-brand-600 text-white hover:bg-brand-600; }
 }
 
-/* Receipt printing */
+/* Receipt printing — width, padding and font come from Settings at runtime */
+@page { margin: 0; }
 @media print {
   body * { visibility: hidden; }
   #receipt, #receipt * { visibility: visible; }
   #receipt {
-    position: absolute; left: 0; top: 0; width: 80mm; padding: 4mm;
-    font-family: ui-monospace, monospace; font-size: 11px; color: #000;
+    position: absolute; left: 0; top: 0;
+    width: var(--receipt-width, 80mm) !important;
+    max-width: var(--receipt-width, 80mm) !important;
+    padding: var(--receipt-pad, 4mm);
+    font-family: ui-monospace, monospace;
+    font-size: var(--receipt-font, 12px);
+    color: #000;
   }
+  #receipt img { filter: grayscale(100%) contrast(140%); }
   .no-print { display: none !important; }
 }
 

@@ -1,41 +1,97 @@
+import { useEffect } from 'react';
 import { money, num, dateTime, labelize } from '../lib/format.js';
 
 /**
- * 80 mm thermal-style receipt. Rendered on screen and printed as-is
- * (see the @media print block in index.css). ESC/POS printers driven from the
- * browser print dialog use exactly this layout.
+ * The printed receipt.
+ *
+ * Width, font size and the logo all come from Settings → Receipt & invoice, and
+ * the same component is used for the on-screen preview, the copy shown after a
+ * sale, and the actual print — so what you set is what comes out of the printer.
+ *
+ * Printing works by pushing the chosen paper width into a CSS variable that the
+ * @media print block in index.css reads.
  */
-export default function Receipt({ data }) {
+
+const PAPER = {
+  '58mm': { width: '58mm', pad: '2mm', screen: 210 },
+  '80mm': { width: '80mm', pad: '4mm', screen: 300 },
+  a4: { width: '210mm', pad: '12mm', screen: 620 },
+};
+
+export default function Receipt({ data, preview = false }) {
+  const b = data?.business || {};
+  const s = data?.sale || {};
+  const gift = data?.gift;
+
+  const paper = PAPER[b.paper || b.receipt_paper || '80mm'] || PAPER['80mm'];
+  const fontSize = Number(b.font_size || b.receipt_font_size || 12);
+  const isSheet = (b.paper || b.receipt_paper) === 'a4';
+
+  // hand the print stylesheet the sizes the user picked
+  useEffect(() => {
+    if (preview) return;
+    const root = document.documentElement;
+    root.style.setProperty('--receipt-width', paper.width);
+    root.style.setProperty('--receipt-pad', paper.pad);
+    root.style.setProperty('--receipt-font', `${fontSize}px`);
+  }, [preview, paper.width, paper.pad, fontSize]);
+
   if (!data) return null;
-  const b = data.business || {};
-  const s = data.sale || {};
-  const gift = data.gift;
-  const hide = (v, node) => (v === null || v === undefined ? null : node);
+
+  const logo = b.logo_url;
+  const logoWidth = Number(b.logo_width_mm || 30);
+  const amended = Number(s.edit_count || 0) > 0;
 
   return (
-    <div id="receipt" className="font-mono text-[12px] leading-snug text-slate-900 bg-white">
-      <div className="text-center mb-2">
-        <p className="font-bold text-sm uppercase">{b.legal_name || b.name}</p>
-        {b.address && <p className="text-[11px]">{b.address}</p>}
-        {b.phone && <p className="text-[11px]">{b.phone}</p>}
-        {b.tin && <p className="text-[11px]">TIN: {b.tin}</p>}
+    <div
+      id={preview ? undefined : 'receipt'}
+      className="font-mono text-slate-900 bg-white mx-auto"
+      style={{
+        fontSize: `${fontSize}px`,
+        lineHeight: 1.35,
+        width: `${paper.screen}px`,
+        maxWidth: '100%',
+      }}
+    >
+      <div className={isSheet ? 'flex items-start gap-4 mb-3' : 'text-center mb-2'}>
+        {logo && (
+          <img src={logo} alt=""
+            className={isSheet ? 'shrink-0' : 'mx-auto mb-1.5'}
+            style={{ width: `${logoWidth * 3.78}px`, maxWidth: '70%', objectFit: 'contain' }} />
+        )}
+        <div className={isSheet ? 'flex-1 min-w-0' : ''}>
+          <p className="font-bold uppercase" style={{ fontSize: `${fontSize + 2}px` }}>
+            {b.legal_name || b.name}
+          </p>
+          {b.address && <p style={{ fontSize: `${fontSize - 1}px` }}>{b.address}</p>}
+          {b.phone && <p style={{ fontSize: `${fontSize - 1}px` }}>{b.phone}</p>}
+          {b.email && <p style={{ fontSize: `${fontSize - 1}px` }}>{b.email}</p>}
+          <div className="flex gap-3 justify-center flex-wrap" style={{ fontSize: `${fontSize - 1}px` }}>
+            {b.tin && <span>TIN: {b.tin}</span>}
+            {b.rc_number && <span>RC: {b.rc_number}</span>}
+          </div>
+        </div>
       </div>
 
       <Divider />
 
-      <div className="flex justify-between text-[11px]">
+      <div className="flex justify-between" style={{ fontSize: `${fontSize - 1}px` }}>
         <span>{s.invoice_no}</span>
         <span>{dateTime(s.created_at)}</span>
       </div>
-      <div className="flex justify-between text-[11px]">
+      <div className="flex justify-between" style={{ fontSize: `${fontSize - 1}px` }}>
         <span>Served by {s.cashier_name || '—'}</span>
         <span>{s.location_name || ''}</span>
       </div>
-      {s.customer_name && <p className="text-[11px]">Customer: {s.customer_name}</p>}
+      {s.customer_name && (
+        <p style={{ fontSize: `${fontSize - 1}px` }}>Customer: {s.customer_name}</p>
+      )}
+
       {gift && <p className="text-center mt-1 font-bold">*** GIFT RECEIPT ***</p>}
-      {data.offline && (
+      {data.offline && <p className="text-center mt-1 font-bold">*** SAVED OFFLINE — WILL SYNC ***</p>}
+      {amended && (
         <p className="text-center mt-1 font-bold">
-          *** SAVED OFFLINE — WILL SYNC ***
+          *** AMENDED COPY — REVISION {s.edit_count} ***
         </p>
       )}
 
@@ -47,15 +103,15 @@ export default function Receipt({ data }) {
             <tr key={idx} className="align-top">
               <td className="pr-1 py-0.5">
                 <div>{i.product_name}</div>
-                <div className="text-[10px] text-slate-600">
+                <div className="text-slate-600" style={{ fontSize: `${fontSize - 2}px` }}>
                   {i.variant_label}{i.sku ? ` · ${i.sku}` : ''}
                 </div>
                 {i.units?.length > 0 && (
-                  <div className="text-[9px] text-slate-500 break-all">
+                  <div className="text-slate-500 break-all" style={{ fontSize: `${fontSize - 3}px` }}>
                     {i.units.map((u) => u.readable || u.epc).join(', ')}
                   </div>
                 )}
-                <div className="text-[10px]">
+                <div style={{ fontSize: `${fontSize - 2}px` }}>
                   {num(i.quantity)} {i.unit_price != null ? `× ${money(i.unit_price)}` : ''}
                   {Number(i.discount_amount) > 0 ? ` − ${money(i.discount_amount)}` : ''}
                 </div>
@@ -71,20 +127,20 @@ export default function Receipt({ data }) {
       <Divider />
 
       <dl className="space-y-0.5">
-        {hide(s.subtotal, <Line label="Subtotal" value={money(s.subtotal)} />)}
+        {s.subtotal != null && <Line label="Subtotal" value={money(s.subtotal)} />}
         {Number(s.discount_amount) > 0 && <Line label="Discount" value={`− ${money(s.discount_amount)}`} />}
-        {hide(s.tax_amount, (
-          <Line label={`VAT @ ${b.vat_rate}%${b.prices_include_vat ? ' (incl.)' : ''}`} value={money(s.tax_amount)} />
-        ))}
-        {hide(s.total, <Line label="TOTAL" value={money(s.total)} bold />)}
+        {s.tax_amount != null && (
+          <Line label={`VAT @ ${b.vat_rate}%${b.prices_include_vat ? ' (incl.)' : ''}`}
+            value={money(s.tax_amount)} />
+        )}
+        {s.total != null && <Line label="TOTAL" value={money(s.total)} bold />}
       </dl>
 
       {!gift && (s.payments || []).length > 0 && (
         <>
           <Divider />
           {s.payments.map((p, i) => (
-            <Line key={i} label={labelize(p.method)}
-              value={money(p.amount)} />
+            <Line key={i} label={labelize(p.method)} value={money(p.amount)} />
           ))}
           {Number(s.change_due) > 0 && <Line label="Change" value={money(s.change_due)} />}
           {Number(s.balance_due) > 0 && <Line label="Balance due" value={money(s.balance_due)} bold />}
@@ -92,14 +148,18 @@ export default function Receipt({ data }) {
       )}
 
       {!gift && Number(s.points_earned) > 0 && (
-        <p className="text-[11px] mt-1">Loyalty points earned: {num(s.points_earned)}</p>
+        <p className="mt-1" style={{ fontSize: `${fontSize - 1}px` }}>
+          Loyalty points earned: {num(s.points_earned)}
+        </p>
       )}
 
       <Divider />
 
-      <p className="text-center text-[11px] mt-1 whitespace-pre-line">{b.footer}</p>
+      <p className="text-center mt-1 whitespace-pre-line" style={{ fontSize: `${fontSize - 1}px` }}>
+        {b.footer}
+      </p>
       {s.invoice_seq && (
-        <p className="text-center text-[9px] text-slate-500 mt-1">
+        <p className="text-center text-slate-500 mt-1" style={{ fontSize: `${fontSize - 3}px` }}>
           Invoice sequence {s.invoice_seq} · VAT-registered receipt
         </p>
       )}

@@ -683,9 +683,14 @@ function offlineReceipt(payload, totals, settings, customer, user, clientUuid) {
   return {
     business: {
       name: settings?.name, legal_name: settings?.legal_name, tin: settings?.tin,
+      rc_number: settings?.rc_number,
       address: settings?.address, phone: settings?.phone, email: settings?.email,
       footer: settings?.receipt_footer, currency_symbol: settings?.currency_symbol,
       vat_rate: settings?.vat_rate, prices_include_vat: settings?.prices_include_vat,
+      logo_url: settings?.receipt_show_logo ? settings?.logo_url : '',
+      logo_width_mm: settings?.logo_width_mm,
+      font_size: settings?.receipt_font_size,
+      paper: settings?.receipt_paper,
     },
     offline: true,
     sale: {

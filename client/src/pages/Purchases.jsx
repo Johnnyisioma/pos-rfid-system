@@ -7,10 +7,11 @@ import {
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useTabParam } from '../lib/useTabParam.js';
 import VariantPicker from '../components/VariantPicker.jsx';
 
 export default function Purchases() {
-  const [tab, setTab] = useState('orders');
+  const [tab, setTab] = useTabParam('orders');
   return (
     <>
       <PageHeader title="Purchases" subtitle="Purchase orders, goods receiving and suppliers" />

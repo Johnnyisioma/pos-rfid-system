@@ -2,10 +2,12 @@ import { useEffect, useState, useCallback } from 'react';
 import { Link, useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Printer, Gift, RotateCcw, CreditCard, Radio, FileCode2,
+  PencilLine, History, Trash2, Plus, AlertTriangle,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
-import { money, num, dateTime, labelize } from '../lib/format.js';
+import { money, num, dateTime, labelize, variantLabel } from '../lib/format.js';
 import { Card, Loading, Badge, Modal, useToast, Field, Empty, Spinner } from '../components/ui.jsx';
+import VariantPicker from '../components/VariantPicker.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
 import Receipt from '../components/Receipt.jsx';
@@ -21,12 +23,17 @@ export default function SaleDetail() {
   const [payModal, setPayModal] = useState(false);
   const [einvoice, setEinvoice] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [editable, setEditable] = useState(null);
+  const [revisions, setRevisions] = useState([]);
+  const [amending, setAmending] = useState(false);
 
   const load = useCallback(async () => {
     try {
       const s = await api.get(`/api/sales/${id}`);
       setSale(s);
       setReceipt(await api.get(`/api/sales/${id}/receipt`));
+      setEditable(await api.get(`/api/sales/${id}/editable`).catch(() => null));
+      setRevisions(await api.get(`/api/sales/${id}/revisions`).catch(() => []));
     } catch (e) { toast.error(e.message); }
   }, [id]); // eslint-disable-line
 
@@ -62,6 +69,11 @@ export default function SaleDetail() {
               <button className="btn-secondary no-print"
                 onClick={() => navigate(`/returns?invoice=${sale.invoice_no}`)}>
                 <RotateCcw size={16} /> Return
+              </button>
+            )}
+            {editable?.editable && (
+              <button className="btn-secondary no-print" onClick={() => setAmending(true)}>
+                <PencilLine size={16} /> Edit sale
               </button>
             )}
             {Number(sale.balance_due) > 0 && can('sales.create') && (
@@ -168,6 +180,57 @@ export default function SaleDetail() {
             </Card>
           </div>
 
+          {Number(sale.edit_count) > 0 && (
+            <div className="rounded-xl bg-amber-50 ring-1 ring-amber-200 p-3 text-sm text-amber-900 flex gap-2.5">
+              <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+              <div>
+                <p className="font-medium">
+                  This receipt has been amended {sale.edit_count} time{Number(sale.edit_count) === 1 ? '' : 's'}
+                  {sale.edited_at ? ` — last on ${dateTime(sale.edited_at)}` : ''}.
+                </p>
+                <p className="text-xs mt-0.5">
+                  The invoice number is unchanged and every earlier version is kept below.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {editable && !editable.editable && can('sales.edit') && (
+            <p className="text-xs text-slate-500">
+              This sale can no longer be edited: {editable.reasons.join(' ')}
+            </p>
+          )}
+          {editable?.editable && (
+            <p className="text-xs text-slate-500">
+              Editable for another {editable.days_remaining} day{editable.days_remaining === 1 ? '' : 's'}
+              {' '}(within the {editable.window_days}-day window).
+            </p>
+          )}
+
+          {revisions.length > 0 && (
+            <Card title="Amendment history" bodyClass="p-0"
+              actions={<History size={15} className="text-slate-400" />}>
+              <div className="divide-y divide-slate-100">
+                {revisions.map((r) => (
+                  <div key={r.id} className="p-4">
+                    <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+                      <p className="font-medium text-slate-800 text-sm">
+                        Revision {r.revision} · {r.reason}
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        {r.user_name || '—'} · {dateTime(r.created_at)}
+                      </p>
+                    </div>
+                    <div className="grid sm:grid-cols-2 gap-3 text-xs">
+                      <RevisionSide title="Before" data={r.before_json} tone="bg-rose-50 ring-rose-200" />
+                      <RevisionSide title="After" data={r.after_json} tone="bg-emerald-50 ring-emerald-200" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
           {sale.returns?.length > 0 && (
             <Card title="Returns against this sale" bodyClass="p-0">
               <table className="data">
@@ -197,6 +260,11 @@ export default function SaleDetail() {
         </div>
       </div>
 
+      {amending && (
+        <AmendModal sale={sale} onClose={() => setAmending(false)}
+          onSaved={() => { setAmending(false); load(); }} />
+      )}
+
       {payModal && (
         <PaymentModal balance={Number(sale.balance_due)} busy={busy}
           onClose={() => setPayModal(false)} onSubmit={takePayment} />
@@ -217,6 +285,176 @@ export default function SaleDetail() {
         </Modal>
       )}
     </>
+  );
+}
+
+function RevisionSide({ title, data, tone }) {
+  return (
+    <div className={`rounded-lg ring-1 p-2.5 ${tone}`}>
+      <p className="font-semibold mb-1.5">{title}</p>
+      <ul className="space-y-1">
+        {(data.items || []).map((i, idx) => (
+          <li key={idx}>
+            {i.product}{i.variant ? ` (${i.variant})` : ''} — {num(i.quantity)} × {money(i.unit_price)}
+            {Number(i.discount) > 0 ? ` − ${money(i.discount)}` : ''} = {money(i.line_total)}
+            {i.tags?.length > 0 && (
+              <span className="block text-[10px] opacity-70 font-mono break-all">{i.tags.join(', ')}</span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className="mt-1.5 pt-1.5 border-t border-current/15 font-semibold">
+        Total {money(data.total)}
+        {Number(data.balance_due) > 0 ? ` · owing ${money(data.balance_due)}` : ''}
+      </p>
+    </div>
+  );
+}
+
+const AMEND_REASONS = [
+  'Wrong item rung up',
+  'Wrong quantity rung up',
+  'Wrong price applied',
+  'Discount not applied at the till',
+  'Customer added an item before leaving',
+  'Wrong customer selected',
+  'Other (explain below)',
+];
+
+/**
+ * Amend an issued receipt.
+ *
+ * Lines are re-priced from the database on save, stock is unwound and
+ * re-allocated, and the invoice number stays exactly as it was.
+ */
+function AmendModal({ sale, onClose, onSaved }) {
+  const toast = useToast();
+  const [lines, setLines] = useState(() => sale.items.map((i) => ({
+    variant_id: i.variant_id,
+    label: `${i.product_name}${i.variant_label ? ` · ${i.variant_label}` : ''}`,
+    sku: i.sku,
+    quantity: Number(i.quantity),
+    unit_price: Number(i.unit_price),
+    discount_amount: Number(i.discount_amount),
+  })));
+  const [reason, setReason] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const setLine = (i, patch) => setLines((p) => p.map((l, x) => (x === i ? { ...l, ...patch } : l)));
+  const total = lines.reduce(
+    (s, l) => s + Number(l.quantity || 0) * Number(l.unit_price || 0) - Number(l.discount_amount || 0), 0);
+  const paid = Number(sale.amount_paid);
+
+  const save = async () => {
+    const chosen = reason === 'Other (explain below)' ? note.trim() : reason;
+    if (!chosen) return toast.error('Choose a reason for the amendment');
+    if (!lines.length) return toast.error('An amended sale still needs at least one line');
+    setBusy(true);
+    try {
+      await api.put(`/api/sales/${sale.id}`, {
+        items: lines.map((l) => ({
+          variant_id: l.variant_id,
+          quantity: Number(l.quantity),
+          unit_price: Number(l.unit_price),
+          discount_amount: Number(l.discount_amount) || 0,
+        })),
+        reason: chosen,
+        note: note || undefined,
+      });
+      toast.success('Receipt amended');
+      onSaved();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Modal open onClose={onClose} size="lg"
+      title={`Edit ${sale.invoice_no}`}
+      subtitle="The invoice number and date stay the same. Stock and the customer's balance are corrected automatically."
+      footer={
+        <>
+          <span className="mr-auto text-sm text-slate-600">
+            New total {money(total)} · paid {money(paid)}
+            {total > paid ? ` · will owe ${money(total - paid)}` : total < paid ? ` · refund ${money(paid - total)}` : ''}
+          </span>
+          <button className="btn-secondary" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={save} disabled={busy}>
+            {busy ? <Spinner /> : <PencilLine size={16} />} Save amendment
+          </button>
+        </>
+      }>
+      <div className="rounded-lg bg-slate-50 ring-1 ring-slate-200 p-3 text-xs text-slate-600 mb-4">
+        Prices are re-read from the catalogue when you save, so a typo here cannot change what a
+        product is worth. The tagged units on the original sale go back on the shelf and are
+        re-allocated against the new lines.
+      </div>
+
+      <div className="rounded-lg ring-1 ring-slate-200 overflow-hidden mb-3">
+        <table className="data">
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th className="text-right w-24">Qty</th>
+              <th className="text-right w-32">Unit price</th>
+              <th className="text-right w-32">Discount</th>
+              <th className="text-right w-28">Line</th>
+              <th className="w-10"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.map((l, i) => (
+              <tr key={i}>
+                <td>
+                  <div className="text-sm font-medium text-slate-800">{l.label}</div>
+                  <div className="text-xs text-slate-500 font-mono">{l.sku}</div>
+                </td>
+                <td>
+                  <input type="number" min="1" className="input py-1 text-right" value={l.quantity}
+                    onChange={(e) => setLine(i, { quantity: e.target.value })} />
+                </td>
+                <td>
+                  <input type="number" className="input py-1 text-right" value={l.unit_price}
+                    onChange={(e) => setLine(i, { unit_price: e.target.value })} />
+                </td>
+                <td>
+                  <input type="number" className="input py-1 text-right" value={l.discount_amount}
+                    onChange={(e) => setLine(i, { discount_amount: e.target.value })} />
+                </td>
+                <td className="text-right tabular-nums text-sm">
+                  {money(Number(l.quantity || 0) * Number(l.unit_price || 0) - Number(l.discount_amount || 0))}
+                </td>
+                <td>
+                  <button className="btn-ghost p-1.5 text-rose-600"
+                    onClick={() => setLines((p) => p.filter((_, x) => x !== i))}>
+                    <Trash2 size={14} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <VariantPicker placeholder="Add another item to this receipt…"
+        onPick={(v) => setLines((p) => [...p, {
+          variant_id: v.variant_id,
+          label: `${v.name}${variantLabel(v) !== 'Default' ? ` · ${variantLabel(v)}` : ''}`,
+          sku: v.sku, quantity: 1, unit_price: Number(v.price), discount_amount: 0,
+        }])} />
+
+      <div className="grid sm:grid-cols-2 gap-3 mt-4">
+        <Field label="Reason (kept on the record)">
+          <select className="input" value={reason} onChange={(e) => setReason(e.target.value)}>
+            <option value="">Choose…</option>
+            {AMEND_REASONS.map((r) => <option key={r}>{r}</option>)}
+          </select>
+        </Field>
+        <Field label="Note" hint="Required if you chose “Other”">
+          <input className="input" value={note} onChange={(e) => setNote(e.target.value)} />
+        </Field>
+      </div>
+    </Modal>
   );
 }
 

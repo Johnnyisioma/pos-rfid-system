@@ -8,9 +8,10 @@ import {
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useTabParam } from '../lib/useTabParam.js';
 
 export default function Customers() {
-  const [tab, setTab] = useState('customers');
+  const [tab, setTab] = useTabParam('customers');
   return (
     <>
       <PageHeader title="Customers" subtitle="Profiles, groups, loyalty points and account balances" />

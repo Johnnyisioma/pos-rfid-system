@@ -1,21 +1,27 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Save, Plus, MapPin, Users, Tag, Layers, Building2, Trash2, Calculator } from 'lucide-react';
+import {
+  Save, Plus, MapPin, Users, Tag, Layers, Building2, Trash2, Calculator,
+  Upload, ImageOff, Receipt as ReceiptIcon, Info,
+} from 'lucide-react';
 import { api } from '../lib/api.js';
 import { money, labelize, dateTime } from '../lib/format.js';
 import {
   Card, Loading, Empty, Badge, Modal, useToast, Field, Tabs, Spinner, ConfirmButton,
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
+import Receipt from '../components/Receipt.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useTabParam } from '../lib/useTabParam.js';
 
 export default function Settings() {
-  const [tab, setTab] = useState('business');
+  const [tab, setTab] = useTabParam('business');
   const { can } = useAuth();
   return (
     <>
       <PageHeader title="Settings" subtitle="Business details, locations, staff and catalogue options" />
       <Tabs className="mb-4" value={tab} onChange={setTab} tabs={[
         { value: 'business', label: 'Business' },
+        { value: 'receipt', label: 'Receipt & invoice' },
         { value: 'locations', label: 'Locations' },
         { value: 'registers', label: 'Registers' },
         { value: 'users', label: 'Staff & roles' },
@@ -23,6 +29,7 @@ export default function Settings() {
         { value: 'account', label: 'My account' },
       ]} />
       {tab === 'business' && <Business />}
+      {tab === 'receipt' && <ReceiptSettings />}
       {tab === 'locations' && <Locations />}
       {tab === 'registers' && <Registers />}
       {tab === 'users' && <Staff />}
@@ -135,6 +142,200 @@ function Business() {
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+
+/* ---------------- receipt & invoice ---------------- */
+
+/** Shrink an uploaded logo in the browser so it fits comfortably in the database. */
+function fileToLogoDataUrl(file, maxWidth = 500) {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) return reject(new Error('That file is not an image'));
+    if (file.size > 4 * 1024 * 1024) return reject(new Error('Pick an image under 4 MB'));
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read that file'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('That image could not be decoded'));
+      img.onload = () => {
+        const scale = Math.min(1, maxWidth / img.width);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        const ctx = canvas.getContext('2d');
+        // white behind the logo so a transparent PNG still prints on thermal paper
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+const SAMPLE_SALE = {
+  invoice_no: 'INV-2026-000123', invoice_seq: 123, created_at: new Date().toISOString(),
+  cashier_name: 'Bola Adeyemi', location_name: 'Lagos Main Store', customer_name: 'Adaeze Nwosu',
+  subtotal: 71800, discount_amount: 1800, tax_amount: 4883.72, total: 70000,
+  amount_paid: 80000, change_due: 10000, balance_due: 0, points_earned: 70,
+  items: [
+    { product_name: 'Marconi Classic Oxford', variant_label: '42 / Black', sku: 'MF-0001-42-BLACK',
+      quantity: 1, unit_price: 38900, discount_amount: 0, line_total: 38900, tax_amount: 2713.95,
+      units: [{ readable: 'MF-0001-42-BLACK-000007' }] },
+    { product_name: 'Lagos Sun Slide', variant_label: '42 / Brown', sku: 'MF-0006-42-BROWN',
+      quantity: 2, unit_price: 16450, discount_amount: 1800, line_total: 31100, tax_amount: 2169.77,
+      units: [{ readable: 'MF-0006-42-BROWN-000011' }, { readable: 'MF-0006-42-BROWN-000012' }] },
+  ],
+  payments: [{ method: 'cash', amount: 80000 }],
+};
+
+function ReceiptSettings() {
+  const { settings, reloadSettings, can } = useAuth();
+  const toast = useToast();
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { if (settings) setForm(settings); }, [settings]);
+  if (!form) return <Loading />;
+  const set = (k) => (e) =>
+    setForm({ ...form, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value });
+
+  const pickLogo = async (file) => {
+    if (!file) return;
+    try {
+      const dataUrl = await fileToLogoDataUrl(file);
+      setForm((f) => ({ ...f, logo_url: dataUrl }));
+      toast.info('Logo loaded — press Save to keep it');
+    } catch (err) { toast.error(err.message); }
+  };
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.put('/api/settings', form);
+      await reloadSettings();
+      toast.success('Receipt settings saved');
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const previewData = {
+    business: {
+      name: form.name, legal_name: form.legal_name, tin: form.tin, rc_number: form.rc_number,
+      address: form.address, phone: form.phone, email: form.email,
+      logo_url: form.receipt_show_logo ? form.logo_url : '',
+      logo_width_mm: form.logo_width_mm,
+      footer: form.receipt_footer, currency_symbol: form.currency_symbol,
+      vat_rate: form.vat_rate, prices_include_vat: form.prices_include_vat,
+      font_size: form.receipt_font_size, paper: form.receipt_paper,
+    },
+    sale: SAMPLE_SALE,
+  };
+
+  return (
+    <div className="grid lg:grid-cols-2 gap-4">
+      <div className="space-y-4">
+        <Card title="Company logo" subtitle="Printed at the top of every receipt and invoice">
+          <div className="flex items-start gap-4">
+            <div className="h-24 w-24 rounded-lg ring-1 ring-slate-200 grid place-items-center bg-slate-50 shrink-0 overflow-hidden">
+              {form.logo_url
+                ? <img src={form.logo_url} alt="Company logo" className="max-h-full max-w-full object-contain" />
+                : <ImageOff size={22} className="text-slate-300" />}
+            </div>
+            <div className="flex-1 min-w-0">
+              <label className="btn-secondary cursor-pointer inline-flex">
+                <Upload size={15} /> {form.logo_url ? 'Replace logo' : 'Upload logo'}
+                <input type="file" accept="image/*" className="hidden"
+                  onChange={(e) => pickLogo(e.target.files[0])} />
+              </label>
+              {form.logo_url && (
+                <button className="btn-ghost text-xs text-rose-600 ml-2"
+                  onClick={() => setForm({ ...form, logo_url: '' })}>Remove</button>
+              )}
+              <p className="text-xs text-slate-500 mt-2">
+                PNG or JPG. It is scaled down and stored in the database, so it survives every
+                redeploy — no file server to keep running.
+              </p>
+            </div>
+          </div>
+
+          <div className="grid sm:grid-cols-2 gap-3 mt-4">
+            <Field label="Printed logo width (mm)"
+              hint="30mm suits an 80mm till roll">
+              <input type="number" min="10" max="70" className="input"
+                value={form.logo_width_mm} onChange={set('logo_width_mm')} />
+            </Field>
+            <div className="flex items-end pb-2">
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" className="rounded border-slate-300"
+                  checked={!!form.receipt_show_logo} onChange={set('receipt_show_logo')} />
+                Show the logo on receipts
+              </label>
+            </div>
+          </div>
+        </Card>
+
+        <Card title="Print size" subtitle="How the receipt is laid out when printed">
+          <div className="grid sm:grid-cols-2 gap-3">
+            <Field label="Paper size">
+              <select className="input" value={form.receipt_paper} onChange={set('receipt_paper')}>
+                <option value="58mm">58 mm till roll (narrow)</option>
+                <option value="80mm">80 mm till roll (standard)</option>
+                <option value="a4">A4 / A5 invoice sheet</option>
+              </select>
+            </Field>
+            <Field label="Font size" hint="Bigger text is easier to read but uses more paper">
+              <select className="input" value={form.receipt_font_size} onChange={set('receipt_font_size')}>
+                <option value="9">9 — very small</option>
+                <option value="10">10 — small</option>
+                <option value="11">11</option>
+                <option value="12">12 — default</option>
+                <option value="13">13</option>
+                <option value="14">14 — large</option>
+                <option value="16">16 — extra large</option>
+              </select>
+            </Field>
+          </div>
+        </Card>
+
+        <Card title="Editing issued receipts">
+          <Field label="Managers may edit a receipt for this many days after it is issued"
+            hint="Set to 0 to stop issued receipts being edited at all.">
+            <input type="number" min="0" max="365" className="input"
+              value={form.sale_edit_window_days} onChange={set('sale_edit_window_days')} />
+          </Field>
+          <div className="mt-3 rounded-lg bg-amber-50 ring-1 ring-amber-200 p-3 text-xs text-amber-900 flex gap-2">
+            <Info size={14} className="shrink-0 mt-0.5" />
+            <div>
+              <p className="font-medium">Only Administrators and Managers can edit an issued receipt.</p>
+              <p className="mt-1">
+                The invoice number never changes, every version is kept, and the receipt is marked as
+                amended. Altering an issued VAT invoice may still require a credit note under Nigerian
+                rules — check with your tax adviser how you should handle corrections.
+              </p>
+            </div>
+          </div>
+        </Card>
+
+        {can('settings.write') && (
+          <button className="btn-primary w-full" onClick={save} disabled={busy}>
+            {busy ? <Spinner /> : <Save size={16} />} Save receipt settings
+          </button>
+        )}
+      </div>
+
+      <Card title="Live preview" subtitle="Sample data — this is exactly how it prints"
+        className="lg:sticky lg:top-[4.5rem] self-start">
+        <div className="bg-slate-100 rounded-lg p-4 flex justify-center overflow-x-auto">
+          <div className="bg-white shadow-sm p-3">
+            <Receipt data={previewData} preview />
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }

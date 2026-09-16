@@ -533,3 +533,36 @@ CREATE TABLE IF NOT EXISTS scan_events (
 CREATE INDEX IF NOT EXISTS idx_scan_events_created ON scan_events(created_at DESC);
 
 INSERT INTO business_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================
+--  Incremental upgrades
+--  CREATE TABLE IF NOT EXISTS never adds columns to a table that
+--  already exists, so every change after the first release is an
+--  idempotent ALTER here. schema.sql runs on every boot.
+-- ============================================================
+
+-- Receipt appearance + the window in which a sale may still be amended
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS receipt_font_size  INT     NOT NULL DEFAULT 12;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS receipt_paper      TEXT    NOT NULL DEFAULT '80mm';
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS receipt_show_logo  BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS logo_width_mm      INT     NOT NULL DEFAULT 30;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS sale_edit_window_days INT  NOT NULL DEFAULT 30;
+
+-- Amendment trail on a sale
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_at  TIMESTAMPTZ;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_by  INT REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS edit_count INT NOT NULL DEFAULT 0;
+
+-- Full before/after snapshot of every amendment, kept forever
+CREATE TABLE IF NOT EXISTS sale_revisions (
+  id          BIGSERIAL PRIMARY KEY,
+  sale_id     BIGINT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  revision    INT NOT NULL,
+  reason      TEXT NOT NULL,
+  before_json JSONB NOT NULL,
+  after_json  JSONB NOT NULL,
+  user_id     INT REFERENCES users(id) ON DELETE SET NULL,
+  user_name   TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sale_revisions_sale ON sale_revisions(sale_id);

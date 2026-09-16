@@ -8,11 +8,12 @@ import {
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useTabParam } from '../lib/useTabParam.js';
 import VariantPicker from '../components/VariantPicker.jsx';
 
 export default function Returns() {
   const [params] = useSearchParams();
-  const [tab, setTab] = useState(params.get('invoice') ? 'new' : 'history');
+  const [tab, setTab] = useTabParam(params.get('invoice') ? 'new' : 'history');
   return (
     <>
       <PageHeader title="Returns & exchanges"

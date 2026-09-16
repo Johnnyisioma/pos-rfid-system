@@ -1,49 +1,99 @@
-import { useEffect, useState } from 'react';
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { useEffect, useState, useMemo } from 'react';
+import { NavLink, Outlet, useLocation, useNavigate, Link } from 'react-router-dom';
 import {
   LayoutDashboard, ShoppingCart, Package, Boxes, Radio, ScanLine, ClipboardCheck, Search,
   Truck, Users, Receipt, RotateCcw, Calculator, Wallet, BarChart3, Settings as Cog,
-  ShieldCheck, Menu, X, LogOut, MapPin, ChevronDown, WifiOff, CloudUpload, Printer,
-  FileSpreadsheet, ArrowLeftRight, Tags,
+  ShieldCheck, Menu, X, LogOut, MapPin, ChevronDown, ChevronRight, WifiOff, CloudUpload,
+  Printer, FileSpreadsheet, ArrowLeftRight, Tags, Plus, List, FolderTree, Layers,
+  TrendingUp, FileText, Store, UserCog, Building2, Percent,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { initOffline, flushQueue } from '../lib/offline.js';
 import { useToast } from './ui.jsx';
 
+/**
+ * Sidebar navigation.
+ *
+ * Each area is a collapsible parent that opens onto its own pages, rather than
+ * one long flat list. A group opens automatically when you are inside it, and
+ * whatever you open by hand is remembered between visits.
+ *
+ * Sub-items that are tabs within a page carry `?tab=` — see useTabParam.
+ */
 const NAV = [
-  { section: 'Sell', items: [
-    { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true, perm: 'reports.read' },
-    { to: '/pos', label: 'Point of Sale', icon: ShoppingCart, perm: 'sales.create' },
-    { to: '/sales', label: 'Sales & invoices', icon: Receipt, perm: 'sales.read' },
-    { to: '/returns', label: 'Returns & exchanges', icon: RotateCcw, perm: 'returns.read' },
-    { to: '/register', label: 'Cash register', icon: Calculator, perm: 'register.open' },
+  { label: 'Dashboard', icon: LayoutDashboard, to: '/', end: true, perm: 'reports.read' },
+
+  { label: 'Sell', icon: ShoppingCart, perm: 'sales.read', children: [
+    { label: 'Point of Sale', to: '/pos', icon: ShoppingCart, perm: 'sales.create' },
+    { label: 'All sales', to: '/sales', icon: Receipt, perm: 'sales.read' },
+    { label: 'Unpaid invoices', to: '/sales?credit=true', icon: FileText, perm: 'sales.read' },
+    { label: 'Returns & exchanges', to: '/returns?tab=new', icon: RotateCcw, perm: 'returns.read' },
+    { label: 'Return history', to: '/returns?tab=history', icon: List, perm: 'returns.read' },
+    { label: 'Cash register', to: '/register', icon: Calculator, perm: 'register.open' },
   ]},
-  { section: 'Stock', items: [
-    { to: '/products', label: 'Products', icon: Package, perm: 'products.read' },
-    { to: '/import-export', label: 'Import / export', icon: FileSpreadsheet, perm: 'products.write' },
-    { to: '/inventory', label: 'Stock levels', icon: Boxes, perm: 'inventory.read' },
-    { to: '/purchases', label: 'Purchases', icon: Truck, perm: 'purchases.read' },
-    { to: '/transfers', label: 'Transfers', icon: ArrowLeftRight, perm: 'transfers.read' },
+
+  { label: 'Products', icon: Package, perm: 'products.read', children: [
+    { label: 'All products', to: '/products', icon: List, perm: 'products.read' },
+    { label: 'Add product', to: '/products/new', icon: Plus, perm: 'products.write' },
+    { label: 'Categories & brands', to: '/settings?tab=catalog', icon: FolderTree, perm: 'products.write' },
+    { label: 'Variation templates', to: '/settings?tab=catalog', icon: Layers, perm: 'products.write' },
+    { label: 'Import / export', to: '/import-export', icon: FileSpreadsheet, perm: 'products.write' },
   ]},
-  { section: 'RFID', items: [
-    { to: '/rfid', label: 'Tagged units', icon: Radio, perm: 'rfid.scan' },
-    { to: '/rfid/scan', label: 'Scan simulator', icon: ScanLine, perm: 'rfid.scan' },
-    { to: '/rfid/stock-take', label: 'Stock take', icon: ClipboardCheck, perm: 'rfid.stocktake' },
-    { to: '/rfid/find', label: 'Find an item', icon: Search, perm: 'rfid.find' },
+
+  { label: 'Stock', icon: Boxes, perm: 'inventory.read', children: [
+    { label: 'Stock levels', to: '/inventory?tab=levels', icon: Boxes, perm: 'inventory.read' },
+    { label: 'Low stock', to: '/inventory?tab=low', icon: TrendingUp, perm: 'inventory.read' },
+    { label: 'Stock adjustments', to: '/inventory?tab=adjustments', icon: Percent, perm: 'inventory.read' },
+    { label: 'Movement ledger', to: '/inventory?tab=movements', icon: List, perm: 'inventory.read' },
+    { label: 'Stock valuation', to: '/inventory?tab=valuation', icon: BarChart3, perm: 'inventory.read' },
+    { label: 'Transfers', to: '/transfers', icon: ArrowLeftRight, perm: 'transfers.read' },
   ]},
-  { section: 'Business', items: [
-    { to: '/customers', label: 'Customers', icon: Users, perm: 'customers.read' },
-    { to: '/expenses', label: 'Expenses', icon: Wallet, perm: 'expenses.read' },
-    { to: '/reports', label: 'Reports', icon: BarChart3, perm: 'reports.read' },
+
+  { label: 'Purchases', icon: Truck, perm: 'purchases.read', children: [
+    { label: 'Purchase orders', to: '/purchases?tab=orders', icon: List, perm: 'purchases.read' },
+    { label: 'Suppliers', to: '/purchases?tab=suppliers', icon: Store, perm: 'suppliers.read' },
+    { label: 'Reorder suggestions', to: '/purchases?tab=reorder', icon: TrendingUp, perm: 'purchases.read' },
   ]},
-  { section: 'Admin', items: [
-    { to: '/settings', label: 'Settings', icon: Cog, perm: 'settings.read' },
-    { to: '/devices', label: 'Hardware', icon: Printer, perm: 'settings.read' },
-    { to: '/audit', label: 'Audit log', icon: ShieldCheck, perm: 'audit.read' },
+
+  { label: 'RFID', icon: Radio, perm: 'rfid.scan', children: [
+    { label: 'Tagged units', to: '/rfid', icon: Radio, perm: 'rfid.scan' },
+    { label: 'Tags to encode', to: '/rfid?encoded=false', icon: Printer, perm: 'rfid.encode' },
+    { label: 'Scan simulator', to: '/rfid/scan', icon: ScanLine, perm: 'rfid.scan' },
+    { label: 'Stock take', to: '/rfid/stock-take', icon: ClipboardCheck, perm: 'rfid.stocktake' },
+    { label: 'Find an item', to: '/rfid/find', icon: Search, perm: 'rfid.find' },
+  ]},
+
+  { label: 'Contacts', icon: Users, perm: 'customers.read', children: [
+    { label: 'Customers', to: '/customers?tab=customers', icon: Users, perm: 'customers.read' },
+    { label: 'Customer groups', to: '/customers?tab=groups', icon: Tags, perm: 'customers.read' },
+  ]},
+
+  { label: 'Expenses', icon: Wallet, perm: 'expenses.read', children: [
+    { label: 'All expenses', to: '/expenses', icon: List, perm: 'expenses.read' },
+    { label: 'Expense categories', to: '/settings?tab=catalog', icon: FolderTree, perm: 'expenses.write' },
+  ]},
+
+  { label: 'Reports', icon: BarChart3, perm: 'reports.read', children: [
+    { label: 'Sales report', to: '/reports?tab=sales', icon: TrendingUp, perm: 'reports.read' },
+    { label: 'Product performance', to: '/reports?tab=products', icon: Package, perm: 'reports.read' },
+    { label: 'Profit & loss', to: '/reports?tab=pl', icon: BarChart3, perm: 'reports.read' },
+    { label: 'VAT report', to: '/reports?tab=tax', icon: FileText, perm: 'reports.read' },
+  ]},
+
+  { label: 'Settings', icon: Cog, perm: 'settings.read', children: [
+    { label: 'Business settings', to: '/settings?tab=business', icon: Building2, perm: 'settings.read' },
+    { label: 'Receipt & invoice', to: '/settings?tab=receipt', icon: Receipt, perm: 'settings.read' },
+    { label: 'Business locations', to: '/settings?tab=locations', icon: MapPin, perm: 'settings.read' },
+    { label: 'Registers', to: '/settings?tab=registers', icon: Calculator, perm: 'settings.read' },
+    { label: 'Staff & roles', to: '/settings?tab=users', icon: UserCog, perm: 'users.read' },
+    { label: 'Hardware', to: '/devices', icon: Printer, perm: 'settings.read' },
+    { label: 'Audit log', to: '/audit', icon: ShieldCheck, perm: 'audit.read' },
   ]},
 ];
 
-function LocationPicker({ compact }) {
+const OPEN_KEY = 'pos.nav.open';
+
+function LocationPicker() {
   const { locations, locationId, switchLocation } = useAuth();
   const [open, setOpen] = useState(false);
   const current = locations.find((l) => l.id === locationId);
@@ -75,16 +125,76 @@ function LocationPicker({ compact }) {
   );
 }
 
+function NavGroup({ group, currentPath, currentSearch, openGroups, toggle }) {
+  const { can } = useAuth();
+  const children = (group.children || []).filter((c) => !c.perm || can(c.perm));
+
+  const isChildActive = (child) => {
+    const [path, query] = child.to.split('?');
+    if (path !== currentPath) return false;
+    if (!query) {
+      // a bare path is active only when no sub-tab/filter is selected
+      return !currentSearch || !/(^|&)(tab|credit|encoded)=/.test(currentSearch);
+    }
+    return currentSearch.includes(query);
+  };
+
+  const groupActive = children.some(isChildActive);
+  const isOpen = openGroups[group.label] ?? groupActive;
+
+  if (!children.length) return null;
+
+  return (
+    <div>
+      <button onClick={() => toggle(group.label, !isOpen)}
+        className={`nav-link w-full justify-between ${groupActive && !isOpen ? 'text-white' : ''}`}>
+        <span className="flex items-center gap-2.5 min-w-0">
+          <group.icon size={16} className="shrink-0" />
+          <span className="truncate">{group.label}</span>
+        </span>
+        {isOpen ? <ChevronDown size={14} className="opacity-60 shrink-0" />
+          : <ChevronRight size={14} className="opacity-60 shrink-0" />}
+      </button>
+
+      {isOpen && (
+        <div className="mt-0.5 ml-3 pl-3 border-l border-slate-700/70 space-y-0.5">
+          {children.map((child) => (
+            <Link key={child.label + child.to} to={child.to}
+              className={`flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[13px] transition-colors ${
+                isChildActive(child)
+                  ? 'bg-brand-600 text-white font-medium'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}>
+              {child.icon && <child.icon size={14} className="shrink-0 opacity-80" />}
+              <span className="truncate">{child.label}</span>
+            </Link>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Layout() {
   const { user, logout, can } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [net, setNet] = useState({ online: navigator.onLine, queued: 0 });
+  const [openGroups, setOpenGroups] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(OPEN_KEY) || '{}'); } catch { return {}; }
+  });
   const loc = useLocation();
   const navigate = useNavigate();
   const toast = useToast();
 
-  useEffect(() => { setMobileOpen(false); }, [loc.pathname]);
+  useEffect(() => { setMobileOpen(false); }, [loc.pathname, loc.search]);
   useEffect(() => initOffline(setNet), []);
+
+  const toggle = (label, open) => {
+    setOpenGroups((prev) => {
+      const next = { ...prev, [label]: open };
+      try { localStorage.setItem(OPEN_KEY, JSON.stringify(next)); } catch { /* private mode */ }
+      return next;
+    });
+  };
 
   const sync = async () => {
     const res = await flushQueue();
@@ -92,6 +202,9 @@ export default function Layout() {
     else if (res.error) toast.error(res.error);
     else toast.info('Nothing waiting to sync');
   };
+
+  const visible = useMemo(
+    () => NAV.filter((g) => !g.perm || can(g.perm)), [can]);
 
   const sidebar = (
     <div className="flex h-full flex-col bg-slate-900">
@@ -108,27 +221,19 @@ export default function Layout() {
         <LocationPicker />
       </div>
 
-      <nav className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
-        {NAV.map((group) => {
-          const items = group.items.filter((i) => !i.perm || can(i.perm));
-          if (!items.length) return null;
-          return (
-            <div key={group.section}>
-              <p className="px-3 mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                {group.section}
-              </p>
-              <div className="space-y-0.5">
-                {items.map((item) => (
-                  <NavLink key={item.to} to={item.to} end={item.end}
-                    className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
-                    <item.icon size={16} className="shrink-0" />
-                    <span className="truncate">{item.label}</span>
-                  </NavLink>
-                ))}
-              </div>
-            </div>
-          );
-        })}
+      <nav className="flex-1 overflow-y-auto px-3 py-3 space-y-1">
+        {visible.map((group) =>
+          group.children ? (
+            <NavGroup key={group.label} group={group} currentPath={loc.pathname}
+              currentSearch={loc.search} openGroups={openGroups} toggle={toggle} />
+          ) : (
+            <NavLink key={group.label} to={group.to} end={group.end}
+              className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+              <group.icon size={16} className="shrink-0" />
+              <span className="truncate">{group.label}</span>
+            </NavLink>
+          )
+        )}
       </nav>
 
       <div className="border-t border-slate-800 p-3">
@@ -144,7 +249,8 @@ export default function Layout() {
             <p className="text-sm text-white truncate leading-tight">{user?.name}</p>
             <p className="text-[11px] text-slate-400 capitalize leading-tight">{user?.role}</p>
           </div>
-          <button onClick={logout} title="Sign out" className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800">
+          <button onClick={logout} title="Sign out"
+            className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800">
             <LogOut size={16} />
           </button>
         </div>

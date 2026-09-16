@@ -14,6 +14,8 @@ const EDITABLE = [
   'invoice_prefix', 'sku_prefix', 'epc_company_prefix', 'receipt_footer',
   'logo_url', 'loyalty_earn_per', 'loyalty_point_value', 'loyalty_enabled',
   'low_stock_default', 'fiscal_country', 'einvoice_scheme',
+  'receipt_font_size', 'receipt_paper', 'receipt_show_logo', 'logo_width_mm',
+  'sale_edit_window_days',
 ];
 
 r.put('/', requirePerm('settings.write'), h(async (req, res) => {

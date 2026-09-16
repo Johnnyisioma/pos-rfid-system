@@ -327,6 +327,106 @@ async function run() {
   ok('catalog export includes per-location stock',
     exportCsv.includes('stock_LAG') && exportCsv.includes('E2E Import Shoe'));
 
+
+  // --- receipt settings: logo, font size, paper ---
+  const originalSettings = (await api('GET', '/api/settings')).body;
+  const tinyLogo = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  r = await api('PUT', '/api/settings', {
+    logo_url: tinyLogo, receipt_show_logo: true, receipt_font_size: 14,
+    receipt_paper: '58mm', logo_width_mm: 25,
+  });
+  ok('receipt settings save', r.status === 200 && r.body.receipt_font_size === 14 &&
+    r.body.receipt_paper === '58mm' && r.body.logo_url === tinyLogo,
+    JSON.stringify({ f: r.body.receipt_font_size, p: r.body.receipt_paper }).slice(0, 120));
+
+  // --- amending an issued receipt ---
+  r = await api('POST', '/api/sales', {
+    items: [{ variant_id: v41.id, quantity: 2 }],
+    payments: [{ method: 'cash', amount: 30000 }],
+  });
+  const amendable = r.body;
+  ok('sale created for amendment', r.status === 201 && !!amendable.invoice_no,
+    JSON.stringify(r.body).slice(0, 140));
+
+  r = await api('GET', `/api/sales/${amendable.id}/editable`);
+  ok('a fresh sale is editable', r.body.editable === true && r.body.window_days > 0,
+    JSON.stringify(r.body).slice(0, 140));
+
+  const stockBefore = (await api('GET', `/api/inventory/availability/${v41.id}`))
+    .body.find((x) => x.location_id === lagosId)?.quantity;
+
+  r = await api('PUT', `/api/sales/${amendable.id}`, {
+    items: [{ variant_id: v41.id, quantity: 1 }],
+    reason: 'E2E — customer put one pair back',
+  });
+  const amended = r.body;
+  ok('amend an issued receipt', r.status === 200 && Number(amended.edit_count) === 1,
+    JSON.stringify(r.body).slice(0, 180));
+  ok('invoice number survives the amendment', amended.invoice_no === amendable.invoice_no,
+    `${amendable.invoice_no} -> ${amended.invoice_no}`);
+  ok('amended total recalculated', Number(amended.total) < Number(amendable.total));
+  ok('overpayment becomes change due', Number(amended.change_due) > 0 || Number(amended.balance_due) === 0);
+
+  const stockAfter = (await api('GET', `/api/inventory/availability/${v41.id}`))
+    .body.find((x) => x.location_id === lagosId)?.quantity;
+  ok('the returned pair went back on the shelf', Number(stockAfter) === Number(stockBefore) + 1,
+    `${stockBefore} -> ${stockAfter}`);
+
+  r = await api('GET', `/api/sales/${amendable.id}/revisions`);
+  const rev = r.body[0];
+  ok('revision recorded with before and after', r.body.length === 1 &&
+    rev.before_json.items[0].quantity === 2 && rev.after_json.items[0].quantity === 1,
+    JSON.stringify(r.body).slice(0, 200));
+  ok('revision keeps the reason and who did it',
+    /customer put one pair back/i.test(rev.reason) && !!rev.user_name);
+
+  r = await api('PUT', `/api/sales/${amendable.id}`, {
+    items: [{ variant_id: v41.id, quantity: 1 }],
+  });
+  ok('amendment without a reason is refused', r.status === 400 && /reason/i.test(r.body.error || ''));
+
+  // a cashier must not be able to rewrite an issued receipt
+  const adminToken2 = token;
+  r = await api('POST', '/api/auth/login', { email: 'cashier@millzee.test', password: 'password123' });
+  token = r.body.token;
+  r = await api('PUT', `/api/sales/${amendable.id}`, {
+    items: [{ variant_id: v41.id, quantity: 5 }], reason: 'should not be allowed',
+  });
+  ok('cashier cannot amend an issued receipt', r.status === 403, JSON.stringify(r.body).slice(0, 140));
+  r = await api('GET', `/api/sales/${amendable.id}/editable`);
+  ok('editable says why the cashier is blocked',
+    r.body.editable === false && r.body.reasons.some((x) => /role/i.test(x)),
+    JSON.stringify(r.body).slice(0, 160));
+  token = adminToken2;
+
+  // the window closes
+  await api('PUT', '/api/settings', { sale_edit_window_days: 0 });
+  r = await api('GET', `/api/sales/${amendable.id}/editable`);
+  ok('a zero-day window blocks editing', r.body.editable === false &&
+    r.body.reasons.some((x) => /days old/i.test(x)), JSON.stringify(r.body).slice(0, 160));
+  r = await api('PUT', `/api/sales/${amendable.id}`, {
+    items: [{ variant_id: v41.id, quantity: 1 }], reason: 'outside the window',
+  });
+  ok('amendment outside the window is refused', r.status === 403, JSON.stringify(r.body).slice(0, 140));
+  await api('PUT', '/api/settings', { sale_edit_window_days: 30 });
+
+  // a sale with a return against it is off limits
+  r = await api('GET', `/api/sales/${sale.id}/editable`);
+  ok('a sale with a return cannot be amended', r.body.editable === false &&
+    r.body.reasons.some((x) => /return/i.test(x)), JSON.stringify(r.body).slice(0, 180));
+
+  r = await api('GET', `/api/sales/${amendable.id}/receipt`);
+  ok('receipt carries the logo and print sizing',
+    r.body.business.logo_url === tinyLogo && Number(r.body.business.font_size) === 14 &&
+    r.body.business.paper === '58mm', JSON.stringify(r.body.business).slice(0, 200));
+  ok('amended receipt is marked as such', Number(r.body.sale.edit_count) === 1);
+
+  await api('PUT', '/api/settings', {
+    receipt_font_size: originalSettings.receipt_font_size,
+    receipt_paper: originalSettings.receipt_paper,
+    logo_url: originalSettings.logo_url || '',
+  });
+
   // --- reports ---
   r = await api('GET', '/api/reports/dashboard');
   ok('dashboard report', r.body.month?.revenue > 0 && Array.isArray(r.body.trend));

@@ -36,7 +36,9 @@ Android-based handheld RFID scanner. Works offline and syncs when the connection
 - Credit sales with per-customer credit limits and balance tracking
 - Line and whole-cart discounts, with a per-cashier discount ceiling enforced server-side
 - Returns, refunds and exchanges — with or without the original receipt
-- On-screen and printable 80 mm receipts, plus a gift receipt that hides prices
+- On-screen and printable receipts — 58 mm, 80 mm or A4, with your logo, at a font size you choose
+- A gift receipt that hides prices
+- Managers can amend an issued receipt within a configurable window, with a full before/after trail
 - Till open/close with expected-versus-counted cash reconciliation
 
 **Stock**
@@ -65,8 +67,36 @@ Android-based handheld RFID scanner. Works offline and syncs when the connection
 - Nigeria VAT at a configurable rate, shown separately, with the business TIN on every invoice
   and sequential unbroken invoice numbering
 - Audit log of who created, changed or deleted what
+- Grouped, collapsible sidebar — each area opens onto its own pages, and every sub-page is a real
+  URL you can bookmark or link to
 
 ---
+
+## Editing an issued receipt
+
+Mistakes at the till are normal: the wrong size gets scanned, a discount is forgotten, a customer
+adds a pair on the way out. Rather than force a return-and-resell, an Administrator or Manager can
+amend the receipt directly — **Sales → open the invoice → Edit sale**.
+
+What the system guarantees while you do it:
+
+| | |
+|---|---|
+| **The invoice number never changes** | A VAT invoice sequence has to stay unbroken, so an amendment updates the document in place rather than issuing a new number. |
+| **Every version is kept** | Each edit writes a revision with the full before/after — lines, quantities, prices, totals and the exact RFID tags on each side. Nothing is overwritten silently. |
+| **Stock stays honest** | The tagged units on the original sale go back on the shelf, then units are re-allocated against the new lines. The movement ledger records both halves. |
+| **Prices come from the catalogue** | Line prices are re-read from the database on save, so the edit screen cannot invent a price. |
+| **The customer's ledger follows** | Balance owed, loyalty points and change due are all recalculated from the new total. |
+| **The receipt says so** | A reprint is marked `*** AMENDED COPY — REVISION n ***`. |
+
+Guard rails: only roles with `sales.edit` (Administrator, Manager) can do it; the window is set in
+**Settings → Receipt & invoice** and defaults to 30 days — set it to `0` to switch the feature off;
+a reason is required; and a sale that already has a return against it is refused, because unwinding
+both at once is how ledgers get corrupted. Process another return instead.
+
+> Altering an issued VAT invoice may still require a credit note under Nigerian rules. The system
+> keeps the evidence trail either way — ask your tax adviser how corrections should be handled for
+> your business.
 
 ## How the RFID side works
 
@@ -322,7 +352,7 @@ Password for all of them: `password123`
 │   └── src/
 │       ├── pages/            one file per screen
 │       ├── components/       layout, UI primitives, charts, receipt
-│       └── lib/              API client, auth context, offline queue, formatting
+│       └── lib/              API client, auth context, offline queue, formatting, tab URLs
 └── scripts/
     ├── e2e.js                end-to-end API tests
     └── ui-check.mjs          headless browser pass over every screen
@@ -357,6 +387,7 @@ needs `Authorization: Bearer <token>`; the active branch is passed as `X-Locatio
 | Inventory | `GET /inventory/levels`, `/low-stock`, `/availability/:variantId`, `/movements`, `/valuation`; `POST /inventory/receive`, `/adjustments` |
 | RFID | `GET /rfid/units`, `/units/:id`, `/units/:id/zpl`, `/find`, `/overview`, `/scan-events`; `POST /rfid/units/:id/encode`, `/encode-batch`, `/resolve`, `/scan-events`, `/simulate-sweep`, `/stock-takes`, `/stock-takes/:id/scan`, `/stock-takes/:id/reconcile` |
 | Sales | `GET/POST /sales`, `GET /sales/:id`, `/sales/:id/receipt`, `/sales/held`, `POST /sales/:id/payments` |
+| Amendments | `PUT /sales/:id` (amend an issued receipt), `GET /sales/:id/editable`, `GET /sales/:id/revisions` |
 | Returns | `GET/POST /returns`, `GET /returns/:id`, `/returns/lookup/:invoice` |
 | Purchases | `GET/POST /purchases`, `PUT /purchases/:id`, `POST /purchases/:id/receive`, `/cancel`, `GET /purchases/suggestions/reorder` |
 | Transfers | `GET/POST /transfers`, `POST /transfers/:id/dispatch`, `/receive`, `/cancel` |
@@ -372,17 +403,18 @@ needs `Authorization: Bearer <token>`; the active branch is passed as `X-Locatio
 
 ```bash
 npm start                  # in one terminal
-npm test                   # 79 end-to-end API checks
+npm test                   # 97 end-to-end API checks
 node scripts/ui-check.mjs --shots   # every screen in a headless browser
 ```
 
 The API suite covers the things that would hurt most if they broke: that two identical
 items resolve to two different units, that oversell is blocked, that invoice numbers stay
 sequential, that a cashier can't exceed their discount ceiling, that a replayed offline
-sale isn't duplicated, that a bad import is rejected wholesale, and that returns put the
-right physical unit back on the shelf.
+sale isn't duplicated, that a bad import is rejected wholesale, that returns put the right physical
+unit back on the shelf, and — for amendments — that the invoice number survives, the stock delta is
+exact, a cashier is refused, and the window actually closes.
 
-The UI pass visits all 22 screens at desktop and phone widths, completes a real sale, and
+The UI pass visits all 34 screens and sub-tabs at desktop and phone widths, completes a real sale, and
 fails on any console error, failed request, blank screen or horizontal overflow.
 
 ---
@@ -423,6 +455,8 @@ is a useful human-readable second copy.
 - **Offline mode** covers selling: the catalogue, prices, stock and customers are cached,
   and sales made offline queue locally and sync automatically. Stock-takes, receiving and
   reports need a connection.
-- **Images** are referenced by URL rather than uploaded; point them at any host you like.
+- **Product images** are referenced by URL rather than uploaded; point them at any host you like.
+  The company logo is different — it is uploaded in **Settings → Receipt & invoice**, scaled down in
+  the browser and stored in the database, so it survives Railway redeploys without a volume.
 - **Bundles** deduct their components' stock but are not themselves RFID-tagged, since a
   kit is not a single physical unit.

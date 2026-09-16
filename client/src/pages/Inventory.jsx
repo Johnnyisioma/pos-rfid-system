@@ -11,12 +11,13 @@ import {
 import { RankedBarChart } from '../components/charts.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useTabParam } from '../lib/useTabParam.js';
 import VariantPicker from '../components/VariantPicker.jsx';
 
 export default function Inventory() {
   const { can, locationId, locations } = useAuth();
-  const [params, setParams] = useSearchParams();
-  const [tab, setTab] = useState(params.get('low') === 'true' ? 'low' : 'levels');
+  const [params] = useSearchParams();
+  const [tab, setTab] = useTabParam(params.get('low') === 'true' ? 'low' : 'levels');
 
   return (
     <>
