@@ -566,3 +566,105 @@ CREATE TABLE IF NOT EXISTS sale_revisions (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_sale_revisions_sale ON sale_revisions(sale_id);
+
+-- ============================================================
+--  Tranche A — trading core
+--  Payment accounts, multiple tax rates, purchase returns.
+-- ============================================================
+
+-- A4 · Where money actually lands: the till, a bank account, an Opay or
+--      Moniepoint wallet, a POS terminal's settlement account.
+CREATE TABLE IF NOT EXISTS payment_accounts (
+  id              SERIAL PRIMARY KEY,
+  name            TEXT NOT NULL,
+  type            TEXT NOT NULL DEFAULT 'bank'
+                  CHECK (type IN ('cash','bank','mobile_money','card_terminal','other')),
+  account_number  TEXT DEFAULT '',
+  bank_name       TEXT DEFAULT '',
+  opening_balance NUMERIC(14,2) NOT NULL DEFAULT 0,
+  location_id     INT REFERENCES locations(id) ON DELETE SET NULL,
+  is_default      BOOLEAN NOT NULL DEFAULT FALSE,
+  is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+  notes           TEXT DEFAULT '',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS account_id INT REFERENCES payment_accounts(id) ON DELETE SET NULL;
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS account_id INT REFERENCES payment_accounts(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_payments_account ON payments(account_id);
+
+-- Which account a tender type defaults to, so a cashier never has to choose.
+CREATE TABLE IF NOT EXISTS payment_method_accounts (
+  method      TEXT PRIMARY KEY,
+  account_id  INT REFERENCES payment_accounts(id) ON DELETE SET NULL
+);
+
+-- A5 · A supermarket rings VAT-able and exempt lines on the same receipt.
+CREATE TABLE IF NOT EXISTS tax_rates (
+  id         SERIAL PRIMARY KEY,
+  name       TEXT NOT NULL UNIQUE,
+  rate       NUMERIC(6,3) NOT NULL DEFAULT 0,
+  is_exempt  BOOLEAN NOT NULL DEFAULT FALSE,
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE products ADD COLUMN IF NOT EXISTS tax_rate_id INT REFERENCES tax_rates(id) ON DELETE SET NULL;
+
+-- A1 · Sending bad goods back to the supplier. Without this, damage leaves as a
+--      stock adjustment and quietly becomes shrinkage.
+CREATE TABLE IF NOT EXISTS purchase_returns (
+  id            SERIAL PRIMARY KEY,
+  ref           TEXT NOT NULL UNIQUE,
+  po_id         INT REFERENCES purchase_orders(id) ON DELETE SET NULL,
+  supplier_id   INT REFERENCES suppliers(id) ON DELETE SET NULL,
+  location_id   INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  reason        TEXT NOT NULL,
+  notes         TEXT DEFAULT '',
+  total         NUMERIC(14,2) NOT NULL DEFAULT 0,
+  credit_note   TEXT DEFAULT '',
+  user_id       INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS purchase_return_items (
+  id          BIGSERIAL PRIMARY KEY,
+  return_id   INT NOT NULL REFERENCES purchase_returns(id) ON DELETE CASCADE,
+  variant_id  INT NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+  quantity    NUMERIC(14,3) NOT NULL,
+  unit_cost   NUMERIC(14,2) NOT NULL DEFAULT 0,
+  line_total  NUMERIC(14,2) NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS purchase_return_units (
+  return_id INT NOT NULL REFERENCES purchase_returns(id) ON DELETE CASCADE,
+  unit_id   BIGINT NOT NULL REFERENCES stock_units(id) ON DELETE CASCADE,
+  PRIMARY KEY (return_id, unit_id)
+);
+
+-- a unit sent back to the supplier leaves stock without becoming shrinkage
+ALTER TABLE stock_units DROP CONSTRAINT IF EXISTS stock_units_status_check;
+ALTER TABLE stock_units ADD CONSTRAINT stock_units_status_check
+  CHECK (status IN ('in_stock','sold','in_transit','damaged','lost','returned','reserved','returned_supplier'));
+
+-- seed the two tax rates every Nigerian retailer needs
+INSERT INTO tax_rates (name, rate, is_exempt, is_default)
+SELECT 'VAT 7.5%', 7.5, FALSE, TRUE
+WHERE NOT EXISTS (SELECT 1 FROM tax_rates);
+INSERT INTO tax_rates (name, rate, is_exempt, is_default)
+SELECT 'VAT exempt', 0, TRUE, FALSE
+WHERE NOT EXISTS (SELECT 1 FROM tax_rates WHERE is_exempt);
+
+-- and a till account so a cash payment has somewhere to land from day one
+INSERT INTO payment_accounts (name, type, is_default)
+SELECT 'Cash till', 'cash', TRUE
+WHERE NOT EXISTS (SELECT 1 FROM payment_accounts);
+
+-- Map cash to that till, and nothing else. Transfers, cards and wallets stay
+-- unmapped on purpose: the shop's bank and Opay accounts are its own to add,
+-- and an unassigned transfer is visible in the Money in & out report, whereas
+-- a transfer quietly banked into the cash till is not.
+INSERT INTO payment_method_accounts (method, account_id)
+SELECT 'cash', id FROM payment_accounts
+ WHERE type = 'cash' AND is_default
+   AND NOT EXISTS (SELECT 1 FROM payment_method_accounts)
+ ORDER BY id LIMIT 1;

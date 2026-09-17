@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
 import {
-  Radio, Printer, Search, Download, Tag, CheckSquare, Square, Copy, Cpu, ScanLine,
+  Radio, Printer, Search, Tag, CheckSquare, Square, Copy, Cpu, ScanLine,
 } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, dateTime, prettyEpc, labelize } from '../lib/format.js';
@@ -10,6 +10,7 @@ import {
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import ExportButtons from '../components/ExportButtons.jsx';
 
 export default function RfidUnits() {
   const { can, locationId } = useAuth();
@@ -61,9 +62,7 @@ export default function RfidUnits() {
         actions={
           <>
             <Link to="/rfid/scan" className="btn-secondary"><ScanLine size={16} /> Scan</Link>
-            <button className="btn-secondary" onClick={() => api.download('/api/reports/export/units?format=xlsx')}>
-              <Download size={16} /> Export
-            </button>
+            <ExportButtons report="units" title="Tagged units" filename="rfid-units" />
           </>
         } />
 

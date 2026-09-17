@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
   Save, Plus, MapPin, Users, Tag, Layers, Building2, Trash2, Calculator,
-  Upload, ImageOff, Receipt as ReceiptIcon, Info,
+  Upload, ImageOff, Receipt as ReceiptIcon, Info, Percent, ShieldCheck, Lock, Check, Minus,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { money, labelize, dateTime } from '../lib/format.js';
@@ -24,7 +24,9 @@ export default function Settings() {
         { value: 'receipt', label: 'Receipt & invoice' },
         { value: 'locations', label: 'Locations' },
         { value: 'registers', label: 'Registers' },
-        { value: 'users', label: 'Staff & roles' },
+        { value: 'users', label: 'Staff' },
+        { value: 'roles', label: 'Roles & permissions' },
+        { value: 'taxes', label: 'Tax rates' },
         { value: 'catalog', label: 'Catalogue options' },
         { value: 'account', label: 'My account' },
       ]} />
@@ -33,6 +35,8 @@ export default function Settings() {
       {tab === 'locations' && <Locations />}
       {tab === 'registers' && <Registers />}
       {tab === 'users' && <Staff />}
+      {tab === 'roles' && <RolesMatrix />}
+      {tab === 'taxes' && <TaxRates />}
       {tab === 'catalog' && <CatalogOptions />}
       {tab === 'account' && <Account />}
     </>
@@ -817,5 +821,234 @@ function Account() {
         </div>
       </Card>
     </div>
+  );
+}
+
+/* ---------------- tax rates ---------------- */
+/**
+ * Most of a Nigerian shoe shop's catalogue is standard-rated at 7.5%, but not
+ * all of it — and a single global rate means the exempt lines get taxed
+ * quietly and the VAT return is wrong. A rate per product fixes that; the
+ * business-wide rate stays as the fallback for anything unassigned.
+ */
+function TaxRates() {
+  const { can, settings } = useAuth();
+  const toast = useToast();
+  const [rows, setRows] = useState(null);
+  const [editing, setEditing] = useState(null);
+
+  const load = useCallback(() =>
+    api.get('/api/catalog').then((c) => setRows(c.taxRates || [])).catch(() => setRows([])), []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (form) => {
+    try {
+      if (form.id) await api.put(`/api/catalog/tax-rates/${form.id}`, form);
+      else await api.post('/api/catalog/tax-rates', form);
+      toast.success('Tax rate saved');
+      setEditing(null);
+      load();
+    } catch (e) { toast.error(e.message); }
+  };
+
+  if (!rows) return <Loading />;
+
+  return (
+    <div className="grid lg:grid-cols-3 gap-4">
+      <Card className="lg:col-span-2" bodyClass="p-0" title="Tax rates"
+        subtitle="Assign one to a product and its VAT is worked out at that rate instead of the business default"
+        actions={can('settings.write') && (
+          <button className="btn-primary text-xs" onClick={() => setEditing({ rate: 7.5 })}>
+            <Plus size={14} /> New rate
+          </button>
+        )}>
+        {rows.length === 0 ? (
+          <Empty title="No tax rates yet" icon={Percent}
+            hint={`Everything is taxed at the business rate of ${settings?.vat_rate || 7.5}%.`} />
+        ) : (
+          <table className="data">
+            <thead><tr><th>Name</th><th className="text-right">Rate</th><th>Flags</th><th></th></tr></thead>
+            <tbody>
+              {rows.map((t) => (
+                <tr key={t.id}>
+                  <td className="font-medium text-slate-800">{t.name}</td>
+                  <td className="text-right tabular-nums font-medium">{Number(t.rate).toFixed(2)}%</td>
+                  <td>
+                    <div className="flex flex-wrap gap-1.5">
+                      {t.is_default && <Badge status="found">Default</Badge>}
+                      {t.is_exempt && <Badge>Exempt / zero-rated</Badge>}
+                      {!t.is_active && <Badge status="cancelled">Inactive</Badge>}
+                    </div>
+                  </td>
+                  <td className="text-right whitespace-nowrap">
+                    {can('settings.write') && (
+                      <>
+                        <button className="btn-ghost text-xs" onClick={() => setEditing(t)}>Edit</button>
+                        <ConfirmButton className="btn-ghost p-1.5 text-rose-600" message="Remove this rate?"
+                          onConfirm={async () => {
+                            const res = await api.del(`/api/catalog/tax-rates/${t.id}`);
+                            toast.success(res.message || 'Tax rate removed');
+                            load();
+                          }}>
+                          <Trash2 size={14} />
+                        </ConfirmButton>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+
+      <Card title="How this is applied">
+        <div className="space-y-3 text-sm text-slate-600">
+          <p>
+            A product with no rate assigned uses the business VAT rate, currently{' '}
+            <strong className="text-slate-800">{settings?.vat_rate ?? 7.5}%</strong>.
+          </p>
+          <p>
+            Prices {settings?.prices_include_vat ? 'include' : 'exclude'} VAT, so the tax on a line is
+            worked out {settings?.prices_include_vat
+              ? 'by extracting it from the shelf price'
+              : 'by adding it on top of the shelf price'}.
+          </p>
+          <p>
+            Receipts show a VAT breakdown per rate, so a basket mixing a standard-rated pair of shoes
+            with a zero-rated item prints both lines and totals correctly.
+          </p>
+          <p className="flex items-start gap-2 text-xs text-slate-500 bg-slate-50 rounded-lg p-2.5">
+            <Info size={14} className="mt-0.5 shrink-0" />
+            Rates already used by a product are deactivated rather than deleted, so historical invoices
+            keep showing the rate that was actually charged.
+          </p>
+        </div>
+      </Card>
+
+      {editing && (
+        <Modal open onClose={() => setEditing(null)} size="sm"
+          title={editing.id ? 'Edit tax rate' : 'New tax rate'}
+          footer={<><button className="btn-secondary" onClick={() => setEditing(null)}>Cancel</button>
+            <button className="btn-primary" onClick={() => save(editing)}>Save</button></>}>
+          <div className="space-y-3">
+            <Field label="Name" hint="What it will be called on the product form — “VAT 7.5%”, “Zero-rated”">
+              <input className="input" autoFocus value={editing.name || ''}
+                onChange={(e) => setEditing({ ...editing, name: e.target.value })} />
+            </Field>
+            <Field label="Rate (%)" hint="Enter 0 for an exempt or zero-rated item">
+              <input type="number" step="0.01" min="0" max="100" className="input"
+                value={editing.rate ?? 0}
+                onChange={(e) => setEditing({ ...editing, rate: e.target.value })} />
+            </Field>
+            {editing.id && (
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" className="rounded border-slate-300"
+                  checked={!!editing.is_default}
+                  onChange={(e) => setEditing({ ...editing, is_default: e.target.checked })} />
+                Offer this rate first on new products
+              </label>
+            )}
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- roles & permissions ---------------- */
+/**
+ * Read-only on purpose. Roles live in the server's code, not in a table,
+ * because a permission set that can be edited from the admin screen is a
+ * permission set that anyone reaching that screen can widen. This page shows
+ * exactly what the server enforces so nobody has to guess — or discover it
+ * when a cashier can suddenly void yesterday's sales.
+ */
+const ROLE_DETAIL = {
+  admin: 'Everything, including settings, staff and the audit log. Keep this to one or two people.',
+  manager: 'Runs a shop day to day: stock, purchases, staff, reports, and amending an issued invoice.',
+  cashier: 'Sells, takes returns and runs the register. Cannot change prices, stock counts or settings.',
+  inventory: 'Receives goods, tags units, counts stock and moves it between shops. No till access.',
+};
+
+// labelize() would render these as "Rfid" and "Pos".
+const AREA_LABELS = { rfid: 'RFID', pos: 'POS', vat: 'VAT' };
+
+function RolesMatrix() {
+  const [data, setData] = useState(null);
+  useEffect(() => { api.get('/api/users/roles').then(setData).catch(() => setData(null)); }, []);
+
+  if (!data) return <Loading />;
+
+  const cellFor = (value) => {
+    if (value === 'full') return <Check size={15} className="text-emerald-600 mx-auto" />;
+    if (value === 'none') return <Minus size={15} className="text-slate-300 mx-auto" />;
+    return <span className="text-[11px] text-slate-600">{value}</span>;
+  };
+
+  return (
+    <>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+        {data.roles.map((r) => (
+          <Card key={r.role} bodyClass="p-4">
+            <div className="flex items-start gap-2">
+              <div className="h-9 w-9 rounded-lg bg-slate-100 grid place-items-center shrink-0">
+                {r.is_superuser ? <ShieldCheck size={17} className="text-brand-600" />
+                  : <Users size={17} className="text-slate-500" />}
+              </div>
+              <div className="min-w-0">
+                <p className="font-medium text-slate-800">{r.label}</p>
+                <p className="text-xs text-slate-500 font-mono">{r.role}</p>
+              </div>
+            </div>
+            <p className="text-xs text-slate-600 mt-2.5 leading-relaxed">{ROLE_DETAIL[r.role]}</p>
+            <div className="flex flex-wrap gap-1.5 mt-2.5">
+              <Badge status={r.active_users > 0 ? 'completed' : undefined}>
+                {r.active_users} active
+              </Badge>
+              {r.users !== r.active_users && <Badge>{r.users - r.active_users} disabled</Badge>}
+              {r.is_superuser && <Badge status="found">Full access</Badge>}
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <Card bodyClass="p-0" title="What each role can reach"
+        subtitle="Exactly as the server enforces it — a tick is full access to that area">
+        <div className="table-wrap">
+          <table className="data">
+            <thead>
+              <tr>
+                <th>Area</th>
+                {data.roles.map((r) => <th key={r.role} className="text-center">{r.label}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {data.areas.map((area) => (
+                <tr key={area}>
+                  <td className="font-medium text-slate-700">
+                    {AREA_LABELS[area] || labelize(area)}
+                  </td>
+                  {data.roles.map((r) => (
+                    <td key={r.role} className="text-center">{cellFor(r.areas[area])}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex items-start gap-2 px-4 py-3 border-t border-slate-100">
+          <Lock size={14} className="mt-0.5 shrink-0 text-slate-400" />
+          <p className="text-xs text-slate-500 leading-relaxed">
+            Roles are fixed in the server rather than editable here, so nobody can widen their own
+            access from inside the app. To change what a role may do, edit{' '}
+            <code className="font-mono text-[11px] text-slate-600 bg-slate-100 rounded px-1 py-0.5">
+              server/lib/permissions.js
+            </code>{' '}
+            and redeploy — the change then applies everywhere at once, including the API.
+          </p>
+        </div>
+      </Card>
+    </>
   );
 }

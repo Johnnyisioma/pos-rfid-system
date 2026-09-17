@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, Search, Users, Download, Star, Wallet, CreditCard, Tag } from 'lucide-react';
+import { Plus, Search, Users, Star, Wallet, CreditCard, Tag } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, date } from '../lib/format.js';
 import {
@@ -8,6 +8,7 @@ import {
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import ExportButtons from '../components/ExportButtons.jsx';
 import { useTabParam } from '../lib/useTabParam.js';
 
 export default function Customers() {
@@ -73,9 +74,7 @@ function CustomerList() {
             <option value="true">Owing money</option>
             <option value="false">Settled</option>
           </select>
-          <button className="btn-secondary" onClick={() => api.download('/api/reports/export/customers?format=xlsx')}>
-            <Download size={16} /> Export
-          </button>
+          <ExportButtons report="customers" title="Customers" />
           {can('customers.write') && (
             <button className="btn-primary" onClick={() => setEditing({})}><Plus size={16} /> New customer</button>
           )}

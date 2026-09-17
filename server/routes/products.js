@@ -93,7 +93,7 @@ r.get('/search', h(async (req, res) => {
        LEFT JOIN location_prices lp ON lp.variant_id=v.id AND lp.location_id=$2
       WHERE p.is_active AND v.is_active
         AND (p.name ILIKE $1 OR v.sku ILIKE $1 OR p.sku ILIKE $1 OR v.barcode = $3)
-      ORDER BY p.name, v.size, v.color
+      ORDER BY (COALESCE(i.quantity,0) > 0) DESC, p.name, v.size, v.color
       LIMIT 40`,
     [`%${q}%`, locationId, q]
   );
@@ -103,11 +103,13 @@ r.get('/search', h(async (req, res) => {
 /* ---------------- single ---------------- */
 async function loadProduct(id, locationId) {
   const product = await one(
-    `SELECT p.*, b.name AS brand_name, c.name AS category_name, sc.name AS sub_category_name
+    `SELECT p.*, b.name AS brand_name, c.name AS category_name, sc.name AS sub_category_name,
+            tr.name AS tax_rate_name
        FROM products p
        LEFT JOIN brands b ON b.id=p.brand_id
        LEFT JOIN categories c ON c.id=p.category_id
        LEFT JOIN categories sc ON sc.id=p.sub_category_id
+       LEFT JOIN tax_rates tr ON tr.id=p.tax_rate_id
       WHERE p.id=$1`, [id]);
   if (!product) return null;
   product.variants = await many(
@@ -157,13 +159,14 @@ r.post('/', requirePerm('products.write'), h(async (req, res) => {
 
     const { rows } = await c.query(
       `INSERT INTO products (name,sku,type,brand_id,category_id,sub_category_id,unit,description,
-                             image_url,tax_rate,reorder_point,track_rfid,is_active,created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+                             image_url,tax_rate,reorder_point,track_rfid,is_active,created_by,tax_rate_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
       [name, sku, type, body.brand_id || null, body.category_id || null, body.sub_category_id || null,
        str(body.unit, 'pair'), str(body.description), str(body.image_url),
        num(body.tax_rate, settings.vat_rate), int(body.reorder_point, settings.low_stock_default),
        body.track_rfid === undefined ? true : bool(body.track_rfid),
-       body.is_active === undefined ? true : bool(body.is_active), req.user.id]
+       body.is_active === undefined ? true : bool(body.is_active), req.user.id,
+       int(body.tax_rate_id) || null]
     );
     const p = rows[0];
 
@@ -211,13 +214,14 @@ r.put('/:id', requirePerm('products.write'), h(async (req, res) => {
               unit=COALESCE($6,unit), description=COALESCE($7,description), image_url=COALESCE($8,image_url),
               tax_rate=COALESCE($9,tax_rate), reorder_point=COALESCE($10,reorder_point),
               track_rfid=COALESCE($11,track_rfid), is_active=COALESCE($12,is_active),
-              type=COALESCE($13,type), updated_at=now()
+              type=COALESCE($13,type), tax_rate_id=COALESCE($14,tax_rate_id), updated_at=now()
         WHERE id=$1`,
       [id, body.name ?? null, body.brand_id ?? null, body.category_id ?? null, body.sub_category_id ?? null,
        body.unit ?? null, body.description ?? null, body.image_url ?? null,
        body.tax_rate ?? null, body.reorder_point ?? null,
        'track_rfid' in body ? bool(body.track_rfid) : null,
-       'is_active' in body ? bool(body.is_active) : null, body.type ?? null]
+       'is_active' in body ? bool(body.is_active) : null, body.type ?? null,
+       int(body.tax_rate_id) || null]
     );
 
     if (Array.isArray(body.variants)) {

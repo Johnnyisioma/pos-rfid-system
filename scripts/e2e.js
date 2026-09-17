@@ -41,6 +41,9 @@ async function upload(path, csv, filename = 'file.csv') {
   return { status: res.status, body: await res.json() };
 }
 
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const daysAgoStr = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+
 async function run() {
   console.log(`\nRunning end-to-end tests against ${BASE}\n${'-'.repeat(64)}`);
 
@@ -64,7 +67,13 @@ async function run() {
 
   r = await api('GET', '/api/products/search?q=oxford');
   ok('POS variant search', Array.isArray(r.body) && r.body.length > 0);
-  const searchHit = r.body[0];
+  ok('search puts sellable stock first',
+    r.body.length < 2 || Number(r.body[0].stock) >= Number(r.body[r.body.length - 1].stock),
+    JSON.stringify(r.body.map((x) => x.stock)));
+  // Later tests sell this three times over, so it has to be a line with real
+  // stock at THIS location — picking row 0 blind makes the suite depend on
+  // where the seed happened to land its inventory.
+  const searchHit = r.body.find((x) => Number(x.stock) >= 4) || r.body[0];
 
   r = await api('POST', '/api/products', {
     name: 'E2E Test Sandal', type: 'variable', unit: 'pair', tax_rate: 7.5, reorder_point: 2,
@@ -294,10 +303,14 @@ async function run() {
   const csv = await res.text();
   ok('CSV template downloads', res.status === 200 && csv.includes('product_name'));
 
+  // Unique per run: the importer correctly UPDATES a product it already knows,
+  // so a fixed SKU would make this assertion fail on the second run against the
+  // same database and look like a regression.
+  const impSku = `E2E-IMP-${Date.now().toString(36).toUpperCase()}`;
   const importCsv = [
     'product_name,product_sku,type,brand,category,sub_category,size,color,cost_price,selling_price,opening_stock,location_code',
-    'E2E Import Shoe,E2E-IMP-1,variable,TestBrand,Footwear,Sneakers,42,Blue,8000,17000,2,LAG',
-    'E2E Import Shoe,E2E-IMP-1,variable,TestBrand,Footwear,Sneakers,43,Blue,8000,17000,1,LAG',
+    `E2E Import Shoe ${impSku},${impSku},variable,TestBrand,Footwear,Sneakers,42,Blue,8000,17000,2,LAG`,
+    `E2E Import Shoe ${impSku},${impSku},variable,TestBrand,Footwear,Sneakers,43,Blue,8000,17000,1,LAG`,
   ].join('\n');
   let up = await upload('/api/io/products/validate', importCsv, 'import.csv');
   ok('import validation passes clean file', up.body.ok === true && up.body.summary.variants === 2,
@@ -471,6 +484,292 @@ async function run() {
   const printer = r.body.find((d) => d.kind === 'rfid_printer');
   r = await api('POST', `/api/devices/${printer.id}/test`, {});
   ok('printer test label works in mock mode', r.body.ok === true && r.body.zpl.includes('^RFW'));
+
+
+  /* ================================================================ */
+  /*  Payment accounts, purchase returns, tax rates and the new       */
+  /*  management reports added in the menu-rework tranche.            */
+  /* ================================================================ */
+
+  // --- payment accounts ---
+  r = await api('POST', '/api/accounts', {
+    name: 'E2E Cash Till', type: 'cash', opening_balance: 50000, is_default: true,
+  });
+  ok('create a payment account', r.status === 201 && r.body.id, JSON.stringify(r.body).slice(0, 150));
+  const till = r.body;
+
+  r = await api('POST', '/api/accounts', {
+    name: 'E2E Moniepoint', type: 'mobile_money', bank_name: 'Moniepoint',
+    account_number: '8100000000', opening_balance: 0,
+  });
+  ok('a second account does not inherit default', r.status === 201 && r.body.is_default === false);
+  const wallet = r.body;
+
+  r = await api('GET', '/api/accounts');
+  ok('account list carries a computed balance',
+    r.body.accounts.some((a) => a.id === till.id && Number(a.balance) >= 50000),
+    JSON.stringify(r.body.accounts?.slice(0, 2)).slice(0, 200));
+
+  r = await api('PUT', '/api/accounts/method-defaults', {
+    mapping: { cash: till.id, transfer: wallet.id, card: '' },
+  });
+  ok('tender defaults saved', r.status === 200 && r.body.some((m) => m.method === 'cash'),
+    JSON.stringify(r.body).slice(0, 150));
+
+  // A payment taken after the mapping exists should land in the mapped account
+  // on its own — a cashier is never asked to choose.
+  r = await api('POST', '/api/sales', {
+    items: [{ variant_id: searchHit.variant_id, quantity: 1 }],
+    payments: [{ method: 'cash', amount: 60000 }],
+    status: 'completed',
+  });
+  const mappedSale = r.body;
+  ok('sale completes with tender mapping in place', r.status === 201, JSON.stringify(r.body).slice(0, 150));
+
+  r = await api('GET', `/api/accounts/${till.id}`);
+  ok('payment routed to the mapped account without being told',
+    Number(r.body.money_in) > 0 && r.body.recent.some((m) => m.document === mappedSale.invoice_no),
+    JSON.stringify({ in: r.body.money_in, n: r.body.recent?.length }));
+  ok('account balance = opening + in - out',
+    Math.abs(Number(r.body.balance) - (50000 + Number(r.body.money_in) - Number(r.body.money_out))) < 0.01);
+
+  // A tender with no mapping must NOT be swept into the default cash till —
+  // it would corrupt the drawer figure and hide that the bank account was
+  // never set up. It should stay unassigned and visible in the report.
+  r = await api('PUT', '/api/accounts/method-defaults', { mapping: { card: '' } });
+  ok('a mapping can be cleared', r.status === 200);
+  r = await api('POST', '/api/sales', {
+    items: [{ variant_id: searchHit.variant_id, quantity: 1 }],
+    payments: [{ method: 'card', amount: 300000 }],
+    status: 'completed',
+  });
+  const cardSale = r.body;
+  ok('an unmapped card payment still completes the sale', r.status === 201,
+    JSON.stringify(r.body).slice(0, 150));
+  r = await api('GET', `/api/accounts/${till.id}`);
+  ok('an unmapped card payment is not swept into the cash till',
+    !r.body.recent.some((m) => m.document === cardSale.invoice_no),
+    JSON.stringify(r.body.recent?.slice(0, 2)).slice(0, 180));
+
+  r = await api('GET', `/api/reports/payments?from=${daysAgoStr(1)}&to=${todayStr()}`);
+  ok('the unassigned money is surfaced rather than hidden',
+    r.body.sell_by_account.some((a) => a.account === 'Unassigned'),
+    JSON.stringify(r.body.sell_by_account).slice(0, 180));
+
+  r = await api('DELETE', `/api/accounts/${till.id}`);
+  ok('an account with money against it is deactivated, not deleted',
+    r.body.deactivated === true, JSON.stringify(r.body).slice(0, 150));
+
+  r = await api('DELETE', `/api/accounts/${wallet.id}`);
+  ok('an unused account deletes cleanly', r.body.deleted === true, JSON.stringify(r.body).slice(0, 120));
+
+  // --- tax rates ---
+  r = await api('POST', '/api/catalog/tax-rates', { name: 'E2E Zero-rated', rate: 0 });
+  ok('create a zero-rated tax rate', r.status === 201 && r.body.is_exempt === true,
+    JSON.stringify(r.body).slice(0, 150));
+  const zeroRate = r.body;
+
+  r = await api('POST', '/api/catalog/tax-rates', { name: 'E2E Standard', rate: 7.5 });
+  ok('a non-zero rate is not marked exempt', r.status === 201 && r.body.is_exempt === false);
+  const stdRate = r.body;
+
+  r = await api('POST', '/api/catalog/tax-rates', { name: 'E2E Bad', rate: 150 });
+  ok('an impossible rate is refused', r.status === 400, JSON.stringify(r.body).slice(0, 120));
+
+  r = await api('GET', '/api/catalog');
+  ok('tax rates reach the product form', (r.body.taxRates || []).some((t) => t.id === zeroRate.id));
+
+  // A product carrying the zero rate must actually be taxed at zero.
+  r = await api('POST', '/api/products', {
+    name: 'E2E Exempt Item', type: 'single', unit: 'piece',
+    tax_rate: 0, tax_rate_id: zeroRate.id, reorder_point: 1,
+    variants: [{ size: '', color: '', cost_price: 1000, selling_price: 5000 }],
+  });
+  ok('product saves against a named tax rate', r.status === 201 && r.body.tax_rate_id === zeroRate.id,
+    JSON.stringify(r.body).slice(0, 150));
+  const exemptProduct = r.body;
+  const exemptVariant = exemptProduct.variants[0];
+
+  r = await api('GET', `/api/products/${exemptProduct.id}`);
+  ok('the rate name comes back with the product', r.body.tax_rate_name === 'E2E Zero-rated',
+    String(r.body.tax_rate_name));
+
+  await api('POST', '/api/inventory/receive', {
+    location_id: locationId, reason: 'E2E exempt stock',
+    items: [{ variant_id: exemptVariant.id, quantity: 2, cost_price: 1000 }],
+  });
+
+  r = await api('POST', '/api/sales', {
+    items: [
+      { variant_id: exemptVariant.id, quantity: 1 },
+      { variant_id: searchHit.variant_id, quantity: 1 },
+    ],
+    payments: [{ method: 'cash', amount: 200000 }],
+    status: 'completed',
+  });
+  ok('a mixed-rate basket completes', r.status === 201, JSON.stringify(r.body).slice(0, 200));
+  const mixedSale = r.body;
+
+  r = await api('GET', `/api/sales/${mixedSale.id}`);
+  const exemptLine = r.body.items.find((i) => i.variant_id === exemptVariant.id);
+  const taxedLine = r.body.items.find((i) => i.variant_id === searchHit.variant_id);
+  ok('the exempt line carries no VAT',
+    Number(exemptLine?.tax_amount) === 0 && Number(exemptLine?.tax_rate) === 0,
+    JSON.stringify(exemptLine).slice(0, 150));
+  ok('the standard line still carries VAT', Number(taxedLine?.tax_amount) > 0);
+  ok('the two lines sit at different rates',
+    Number(exemptLine?.tax_rate) !== Number(taxedLine?.tax_rate),
+    `${exemptLine?.tax_rate} vs ${taxedLine?.tax_rate}`);
+
+  r = await api('DELETE', `/api/catalog/tax-rates/${stdRate.id}`);
+  ok('an unused tax rate deletes', r.body.ok === true);
+  r = await api('DELETE', `/api/catalog/tax-rates/${zeroRate.id}`);
+  ok('a tax rate in use is deactivated, not deleted', r.body.deactivated === true,
+    JSON.stringify(r.body).slice(0, 150));
+
+  // --- purchase returns ---
+  r = await api('GET', '/api/purchases/returns');
+  ok('the returns list is not read as a purchase order id', r.status === 200 && Array.isArray(r.body.data),
+    JSON.stringify(r.body).slice(0, 120));
+  const returnsBefore = r.body.total;
+
+  r = await api('GET', '/api/suppliers?limit=1');
+  const returnSupplier = r.body.data[0];
+
+  r = await api('POST', '/api/inventory/receive', {
+    location_id: locationId, reason: 'E2E stock to send back',
+    items: [{ variant_id: v41.id, quantity: 2, cost_price: 5000 }],
+  });
+  const returnableUnits = r.body.units;
+
+  const stockOf = async (variantId) => {
+    const res = await api('GET', `/api/products/${testProduct.id}`);
+    return Number(res.body.variants?.find((x) => x.id === variantId)?.stock ?? 0);
+  };
+  const beforeQty = await stockOf(v41.id);
+
+  r = await api('POST', '/api/purchases/returns', {
+    supplier_id: returnSupplier.id, location_id: locationId,
+    reason: 'Damaged in transit', credit_note: 'CN-E2E-1',
+    items: [{ variant_id: v41.id, quantity: 2, unit_cost: 5000,
+      unit_ids: returnableUnits.map((u) => u.id) }],
+  });
+  ok('record a purchase return', r.status === 201 && r.body.ref?.startsWith('PRT'),
+    JSON.stringify(r.body).slice(0, 150));
+  ok('the return is valued at cost', Number(r.body.total) === 10000, String(r.body.total));
+  const purchaseReturn = r.body;
+
+  r = await api('POST', '/api/purchases/returns', {
+    supplier_id: returnSupplier.id, reason: '',
+    items: [{ variant_id: v41.id, quantity: 1 }],
+  });
+  ok('a return without a reason is refused', r.status === 400, JSON.stringify(r.body).slice(0, 120));
+
+  r = await api('POST', '/api/purchases/returns', {
+    supplier_id: returnSupplier.id, reason: 'Faulty / defective',
+    items: [{ variant_id: v41.id, quantity: 9999 }],
+  });
+  ok('returning more than you hold is refused', r.status === 400, JSON.stringify(r.body).slice(0, 140));
+
+  const afterQty = await stockOf(v41.id);
+  ok('stock drops by exactly what went back', beforeQty - afterQty === 2, `${beforeQty} -> ${afterQty}`);
+
+  r = await api('GET', `/api/purchases/returns/${purchaseReturn.id}`);
+  ok('the return records which physical units left', r.body.units?.length === 2,
+    JSON.stringify(r.body.units).slice(0, 150));
+  ok('returned units are no longer sellable',
+    r.body.units.every((u) => returnableUnits.some((x) => x.id === u.id)));
+
+  r = await api('GET', `/api/rfid/units?variant_id=${v41.id}&status=returned_supplier`);
+  ok('returned units carry their own status, not "damaged"',
+    (r.body.data || []).length >= 2, JSON.stringify(r.body).slice(0, 140));
+
+  // Shrinkage must not absorb supplier damage — that is the whole point.
+  r = await api('GET', `/api/reports/stock-adjustments${'?from=' + daysAgoStr(1) + '&to=' + todayStr()}`);
+  const shrinkReasons = (r.body.by_reason || []).map((x) => x.reason);
+  ok('a supplier return is not counted as shrinkage',
+    !shrinkReasons.some((x) => /returned to supplier/i.test(String(x))),
+    JSON.stringify(shrinkReasons).slice(0, 150));
+
+  r = await api('GET', '/api/purchases/returns');
+  ok('the new return shows in the list', r.body.total === returnsBefore + 1,
+    `${returnsBefore} -> ${r.body.total}`);
+
+  r = await api('GET', `/api/reports/export/purchase-returns?format=csv&from=${daysAgoStr(1)}&to=${todayStr()}`, null, true);
+  const prCsv = await r.text();
+  ok('purchase returns export to CSV', r.status === 200 && prCsv.includes('PRT'), prCsv.slice(0, 80));
+
+  // --- new management reports ---
+  r = await api('GET', '/api/reports/today');
+  ok('today strip reports a figure', r.status === 200 && r.body.revenue !== undefined,
+    JSON.stringify(r.body).slice(0, 150));
+
+  r = await api('GET', '/api/reports/alerts');
+  ok('alerts endpoint answers',
+    r.status === 200 && Array.isArray(r.body.low_stock) && Array.isArray(r.body.unpaid)
+    && typeof r.body.count === 'number',
+    JSON.stringify(r.body).slice(0, 150));
+  ok('the alert badge count matches what is listed',
+    r.body.count === r.body.low_stock.length + r.body.unpaid.length + (r.body.tags_pending > 0 ? 1 : 0),
+    JSON.stringify({ c: r.body.count, l: r.body.low_stock.length, u: r.body.unpaid.length }));
+
+  r = await api('GET', '/api/reports/payment-by-age');
+  ok('payment by age buckets the debt',
+    r.body.buckets && ['current', 'd31_60', 'd61_90', 'over_90'].every((k) => k in r.body.buckets),
+    JSON.stringify(r.body.buckets));
+  ok('the buckets add up to the total',
+    Math.abs(Object.values(r.body.buckets).reduce((a, b) => a + Number(b), 0) - Number(r.body.total)) < 0.01);
+  ok('aging is grouped by customer as well as invoice', Array.isArray(r.body.by_customer));
+
+  r = await api('GET', '/api/reports/contacts-balance');
+  ok('supplier & customer balances answer',
+    Array.isArray(r.body.receivables) && Array.isArray(r.body.payables),
+    JSON.stringify(r.body).slice(0, 150));
+  ok('the supplier return shows against the supplier',
+    r.body.payables.some((x) => x.id === returnSupplier.id && Number(x.returned) > 0),
+    JSON.stringify(r.body.payables.find((x) => x.id === returnSupplier.id)).slice(0, 150));
+
+  r = await api('GET', `/api/reports/purchase-sale?from=${daysAgoStr(30)}&to=${todayStr()}`);
+  ok('purchase vs sale nets off returns on both sides',
+    Number(r.body.sales.net) === Number(r.body.sales.gross) - Number(r.body.sales.returns) &&
+    Number(r.body.purchases.net) === Number(r.body.purchases.total) - Number(r.body.purchases.returns),
+    JSON.stringify(r.body).slice(0, 200));
+
+  r = await api('GET', `/api/reports/payments?from=${daysAgoStr(30)}&to=${todayStr()}`);
+  ok('money in & out splits by method and by account',
+    Array.isArray(r.body.sell_by_method) && Array.isArray(r.body.sell_by_account),
+    JSON.stringify(r.body).slice(0, 150));
+  ok('money in equals the sum of the tender lines',
+    Math.abs(r.body.sell_by_method.reduce((a, b) => a + Number(b.amount), 0) - Number(r.body.money_in)) < 0.01);
+
+  r = await api('GET', `/api/reports/z-report?date=${todayStr()}`);
+  ok('Z report answers for the day', r.status === 200 && r.body.totals,
+    JSON.stringify(r.body).slice(0, 150));
+  ok('Z report reconciles expected cash',
+    Math.abs(Number(r.body.cash.expected) -
+      (Number(r.body.cash.opening) + Number(r.body.cash.taken) - Number(r.body.cash.change_given))) < 0.01,
+    JSON.stringify(r.body.cash));
+  ok('Z report counts amendments separately', typeof r.body.amendments === 'number');
+
+  r = await api('GET', `/api/reports/stock-adjustments?from=${daysAgoStr(90)}&to=${todayStr()}`);
+  ok('shrinkage report groups by reason and by who authorised it',
+    Array.isArray(r.body.by_reason) && Array.isArray(r.body.by_user),
+    JSON.stringify(r.body).slice(0, 150));
+
+  r = await api('GET', `/api/reports/export/aged-receivables?format=csv`, null, true);
+  ok('aged receivables export to CSV', r.status === 200);
+
+  // --- role matrix ---
+  r = await api('GET', '/api/users/roles');
+  ok('the role matrix is published', r.status === 200 && r.body.roles?.length >= 4,
+    JSON.stringify(r.body).slice(0, 150));
+  const adminRole = r.body.roles.find((x) => x.role === 'admin');
+  const cashierRole = r.body.roles.find((x) => x.role === 'cashier');
+  ok('admin is reported as a superuser', adminRole?.is_superuser === true);
+  ok('a cashier has no settings write access',
+    cashierRole?.areas?.settings && !/write/.test(cashierRole.areas.settings),
+    String(cashierRole?.areas?.settings));
+  ok('the matrix counts who holds each role', typeof cashierRole?.users === 'number');
 
   console.log(results.join('\n'));
   console.log('-'.repeat(64));

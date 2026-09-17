@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import { many, one, tx } from '../db/index.js';
 import { h, bad, str, num, bool } from '../lib/util.js';
 import { requirePerm } from '../middleware/auth.js';
-import { ROLES } from '../lib/permissions.js';
+import { ROLES, ROLE_PERMISSIONS, ROLE_LABELS } from '../lib/permissions.js';
 import { audit } from '../lib/audit.js';
 
 const r = Router();
@@ -20,6 +20,47 @@ r.get('/', requirePerm('users.read'), h(async (req, res) => {
       GROUP BY u.id ORDER BY u.name`
   );
   res.json(rows);
+}));
+
+/**
+ * The permission matrix, as the server actually enforces it.
+ *
+ * Roles are defined in code rather than in a table on purpose: a permission
+ * set that can be edited at runtime is a permission set that can be widened
+ * by anyone who gets into the admin screen. This endpoint publishes what the
+ * server will allow so the UI can show it honestly instead of guessing.
+ */
+r.get('/roles', requirePerm('users.read'), h(async (req, res) => {
+  const counts = await many(
+    'SELECT role, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE is_active)::int AS active FROM users GROUP BY role');
+  const byRole = Object.fromEntries(counts.map((c) => [c.role, c]));
+
+  // Every area the permission strings mention, in the order the menu shows them.
+  const areas = [...new Set(
+    Object.values(ROLE_PERMISSIONS).flat()
+      .filter((p) => p !== '*')
+      .map((p) => p.split('.')[0]))].sort();
+
+  res.json({
+    roles: ROLES.map((role) => {
+      const granted = ROLE_PERMISSIONS[role];
+      return {
+        role,
+        label: ROLE_LABELS[role] || role,
+        permissions: granted,
+        is_superuser: granted.includes('*'),
+        users: byRole[role]?.n || 0,
+        active_users: byRole[role]?.active || 0,
+        areas: Object.fromEntries(areas.map((a) => {
+          if (granted.includes('*')) return [a, 'full'];
+          if (granted.includes(`${a}.*`)) return [a, 'full'];
+          const own = granted.filter((p) => p.startsWith(`${a}.`)).map((p) => p.split('.')[1]);
+          return [a, own.length ? own.join(', ') : 'none'];
+        })),
+      };
+    }),
+    areas,
+  });
 }));
 
 r.post('/', requirePerm('users.write'), h(async (req, res) => {

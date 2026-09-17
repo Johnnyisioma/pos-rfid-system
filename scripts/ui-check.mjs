@@ -46,6 +46,27 @@ const PAGES = [
   ['returns-history', '/returns?tab=history'],
   ['devices', '/devices'],
   ['audit', '/audit'],
+
+  // --- screens added with the Ultimate-POS style menu ---
+  ['accounts', '/accounts'],
+  ['purchases-returns', '/purchases?tab=returns'],
+  ['purchases-new', '/purchases?tab=new'],
+  ['settings-taxes', '/settings?tab=taxes'],
+  ['settings-roles', '/settings?tab=roles'],
+  ['reports-z', '/reports?tab=z'],
+  ['reports-payments', '/reports?tab=payments'],
+  ['reports-aging', '/reports?tab=aging'],
+  ['reports-contacts', '/reports?tab=contacts'],
+  ['reports-shrinkage', '/reports?tab=shrinkage'],
+  ['reports-purchase-sale', '/reports?tab=purchase-sale'],
+  ['sales-held', '/sales?status=held'],
+  ['sales-draft', '/sales?status=draft'],
+  ['sales-quotation', '/sales?status=quotation'],
+  ['sales-layaway', '/sales?sale_type=layaway'],
+  ['sales-unpaid', '/sales?credit=true'],
+  ['transfers-new', '/transfers?new=1'],
+  ['expenses-new', '/expenses?new=1'],
+
   ['stock-take-mode', '/stock-take-mode'],
 ];
 
@@ -153,6 +174,82 @@ async function run() {
     problems.push({ page: 'pos-interaction', kind: 'flow', text: 'No product results for "oxford"' });
   }
 
+  // --- the new menu and top bar actually open ---
+  currentLabel = 'menu-interaction';
+  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(500);
+
+  // Every sidebar group should expand and reveal at least one link.
+  const groupButtons = page.locator('nav button');
+  const groupCount = await groupButtons.count();
+  if (groupCount < 5) {
+    problems.push({ page: 'menu-interaction', kind: 'menu',
+      text: `Expected the grouped sidebar, found ${groupCount} group toggles` });
+  }
+  for (let g = 0; g < Math.min(groupCount, 14); g += 1) {
+    const btn = groupButtons.nth(g);
+    const name = (await btn.textContent())?.trim().slice(0, 30) || `group ${g}`;
+    await btn.click();
+    await page.waitForTimeout(140);
+    const links = await page.locator('nav a').count();
+    if (links === 0) {
+      problems.push({ page: 'menu-interaction', kind: 'menu', text: `"${name}" revealed no links` });
+    }
+  }
+  if (wantShots) await page.screenshot({ path: path.join(SHOT_DIR, '92-menu-open.png'), fullPage: true });
+
+  // Every sidebar destination must resolve to a real screen, not the catch-all
+  // redirect. A link the router does not know about is the classic symptom of
+  // a menu rewritten ahead of the pages.
+  const hrefs = await page.locator('nav a').evaluateAll((els) =>
+    [...new Set(els.map((e) => e.getAttribute('href')).filter(Boolean))]);
+  for (const href of hrefs) {
+    if (!href.startsWith('/')) continue;
+    currentLabel = `link${href}`;
+    await page.goto(BASE + href, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(350);
+    const landed = new URL(page.url()).pathname;
+    const wanted = href.split('?')[0];
+    if (landed !== wanted) {
+      problems.push({ page: 'menu-links', kind: 'route',
+        text: `${href} fell through to ${landed}` });
+    }
+  }
+
+  // The calculator in the top bar is a real tool, not decoration.
+  currentLabel = 'calculator';
+  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  const calcBtn = page.locator('button[title*="alculator"]');
+  if (await calcBtn.count()) {
+    await calcBtn.first().click();
+    await page.waitForTimeout(300);
+    const dialog = await page.locator('text=/Calculator/i').count();
+    if (!dialog) problems.push({ page: 'calculator', kind: 'flow', text: 'Calculator did not open' });
+    if (wantShots) await page.screenshot({ path: path.join(SHOT_DIR, '93-calculator.png') });
+    await page.keyboard.press('Escape');
+  } else {
+    problems.push({ page: 'calculator', kind: 'flow', text: 'No calculator button in the top bar' });
+  }
+
+  // The export toolbar must offer all three ways out.
+  currentLabel = 'export-toolbar';
+  await page.goto(`${BASE}/sales`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(600);
+  const exportBtn = page.locator('button:has-text("Export")').first();
+  if (await exportBtn.count()) {
+    await exportBtn.click();
+    await page.waitForTimeout(250);
+    for (const item of ['CSV', 'Excel', 'Print']) {
+      if (!(await page.locator(`[role=menuitem]:has-text("${item}")`).count())) {
+        problems.push({ page: 'export-toolbar', kind: 'flow', text: `No ${item} option in the export menu` });
+      }
+    }
+    if (wantShots) await page.screenshot({ path: path.join(SHOT_DIR, '94-export-menu.png') });
+    await page.keyboard.press('Escape');
+  } else {
+    problems.push({ page: 'export-toolbar', kind: 'flow', text: 'No export button on the sales list' });
+  }
+
   // --- mobile viewport pass ---
   currentLabel = 'mobile';
   const mobile = await browser.newContext({
@@ -166,7 +263,10 @@ async function run() {
   await mp.fill('input[type=password]', 'password123');
   await mp.click('button:has-text("Sign in")');
   await mp.waitForURL((u) => !u.pathname.startsWith('/login'), { timeout: 15000 });
-  for (const [label, route] of [['m-pos', '/pos'], ['m-stock-take-mode', '/stock-take-mode'], ['m-sales', '/sales']]) {
+  for (const [label, route] of [
+    ['m-pos', '/pos'], ['m-stock-take-mode', '/stock-take-mode'], ['m-sales', '/sales'],
+    ['m-dashboard', '/'], ['m-reports-z', '/reports?tab=z'], ['m-accounts', '/accounts'],
+  ]) {
     currentLabel = label;
     await mp.goto(BASE + route, { waitUntil: 'networkidle' });
     await mp.waitForTimeout(600);

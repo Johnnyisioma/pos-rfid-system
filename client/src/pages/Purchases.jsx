@@ -1,34 +1,70 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Plus, Truck, PackageCheck, Trash2, Users, Radio, ShoppingBag, X } from 'lucide-react';
-import { api, qs } from '../lib/api.js';
-import { money, num, date, dateTime } from '../lib/format.js';
+import { useSearchParams } from 'react-router-dom';
 import {
-  Card, Loading, Empty, Badge, Modal, Pagination, useToast, Field, Tabs, Spinner, ConfirmButton,
+  Plus, Truck, PackageCheck, Trash2, Users, Radio, ShoppingBag, Undo2, AlertTriangle,
+} from 'lucide-react';
+import { api, qs } from '../lib/api.js';
+import { money, num, date, dateTime, daysAgo, today } from '../lib/format.js';
+import {
+  Card, Loading, Empty, Badge, Modal, Pagination, useToast, Field, Tabs, Spinner, ConfirmButton, Stat,
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
 import { useTabParam } from '../lib/useTabParam.js';
 import VariantPicker from '../components/VariantPicker.jsx';
+import ExportButtons from '../components/ExportButtons.jsx';
 
 export default function Purchases() {
   const [tab, setTab] = useTabParam('orders');
+
+  // The sidebar links "Add purchase" as ?tab=new. Treat it as the orders tab
+  // with the editor already open, rather than a tab of its own.
+  const wantsNew = tab === 'new';
+  const active = wantsNew ? 'orders' : tab;
+
   return (
     <>
-      <PageHeader title="Purchases" subtitle="Purchase orders, goods receiving and suppliers" />
-      <Tabs className="mb-4" value={tab} onChange={setTab} tabs={[
+      <PageHeader title="Purchases" subtitle="Purchase orders, goods receiving, returns and suppliers" />
+      <Tabs className="mb-4" value={active} onChange={setTab} tabs={[
         { value: 'orders', label: 'Purchase orders' },
+        { value: 'returns', label: 'Purchase returns' },
         { value: 'suppliers', label: 'Suppliers' },
         { value: 'reorder', label: 'Reorder suggestions' },
       ]} />
-      {tab === 'orders' && <Orders />}
-      {tab === 'suppliers' && <Suppliers />}
-      {tab === 'reorder' && <Reorder />}
+      {active === 'orders' && <Orders autoNew={wantsNew} onNewHandled={() => setTab('orders')} />}
+      {active === 'returns' && <PurchaseReturns />}
+      {active === 'suppliers' && <Suppliers />}
+      {active === 'reorder' && <Reorder />}
     </>
   );
 }
 
+const PO_COLUMNS = [
+  { key: 'po_number', label: 'PO number' },
+  { key: 'supplier_name', label: 'Supplier' },
+  { key: 'location_name', label: 'Location' },
+  { key: 'status', label: 'Status' },
+  { key: 'ordered_qty', label: 'Ordered', align: 'right' },
+  { key: 'received_qty', label: 'Received', align: 'right' },
+  { key: 'total', label: 'Total', align: 'right', format: (v) => money(v) },
+  { key: 'order_date', label: 'Date', format: (v) => date(v) },
+];
+
+const RETURN_COLUMNS = [
+  { key: 'ref', label: 'Reference' },
+  { key: 'created_at', label: 'Date', format: (v) => date(v) },
+  { key: 'supplier_name', label: 'Supplier' },
+  { key: 'po_number', label: 'Against PO' },
+  { key: 'location_name', label: 'Location' },
+  { key: 'reason', label: 'Reason' },
+  { key: 'total_qty', label: 'Units', align: 'right' },
+  { key: 'total', label: 'Value', align: 'right', format: (v) => money(v) },
+  { key: 'credit_note', label: 'Credit note' },
+  { key: 'user_name', label: 'Recorded by' },
+];
+
 /* ---------------- purchase orders ---------------- */
-function Orders() {
+function Orders({ autoNew, onNewHandled }) {
   const { can, locationId } = useAuth();
   const [data, setData] = useState(null);
   const [status, setStatus] = useState('');
@@ -42,6 +78,10 @@ function Orders() {
   }, [status, page, locationId]);
   useEffect(() => { load(); }, [load]);
 
+  useEffect(() => {
+    if (autoNew && can('purchases.write')) { setCreating(true); onNewHandled?.(); }
+  }, [autoNew]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <>
       <Card bodyClass="p-0">
@@ -52,6 +92,8 @@ function Orders() {
               <option key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</option>)}
           </select>
           <div className="flex-1" />
+          <ExportButtons title="Purchase orders" columns={PO_COLUMNS} rows={data?.data || []}
+            filename="purchase-orders" />
           {can('purchases.write') && (
             <button className="btn-primary" onClick={() => setCreating(true)}><Plus size={16} /> New purchase order</button>
           )}
@@ -444,5 +486,286 @@ function Reorder() {
       <PoEditor open={creating} prefill={prefill} onClose={() => setCreating(false)}
         onDone={() => { setCreating(false); setSelected([]); }} />
     </>
+  );
+}
+
+/* ---------------- purchase returns ---------------- */
+/**
+ * Bad goods going back to the supplier. Deliberately not a stock adjustment:
+ * an adjustment would bury supplier damage inside shrinkage and quietly
+ * inflate what looks like staff loss. This takes the units out under their
+ * own status and keeps the money on the supplier's account.
+ */
+const RETURN_REASONS = [
+  'Damaged in transit', 'Faulty / defective', 'Wrong item supplied',
+  'Wrong size or colour', 'Short-dated or expired', 'Over-supplied',
+  'Quality below standard', 'Other',
+];
+
+function PurchaseReturns() {
+  const { can, locationId } = useAuth();
+  const [data, setData] = useState(null);
+  const [page, setPage] = useState(1);
+  const [creating, setCreating] = useState(false);
+  const [open, setOpen] = useState(null);
+
+  const load = useCallback(async () => {
+    setData(null);
+    setData(await api.get(`/api/purchases/returns${qs({ page, limit: 25 })}`)
+      .catch(() => ({ data: [], total: 0, value: 0 })));
+  }, [page, locationId]);
+  useEffect(() => { load(); }, [load]);
+
+  return (
+    <>
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-4">
+        <Stat label="Returns recorded" value={num(data?.total || 0)} icon={Undo2} />
+        <Stat label="Value sent back" value={money(data?.value || 0)} tone="warn" />
+        <Stat label="This page" value={num(data?.data?.length || 0)} />
+      </div>
+
+      <Card bodyClass="p-0">
+        <div className="p-4 flex flex-wrap gap-2 border-b border-slate-100">
+          <p className="text-sm text-slate-500 self-center flex-1 min-w-0">
+            Goods sent back to a supplier — kept out of shrinkage so your loss figures stay honest.
+          </p>
+          <ExportButtons report="purchase-returns" title="Purchase returns"
+            columns={RETURN_COLUMNS} rows={data?.data || []}
+            params={{ from: daysAgo(365), to: today() }} />
+          {can('purchases.write') && (
+            <button className="btn-primary" onClick={() => setCreating(true)}>
+              <Plus size={16} /> Record return
+            </button>
+          )}
+        </div>
+
+        {!data ? <Loading /> : data.data.length === 0 ? (
+          <Empty title="No purchase returns" icon={Undo2}
+            hint="When a delivery arrives damaged or wrong, record it here rather than adjusting stock away." />
+        ) : (
+          <>
+            <div className="table-wrap">
+              <table className="data">
+                <thead><tr><th>Reference</th><th>Supplier</th><th>Against PO</th><th>Reason</th>
+                  <th className="text-right">Units</th><th className="text-right">Value</th>
+                  <th>Credit note</th><th>Date</th></tr></thead>
+                <tbody>
+                  {data.data.map((r) => (
+                    <tr key={r.id} className="cursor-pointer" onClick={() => setOpen(r.id)}>
+                      <td className="font-mono text-xs font-medium text-brand-700">{r.ref}</td>
+                      <td>{r.supplier_name || '—'}</td>
+                      <td className="font-mono text-xs text-slate-500">{r.po_number || '—'}</td>
+                      <td className="text-slate-600 text-sm">{r.reason}</td>
+                      <td className="text-right tabular-nums">{num(r.total_qty)}</td>
+                      <td className="text-right tabular-nums">{money(r.total)}</td>
+                      <td className="text-xs text-slate-500">{r.credit_note || '—'}</td>
+                      <td className="text-slate-500 text-xs whitespace-nowrap">{date(r.created_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <Pagination page={data.page} limit={data.limit} total={data.total} onPage={setPage} />
+          </>
+        )}
+      </Card>
+
+      {creating && (
+        <ReturnEditor onClose={() => setCreating(false)}
+          onDone={() => { setCreating(false); load(); }} />
+      )}
+      {open && <ReturnDetail id={open} onClose={() => setOpen(null)} />}
+    </>
+  );
+}
+
+function ReturnEditor({ onClose, onDone }) {
+  const { locationId, locations } = useAuth();
+  const toast = useToast();
+  const [suppliers, setSuppliers] = useState([]);
+  const [pos, setPos] = useState([]);
+  const [form, setForm] = useState({
+    supplier_id: '', po_id: '', location_id: locationId,
+    reason: RETURN_REASONS[0], notes: '', credit_note: '',
+  });
+  const [lines, setLines] = useState([]);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.get('/api/suppliers?limit=200').then((r) => setSuppliers(r.data)).catch(() => {});
+    api.get('/api/purchases?limit=50&status=received').then((r) => setPos(r.data)).catch(() => {});
+  }, []);
+
+  const add = (v) => setLines((p) => {
+    if (p.some((l) => l.variant_id === v.variant_id)) return p;
+    return [...p, {
+      variant_id: v.variant_id,
+      label: `${v.name} · ${[v.size, v.color].filter(Boolean).join(' / ') || 'default'}`,
+      sku: v.sku, on_hand: v.quantity ?? v.on_hand ?? null,
+      quantity: 1, unit_cost: v.cost_price ?? 0,
+    }];
+  });
+  const setLine = (i, patch) => setLines((p) => p.map((l, x) => (x === i ? { ...l, ...patch } : l)));
+  const total = lines.reduce((s, l) => s + Number(l.quantity || 0) * Number(l.unit_cost || 0), 0);
+
+  const submit = async () => {
+    const items = lines.filter((l) => l.variant_id && Number(l.quantity) > 0)
+      .map((l) => ({ variant_id: l.variant_id, quantity: Number(l.quantity), unit_cost: Number(l.unit_cost) }));
+    if (!items.length) return toast.error('Add at least one item to return');
+    if (!form.reason.trim()) return toast.error('A reason is required');
+    setBusy(true);
+    try {
+      const res = await api.post('/api/purchases/returns', { ...form, items });
+      toast.success(`${res.ref} recorded · ${money(res.total)} sent back`);
+      onDone();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Modal open onClose={onClose} title="Record a purchase return" size="lg"
+      subtitle="Units come out of stock under their own status, not as shrinkage."
+      footer={<><span className="mr-auto text-sm text-slate-600">Value {money(total)}</span>
+        <button className="btn-secondary" onClick={onClose}>Cancel</button>
+        <button className="btn-primary" onClick={submit} disabled={busy}>
+          {busy ? <Spinner /> : <Undo2 size={16} />} Record return
+        </button></>}>
+      <div className="grid sm:grid-cols-3 gap-3 mb-4">
+        <Field label="Supplier">
+          <select className="input" value={form.supplier_id}
+            onChange={(e) => setForm({ ...form, supplier_id: e.target.value })}>
+            <option value="">—</option>
+            {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Against PO" hint="Optional, but it ties the credit to the right delivery">
+          <select className="input" value={form.po_id}
+            onChange={(e) => setForm({ ...form, po_id: e.target.value })}>
+            <option value="">—</option>
+            {pos.map((p) => <option key={p.id} value={p.id}>{p.po_number}</option>)}
+          </select>
+        </Field>
+        <Field label="From location">
+          <select className="input" value={form.location_id}
+            onChange={(e) => setForm({ ...form, location_id: Number(e.target.value) })}>
+            {locations.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Reason" className="sm:col-span-2">
+          <select className="input" value={form.reason}
+            onChange={(e) => setForm({ ...form, reason: e.target.value })}>
+            {RETURN_REASONS.map((x) => <option key={x} value={x}>{x}</option>)}
+          </select>
+        </Field>
+        <Field label="Supplier credit note">
+          <input className="input" placeholder="CN-…" value={form.credit_note}
+            onChange={(e) => setForm({ ...form, credit_note: e.target.value })} />
+        </Field>
+        <Field label="Notes" className="sm:col-span-3">
+          <input className="input" value={form.notes}
+            onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+        </Field>
+      </div>
+
+      <VariantPicker onPick={add} placeholder="Search the item you are sending back…" />
+
+      {lines.length > 0 && (
+        <div className="mt-3 rounded-lg ring-1 ring-slate-200 overflow-hidden">
+          <table className="data">
+            <thead><tr><th>Item</th><th className="text-right w-24">Qty</th>
+              <th className="text-right w-32">Unit cost</th>
+              <th className="text-right w-32">Line value</th><th className="w-10"></th></tr></thead>
+            <tbody>
+              {lines.map((l, i) => (
+                <tr key={l.variant_id}>
+                  <td>
+                    <div className="text-sm font-medium">{l.label}</div>
+                    <div className="text-xs text-slate-500 font-mono">{l.sku}</div>
+                  </td>
+                  <td><input type="number" min="1" className="input py-1 text-right" value={l.quantity}
+                    onChange={(e) => setLine(i, { quantity: e.target.value })} /></td>
+                  <td><input type="number" className="input py-1 text-right" value={l.unit_cost}
+                    onChange={(e) => setLine(i, { unit_cost: e.target.value })} /></td>
+                  <td className="text-right tabular-nums">
+                    {money(Number(l.quantity || 0) * Number(l.unit_cost || 0))}
+                  </td>
+                  <td><button className="btn-ghost p-1.5 text-rose-600"
+                    onClick={() => setLines((p) => p.filter((_, x) => x !== i))}><Trash2 size={14} /></button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <p className="mt-3 flex items-start gap-2 text-xs text-amber-800 bg-amber-50 ring-1 ring-amber-200 rounded-lg p-2.5">
+        <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+        The system picks the actual tagged units to send back and marks them
+        <span className="font-mono mx-1">returned_supplier</span>. They stop counting as sellable
+        stock straight away, and the supplier's outstanding balance drops by the return value.
+      </p>
+    </Modal>
+  );
+}
+
+function ReturnDetail({ id, onClose }) {
+  const [ret, setRet] = useState(null);
+  useEffect(() => { api.get(`/api/purchases/returns/${id}`).then(setRet).catch(() => {}); }, [id]);
+  if (!ret) return <Modal open onClose={onClose} title="Purchase return"><Loading /></Modal>;
+
+  return (
+    <Modal open onClose={onClose} size="lg" title={ret.ref}
+      subtitle={`${ret.supplier_name || 'No supplier'} · ${ret.location_name} · ${dateTime(ret.created_at)}`}
+      footer={<><span className="mr-auto text-sm font-medium text-slate-700">Value {money(ret.total)}</span>
+        <button className="btn-primary" onClick={onClose}>Close</button></>}>
+      <div className="flex flex-wrap gap-2 mb-4">
+        <Badge>{ret.reason}</Badge>
+        {ret.po_number && <Badge status="found">Against {ret.po_number}</Badge>}
+        {ret.credit_note && <Badge>Credit note {ret.credit_note}</Badge>}
+        {ret.user_name && <Badge>By {ret.user_name}</Badge>}
+      </div>
+
+      <div className="table-wrap">
+        <table className="data">
+          <thead><tr><th>Item</th><th className="text-right">Qty</th>
+            <th className="text-right">Unit cost</th><th className="text-right">Line total</th></tr></thead>
+          <tbody>
+            {ret.items.map((i) => (
+              <tr key={i.id}>
+                <td>
+                  <div className="font-medium text-slate-800">{i.product_name}</div>
+                  <div className="text-xs text-slate-500">
+                    {[i.size, i.color].filter(Boolean).join(' / ')} · <span className="font-mono">{i.sku}</span>
+                  </div>
+                </td>
+                <td className="text-right tabular-nums">{num(i.quantity)}</td>
+                <td className="text-right tabular-nums">{money(i.unit_cost)}</td>
+                <td className="text-right tabular-nums">{money(i.line_total)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {ret.units?.length > 0 && (
+        <div className="mt-4">
+          <p className="text-xs font-medium text-slate-500 uppercase tracking-wide mb-2">
+            {ret.units.length} tagged unit(s) sent back
+          </p>
+          <div className="max-h-44 overflow-y-auto rounded-lg ring-1 ring-slate-200 divide-y divide-slate-100">
+            {ret.units.map((u) => (
+              <div key={u.id} className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs">
+                <span className="font-mono text-slate-700">{u.epc_readable}</span>
+                <span className="text-slate-500 truncate">
+                  {u.product_name} {[u.size, u.color].filter(Boolean).join(' / ')}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {ret.notes && <p className="text-xs text-slate-500 mt-3">{ret.notes}</p>}
+    </Modal>
   );
 }

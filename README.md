@@ -13,6 +13,11 @@ Android-based handheld RFID scanner. Works offline and syncs when the connection
 ## Contents
 
 - [What it does](#what-it-does)
+- [The menu](#the-menu)
+- [Money: payment accounts](#money-payment-accounts)
+- [Purchase returns](#purchase-returns)
+- [Tax rates](#tax-rates)
+- [Roles and permissions](#roles-and-permissions)
 - [How the RFID side works](#how-the-rfid-side-works)
 - [Running it locally](#running-it-locally)
 - [Deploying to Railway](#deploying-to-railway)
@@ -59,16 +64,138 @@ Android-based handheld RFID scanner. Works offline and syncs when the connection
 - Find-an-item: given a product and size, see exactly which units exist and where
 - A full-screen Stock Take Mode built for handheld use
 
+- Purchase returns — damaged or wrong deliveries go back to the supplier under their own status,
+  so supplier faults never show up in your shrinkage figures
+
+**Money**
+- Payment accounts: the till, the bank account, the Opay/Moniepoint wallet, the card terminal's
+  settlement account — each with its own running balance and movement history
+- Tender mapping, so cash lands in the till and a transfer lands in the bank without a cashier
+  ever choosing
+- Per-product tax rates alongside the business VAT rate, with a per-rate breakdown on the receipt
+- Expenses by category, location and the account they were paid from
+
 **Business**
 - Customers, groups with standing discounts, loyalty points, store credit, account balances
-- Expenses by category and location
 - Dashboards, best sellers, slow movers, dead stock, sales by staff/location/category
 - Profit and loss, inventory valuation and potential profit
+- Z report for end-of-day cash-up, money in and out, payment by age, supplier and customer
+  balances, purchase versus sale, and a shrinkage report grouped by reason and by who authorised it
 - Nigeria VAT at a configurable rate, shown separately, with the business TIN on every invoice
   and sequential unbroken invoice numbering
+- Every list exports to CSV, Excel or a clean A4 printout
 - Audit log of who created, changed or deleted what
 - Grouped, collapsible sidebar — each area opens onto its own pages, and every sub-page is a real
   URL you can bookmark or link to
+- A calculator, an alerts bell and today's takings in the top bar
+
+---
+
+## The menu
+
+The sidebar follows the shape people already know from Ultimate POS, so a manager who has used
+one can find things here without being taught:
+
+| Group | What is inside |
+|---|---|
+| **Dashboard** | The day at a glance |
+| **User Management** | Staff, roles and permissions |
+| **Contacts** | Customers, customer groups, suppliers |
+| **Products** | All products, add product, import/export, print RFID tags, categories and brands, variation templates, tax rates |
+| **Purchases** | Add purchase order, list purchases, purchase returns, reorder suggestions |
+| **Sell** | New sale, all sales, held sales, drafts, quotations, layaway, unpaid invoices, returns, register |
+| **Stock Transfers** | Add transfer, list transfers |
+| **Stock** | Stock on hand, adjustments, low stock, valuation, stock take |
+| **RFID** | Tagged units, scan simulator, stock take, find an item, devices |
+| **Expenses** | Add expense, list expenses, expense categories |
+| **Payment Accounts** | List accounts, money in and out |
+| **Reports** | Grouped by Money / Stock / People / Audit |
+| **Settings** | Business, receipt and invoice, locations, registers, staff, roles, tax rates, catalogue options |
+
+Two conventions worth knowing. Inside a long group, **add-something comes before list-something**,
+because the thing you came to do is usually the thing you came to do. And **Stock Take Mode** sits
+in its own zone at the bottom, walled off from everything else — it takes the whole screen and is
+meant for a handheld, so it should be hard to hit by accident.
+
+Every entry is a real URL. `/sales?status=held`, `/reports?tab=z`, `/settings?tab=taxes` — bookmark
+them, put them on a tablet's home screen, or send one to a colleague.
+
+---
+
+## Money: payment accounts
+
+A register session tracks one cash drawer for one shift. Payment accounts are the other half: where
+the money actually ends up. Without them a transfer payment goes into the sale and then vanishes,
+and nothing reconciles at the end of the month.
+
+Set up an account per real place money sits — **Payment Accounts → New account**:
+
+- **Cash / till** — the drawer
+- **Bank account** — your GTBank, Zenith, whichever
+- **Mobile money wallet** — Opay, Moniepoint, PalmPay
+- **Card terminal settlement** — where your POS terminal pays out
+
+Then **Tender defaults** maps each payment method to an account once, and every sale from then on
+routes itself. A cashier is never asked.
+
+An account's balance is `opening balance + payments in − expenses out`, and opening it shows every
+movement with the invoice or expense reference behind it.
+
+One deliberate behaviour: **an unmapped tender is left unassigned rather than swept into the default
+account.** It would be easy to dump an unmapped transfer into the cash till, but then the drawer
+would never reconcile and nobody would notice the bank account was never set up. Instead the money
+shows as "Unassigned" in **Reports → Money in & out**, with a link to the mapping screen.
+
+Deleting an account that has money against it deactivates it instead. History stays intact.
+
+---
+
+## Purchase returns
+
+When a delivery arrives damaged, faulty or simply wrong, **Purchases → Purchase returns → Record
+return** sends it back properly rather than adjusting the stock away.
+
+The difference matters. A stock adjustment is how you record *your* loss — theft, breakage,
+miscounts. Putting a supplier's bad delivery through the same door inflates your shrinkage figure
+and hides the fact that one supplier keeps sending damaged goods. So a purchase return:
+
+- takes the actual tagged units out under their own status, `returned_supplier`
+- keeps the cost on the supplier's account and drops what you owe them by the return value
+- records the supplier's credit note number against it
+- appears in its own report and export, and **never** in the shrinkage report
+
+You cannot return more than you hold, and a reason is required on every one.
+
+---
+
+## Tax rates
+
+Most of the catalogue is standard-rated at 7.5%, but not all of it. A single global rate means
+exempt lines get taxed quietly and the VAT return is wrong.
+
+**Settings → Tax rates** holds named rates; **the product form** assigns one. A product with no
+rate assigned falls back to the business VAT rate in **Settings → Business**.
+
+A basket that mixes rates prints a breakdown per rate on the receipt rather than one misleading
+"VAT @ 7.5%" line — which, on a tax document, would be a false statement.
+
+Rates already used by a product are deactivated rather than deleted, so historical invoices keep
+showing the rate that was actually charged.
+
+---
+
+## Roles and permissions
+
+**Settings → Roles & permissions** shows exactly what each role may reach, straight from what the
+server enforces — no guessing, and no discovering it the day a cashier voids yesterday's sales.
+
+The four roles are **Administrator**, **Manager**, **Cashier** and **Inventory Staff**.
+
+They are defined in `server/lib/permissions.js` rather than in a database table, and the screen is
+read-only on purpose: a permission set that can be edited from the admin screen is a permission set
+that anyone reaching that screen can widen. To change what a role may do, edit that file and
+redeploy — the change then applies everywhere at once, including the API, not just the buttons the
+UI happens to hide.
 
 ---
 
@@ -342,6 +469,7 @@ Password for all of them: `password123`
 │   ├── services/
 │   │   ├── epc.js            the ONLY place an EPC is built or parsed
 │   │   ├── hardware.js       Zebra ZPL + reader adapters (mock / TCP / HTTP agent)
+│   │   ├── accounts.js       decides which payment account a tender lands in
 │   │   ├── inventory.js      unit creation, allocation, stock movement ledger
 │   │   └── pricing.js        VAT and discount engine, shared with the offline client
 │   ├── routes/               one file per area of the API
@@ -351,7 +479,7 @@ Password for all of them: `password123`
 │   ├── public/               manifest, service worker, icons
 │   └── src/
 │       ├── pages/            one file per screen
-│       ├── components/       layout, UI primitives, charts, receipt
+│       ├── components/       layout, UI primitives, charts, receipt, export toolbar
 │       └── lib/              API client, auth context, offline queue, formatting, tab URLs
 └── scripts/
     ├── e2e.js                end-to-end API tests
@@ -390,10 +518,14 @@ needs `Authorization: Bearer <token>`; the active branch is passed as `X-Locatio
 | Amendments | `PUT /sales/:id` (amend an issued receipt), `GET /sales/:id/editable`, `GET /sales/:id/revisions` |
 | Returns | `GET/POST /returns`, `GET /returns/:id`, `/returns/lookup/:invoice` |
 | Purchases | `GET/POST /purchases`, `PUT /purchases/:id`, `POST /purchases/:id/receive`, `/cancel`, `GET /purchases/suggestions/reorder` |
+| Purchase returns | `GET/POST /purchases/returns`, `GET /purchases/returns/:id` |
+| Payment accounts | `GET/POST /accounts`, `GET/PUT/DELETE /accounts/:id`, `PUT /accounts/method-defaults` |
+| Tax rates | `POST /catalog/tax-rates`, `PUT/DELETE /catalog/tax-rates/:id` (rates also come back on `GET /catalog`) |
+| Roles | `GET /users/roles` — the permission matrix the server actually enforces |
 | Transfers | `GET/POST /transfers`, `POST /transfers/:id/dispatch`, `/receive`, `/cancel` |
 | Customers | `GET/POST /customers`, `PUT /customers/:id`, `POST /customers/:id/payments`, `/store-credit`, `/loyalty` |
 | Registers | `GET /registers`, `POST /registers/:id/open`, `GET /registers/sessions/current`, `POST /registers/sessions/:id/close` |
-| Reports | `GET /reports/dashboard`, `/sales`, `/products`, `/profit-loss`, `/tax`, `/export/:report` |
+| Reports | `GET /reports/dashboard`, `/sales`, `/products`, `/profit-loss`, `/tax`, `/today`, `/alerts`, `/z-report`, `/payments`, `/payment-by-age`, `/contacts-balance`, `/purchase-sale`, `/stock-adjustments`, `/export/:report` |
 | Admin | `/settings`, `/locations`, `/users`, `/catalog`, `/devices`, `/audit`, `/expenses` |
 | Offline | `GET /sync/snapshot`, `POST /sync/sales` |
 
@@ -403,7 +535,7 @@ needs `Authorization: Bearer <token>`; the active branch is passed as `X-Locatio
 
 ```bash
 npm start                  # in one terminal
-npm test                   # 97 end-to-end API checks
+npm test                   # 155 end-to-end API checks
 node scripts/ui-check.mjs --shots   # every screen in a headless browser
 ```
 
@@ -414,8 +546,20 @@ sale isn't duplicated, that a bad import is rejected wholesale, that returns put
 unit back on the shelf, and — for amendments — that the invoice number survives, the stock delta is
 exact, a cashier is refused, and the window actually closes.
 
-The UI pass visits all 34 screens and sub-tabs at desktop and phone widths, completes a real sale, and
-fails on any console error, failed request, blank screen or horizontal overflow.
+It also covers the newer ground: that a payment routes itself to the account its tender is mapped
+to, that an *un*mapped tender stays visibly unassigned instead of being swept into the till, that an
+account holding money is deactivated rather than deleted, that a zero-rated product really is taxed
+at zero in a mixed basket, that returning goods to a supplier drops stock by exactly the right
+amount and never lands in the shrinkage report, that the aged-debt buckets add up to the total, and
+that the Z report's expected cash reconciles.
+
+The suite is re-runnable: run it twice against the same database and it still reports zero failures.
+
+The UI pass visits all 52 screens and sub-tabs at desktop and phone widths, completes a real sale,
+opens every sidebar group, **follows every sidebar link and fails if any of them falls through to
+the catch-all redirect** — the classic symptom of a menu rewritten ahead of its pages — checks the
+calculator and the export menu open, and fails on any console error, failed request, blank screen or
+horizontal overflow.
 
 ---
 
@@ -450,8 +594,16 @@ is a useful human-readable second copy.
 - **E-invoicing.** Not implemented. Invoice data *is* stored in the structured shape a
   FIRS UBL submission needs (see any sale → "View e-invoice payload"), so adding a
   submission integration is a mapping job rather than a redesign.
-- **PDF reports.** Reports export to Excel and CSV. For PDF, use the browser's
-  print-to-PDF — receipts are styled for 80 mm thermal paper and print correctly.
+- **PDF reports.** Every list exports to CSV, Excel or a print view; for a PDF, use the
+  browser's print-to-PDF from that print view. Receipts and the Z report print separately
+  from the list printouts — receipts are styled for 58/80 mm thermal paper, list printouts
+  and the Z report come out as A4.
+- **Roles are fixed in code**, not editable in the app — see
+  [Roles and permissions](#roles-and-permissions) for why, and how to change them.
+- **Units of measure and price groups** are not implemented: everything sells in the unit
+  set on the product, and per-location price overrides cover the pricing case. Sales
+  orders/shipments, scheduled discounts, standalone barcode-label printing, notification
+  templates, contact import, commission agents and warranties are also not implemented.
 - **Offline mode** covers selling: the catalogue, prices, stock and customers are cached,
   and sales made offline queue locally and sync automatically. Stock-takes, receiving and
   reports need a connection.

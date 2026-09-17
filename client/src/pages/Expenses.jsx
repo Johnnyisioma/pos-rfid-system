@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Plus, Wallet, Download, Trash2 } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
+import { Plus, Wallet, Trash2 } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, date, daysAgo, today } from '../lib/format.js';
 import {
@@ -8,9 +9,11 @@ import {
 import { RankedBarChart } from '../components/charts.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import ExportButtons from '../components/ExportButtons.jsx';
 
 export default function Expenses() {
   const { can, locationId, locations } = useAuth();
+  const [params, setParams] = useSearchParams();
   const toast = useToast();
   const [data, setData] = useState(null);
   const [categories, setCategories] = useState([]);
@@ -27,6 +30,14 @@ export default function Expenses() {
   useEffect(() => { api.get('/api/catalog').then((c) => setCategories(c.expenseCategories)).catch(() => {}); }, []);
   useEffect(() => { setPage(1); }, [range]);
 
+  // "Add expense" in the sidebar arrives as ?new=1 — open the form once and
+  // clear the flag so a refresh does not pop it up again.
+  useEffect(() => {
+    if (params.get('new') !== '1') return;
+    if (can('expenses.write')) setEditing({ expense_date: today() });
+    setParams(new URLSearchParams(), { replace: true });
+  }, [params]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const save = async (form) => {
     try {
       if (form.id) await api.put(`/api/expenses/${form.id}`, form);
@@ -42,10 +53,7 @@ export default function Expenses() {
       <PageHeader title="Expenses" subtitle="Running costs by category and location"
         actions={
           <>
-            <button className="btn-secondary"
-              onClick={() => api.download(`/api/reports/export/expenses${qs({ ...range, format: 'xlsx' })}`)}>
-              <Download size={16} /> Export
-            </button>
+            <ExportButtons report="expenses" title="Expenses" params={range} />
             {can('expenses.write') && (
               <button className="btn-primary" onClick={() => setEditing({ expense_date: today() })}>
                 <Plus size={16} /> Record expense

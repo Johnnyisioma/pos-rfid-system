@@ -24,6 +24,7 @@ import SaleDetail from './pages/SaleDetail.jsx';
 import Returns from './pages/Returns.jsx';
 import Register from './pages/Register.jsx';
 import Expenses from './pages/Expenses.jsx';
+import Accounts from './pages/Accounts.jsx';
 import Reports from './pages/Reports.jsx';
 import Settings from './pages/Settings.jsx';
 import Devices from './pages/Devices.jsx';
@@ -66,6 +67,7 @@ export default function App() {
         <Route path="returns" element={<Returns />} />
         <Route path="register" element={<Register />} />
         <Route path="expenses" element={<Expenses />} />
+        <Route path="accounts" element={<Accounts />} />
         <Route path="reports" element={<Reports />} />
         <Route path="settings" element={<Settings />} />
         <Route path="devices" element={<Devices />} />

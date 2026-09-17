@@ -1,93 +1,139 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useCallback } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate, Link } from 'react-router-dom';
 import {
   LayoutDashboard, ShoppingCart, Package, Boxes, Radio, ScanLine, ClipboardCheck, Search,
   Truck, Users, Receipt, RotateCcw, Calculator, Wallet, BarChart3, Settings as Cog,
   ShieldCheck, Menu, X, LogOut, MapPin, ChevronDown, ChevronRight, WifiOff, CloudUpload,
   Printer, FileSpreadsheet, ArrowLeftRight, Tags, Plus, List, FolderTree, Layers,
-  TrendingUp, FileText, Store, UserCog, Building2, Percent,
+  TrendingUp, FileText, Store, UserCog, Building2, Percent, Landmark, Bell, PauseCircle,
+  FileClock, PiggyBank, SlidersHorizontal, Coins, AlertTriangle, Users2, ScrollText,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { initOffline, flushQueue } from '../lib/offline.js';
-import { useToast } from './ui.jsx';
+import { useToast, Modal } from './ui.jsx';
+import { api } from '../lib/api.js';
+import { money, num, ago } from '../lib/format.js';
 
 /**
  * Sidebar navigation.
  *
- * Each area is a collapsible parent that opens onto its own pages, rather than
- * one long flat list. A group opens automatically when you are inside it, and
- * whatever you open by hand is remembered between visits.
- *
- * Sub-items that are tabs within a page carry `?tab=` — see useTabParam.
+ * Ordered the way a shop floor actually reaches for things: admin at the very
+ * top where a cashier never looks, the daily transaction modules through the
+ * middle, setup at the bottom. Long dropdowns are split into labelled blocks
+ * rather than a dozen equal rows — twelve flat items is where a menu stops
+ * being scannable. Where a document type has both, "add" comes before "list".
  */
+const DIV = (label) => ({ type: 'divider', label });
+
 const NAV = [
   { label: 'Dashboard', icon: LayoutDashboard, to: '/', end: true, perm: 'reports.read' },
 
-  { label: 'Sell', icon: ShoppingCart, perm: 'sales.read', children: [
-    { label: 'Point of Sale', to: '/pos', icon: ShoppingCart, perm: 'sales.create' },
-    { label: 'All sales', to: '/sales', icon: Receipt, perm: 'sales.read' },
-    { label: 'Unpaid invoices', to: '/sales?credit=true', icon: FileText, perm: 'sales.read' },
-    { label: 'Returns & exchanges', to: '/returns?tab=new', icon: RotateCcw, perm: 'returns.read' },
-    { label: 'Return history', to: '/returns?tab=history', icon: List, perm: 'returns.read' },
-    { label: 'Cash register', to: '/register', icon: Calculator, perm: 'register.open' },
+  { label: 'User Management', icon: UserCog, perm: 'users.read', children: [
+    { label: 'Staff', to: '/settings?tab=users', icon: Users },
+    { label: 'Roles & permissions', to: '/settings?tab=roles', icon: ShieldCheck },
+  ]},
+
+  { label: 'Contacts', icon: Users2, perm: 'customers.read', children: [
+    { label: 'Customers', to: '/customers?tab=customers', icon: Users },
+    { label: 'Customer groups', to: '/customers?tab=groups', icon: Tags },
+    { label: 'Suppliers', to: '/purchases?tab=suppliers', icon: Store, perm: 'suppliers.read' },
   ]},
 
   { label: 'Products', icon: Package, perm: 'products.read', children: [
-    { label: 'All products', to: '/products', icon: List, perm: 'products.read' },
+    { label: 'All products', to: '/products', icon: List },
     { label: 'Add product', to: '/products/new', icon: Plus, perm: 'products.write' },
+    DIV('Bulk actions'),
+    { label: 'Import / export', to: '/import-export', icon: FileSpreadsheet, perm: 'products.write' },
+    { label: 'Print RFID tags', to: '/rfid?encoded=false', icon: Printer, perm: 'rfid.encode' },
+    DIV('Taxonomy'),
     { label: 'Categories & brands', to: '/settings?tab=catalog', icon: FolderTree, perm: 'products.write' },
     { label: 'Variation templates', to: '/settings?tab=catalog', icon: Layers, perm: 'products.write' },
-    { label: 'Import / export', to: '/import-export', icon: FileSpreadsheet, perm: 'products.write' },
-  ]},
-
-  { label: 'Stock', icon: Boxes, perm: 'inventory.read', children: [
-    { label: 'Stock levels', to: '/inventory?tab=levels', icon: Boxes, perm: 'inventory.read' },
-    { label: 'Low stock', to: '/inventory?tab=low', icon: TrendingUp, perm: 'inventory.read' },
-    { label: 'Stock adjustments', to: '/inventory?tab=adjustments', icon: Percent, perm: 'inventory.read' },
-    { label: 'Movement ledger', to: '/inventory?tab=movements', icon: List, perm: 'inventory.read' },
-    { label: 'Stock valuation', to: '/inventory?tab=valuation', icon: BarChart3, perm: 'inventory.read' },
-    { label: 'Transfers', to: '/transfers', icon: ArrowLeftRight, perm: 'transfers.read' },
+    { label: 'Tax rates', to: '/settings?tab=taxes', icon: Percent, perm: 'settings.read' },
   ]},
 
   { label: 'Purchases', icon: Truck, perm: 'purchases.read', children: [
-    { label: 'Purchase orders', to: '/purchases?tab=orders', icon: List, perm: 'purchases.read' },
-    { label: 'Suppliers', to: '/purchases?tab=suppliers', icon: Store, perm: 'suppliers.read' },
-    { label: 'Reorder suggestions', to: '/purchases?tab=reorder', icon: TrendingUp, perm: 'purchases.read' },
+    { label: 'Add purchase order', to: '/purchases?tab=new', icon: Plus, perm: 'purchases.write' },
+    { label: 'List purchases', to: '/purchases?tab=orders', icon: List },
+    { label: 'Purchase returns', to: '/purchases?tab=returns', icon: RotateCcw },
+    DIV(),
+    { label: 'Reorder suggestions', to: '/purchases?tab=reorder', icon: TrendingUp },
+  ]},
+
+  { label: 'Sell', icon: ShoppingCart, perm: 'sales.read', children: [
+    { label: 'Point of Sale', to: '/pos', icon: ShoppingCart, perm: 'sales.create' },
+    { label: 'All sales', to: '/sales', icon: Receipt },
+    DIV('Open documents'),
+    { label: 'Held sales', to: '/sales?status=held', icon: PauseCircle },
+    { label: 'Drafts', to: '/sales?status=draft', icon: FileClock },
+    { label: 'Quotations', to: '/sales?status=quotation', icon: FileText },
+    { label: 'Layaway', to: '/sales?sale_type=layaway', icon: PiggyBank },
+    { label: 'Unpaid invoices', to: '/sales?credit=true', icon: Coins },
+    DIV(),
+    { label: 'New return', to: '/returns?tab=new', icon: RotateCcw, perm: 'returns.create' },
+    { label: 'Sell returns', to: '/returns?tab=history', icon: List, perm: 'returns.read' },
+    { label: 'Cash register', to: '/register', icon: Calculator, perm: 'register.open' },
+  ]},
+
+  { label: 'Stock Transfers', icon: ArrowLeftRight, perm: 'transfers.read', children: [
+    { label: 'Add transfer', to: '/transfers?new=1', icon: Plus, perm: 'transfers.write' },
+    { label: 'List transfers', to: '/transfers', icon: List },
+  ]},
+
+  { label: 'Stock', icon: Boxes, perm: 'inventory.read', children: [
+    { label: 'Stock levels', to: '/inventory?tab=levels', icon: Boxes },
+    { label: 'Low stock', to: '/inventory?tab=low', icon: AlertTriangle },
+    DIV('Adjustments'),
+    { label: 'Stock adjustments', to: '/inventory?tab=adjustments', icon: SlidersHorizontal },
+    { label: 'Movement ledger', to: '/inventory?tab=movements', icon: ScrollText },
+    { label: 'Stock valuation', to: '/inventory?tab=valuation', icon: BarChart3 },
   ]},
 
   { label: 'RFID', icon: Radio, perm: 'rfid.scan', children: [
-    { label: 'Tagged units', to: '/rfid', icon: Radio, perm: 'rfid.scan' },
+    { label: 'Tagged units', to: '/rfid', icon: Radio },
     { label: 'Tags to encode', to: '/rfid?encoded=false', icon: Printer, perm: 'rfid.encode' },
-    { label: 'Scan simulator', to: '/rfid/scan', icon: ScanLine, perm: 'rfid.scan' },
+    DIV(),
+    { label: 'Scan simulator', to: '/rfid/scan', icon: ScanLine },
     { label: 'Stock take', to: '/rfid/stock-take', icon: ClipboardCheck, perm: 'rfid.stocktake' },
     { label: 'Find an item', to: '/rfid/find', icon: Search, perm: 'rfid.find' },
   ]},
 
-  { label: 'Contacts', icon: Users, perm: 'customers.read', children: [
-    { label: 'Customers', to: '/customers?tab=customers', icon: Users, perm: 'customers.read' },
-    { label: 'Customer groups', to: '/customers?tab=groups', icon: Tags, perm: 'customers.read' },
-  ]},
-
   { label: 'Expenses', icon: Wallet, perm: 'expenses.read', children: [
-    { label: 'All expenses', to: '/expenses', icon: List, perm: 'expenses.read' },
+    { label: 'Add expense', to: '/expenses?new=1', icon: Plus, perm: 'expenses.write' },
+    { label: 'List expenses', to: '/expenses', icon: List },
     { label: 'Expense categories', to: '/settings?tab=catalog', icon: FolderTree, perm: 'expenses.write' },
   ]},
 
+  { label: 'Payment Accounts', icon: Landmark, perm: 'reports.read', children: [
+    { label: 'List accounts', to: '/accounts', icon: Landmark },
+    { label: 'Money in & out', to: '/reports?tab=payments', icon: Coins },
+  ]},
+
   { label: 'Reports', icon: BarChart3, perm: 'reports.read', children: [
-    { label: 'Sales report', to: '/reports?tab=sales', icon: TrendingUp, perm: 'reports.read' },
-    { label: 'Product performance', to: '/reports?tab=products', icon: Package, perm: 'reports.read' },
-    { label: 'Profit & loss', to: '/reports?tab=pl', icon: BarChart3, perm: 'reports.read' },
-    { label: 'VAT report', to: '/reports?tab=tax', icon: FileText, perm: 'reports.read' },
+    DIV('Money'),
+    { label: 'Profit & loss', to: '/reports?tab=pl', icon: BarChart3 },
+    { label: 'Z report', to: '/reports?tab=z', icon: Receipt },
+    { label: 'Payments', to: '/reports?tab=payments', icon: Coins },
+    { label: 'Payment by age', to: '/reports?tab=aging', icon: FileClock },
+    { label: 'Purchase & sale', to: '/reports?tab=purchase-sale', icon: TrendingUp },
+    DIV('Stock'),
+    { label: 'Sales report', to: '/reports?tab=sales', icon: TrendingUp },
+    { label: 'Product performance', to: '/reports?tab=products', icon: Package },
+    { label: 'Shrinkage', to: '/reports?tab=shrinkage', icon: AlertTriangle },
+    DIV('People'),
+    { label: 'Supplier & customer', to: '/reports?tab=contacts', icon: Users2 },
+    DIV('Audit'),
+    { label: 'VAT report', to: '/reports?tab=tax', icon: FileText },
+    { label: 'Activity log', to: '/audit', icon: ShieldCheck, perm: 'audit.read' },
   ]},
 
   { label: 'Settings', icon: Cog, perm: 'settings.read', children: [
-    { label: 'Business settings', to: '/settings?tab=business', icon: Building2, perm: 'settings.read' },
-    { label: 'Receipt & invoice', to: '/settings?tab=receipt', icon: Receipt, perm: 'settings.read' },
-    { label: 'Business locations', to: '/settings?tab=locations', icon: MapPin, perm: 'settings.read' },
-    { label: 'Registers', to: '/settings?tab=registers', icon: Calculator, perm: 'settings.read' },
-    { label: 'Staff & roles', to: '/settings?tab=users', icon: UserCog, perm: 'users.read' },
-    { label: 'Hardware', to: '/devices', icon: Printer, perm: 'settings.read' },
-    { label: 'Audit log', to: '/audit', icon: ShieldCheck, perm: 'audit.read' },
+    { label: 'Business settings', to: '/settings?tab=business', icon: Building2 },
+    { label: 'Receipt & invoice', to: '/settings?tab=receipt', icon: Receipt },
+    { label: 'Business locations', to: '/settings?tab=locations', icon: MapPin },
+    { label: 'Registers', to: '/settings?tab=registers', icon: Calculator },
+    { label: 'Tax rates', to: '/settings?tab=taxes', icon: Percent },
+    { label: 'Payment accounts', to: '/accounts', icon: Landmark },
+    { label: 'Hardware', to: '/devices', icon: Printer },
   ]},
 ];
 
@@ -127,22 +173,21 @@ function LocationPicker() {
 
 function NavGroup({ group, currentPath, currentSearch, openGroups, toggle }) {
   const { can } = useAuth();
-  const children = (group.children || []).filter((c) => !c.perm || can(c.perm));
+  const children = (group.children || []).filter(
+    (c) => c.type === 'divider' || !c.perm || can(c.perm));
 
   const isChildActive = (child) => {
-    const [path, query] = child.to.split('?');
+    if (child.type === 'divider') return false;
+    const [path, queryPart] = child.to.split('?');
     if (path !== currentPath) return false;
-    if (!query) {
-      // a bare path is active only when no sub-tab/filter is selected
-      return !currentSearch || !/(^|&)(tab|credit|encoded)=/.test(currentSearch);
-    }
-    return currentSearch.includes(query);
+    if (!queryPart) return !currentSearch || !/(^|[?&])(tab|status|credit|encoded|sale_type|new)=/.test(currentSearch);
+    return queryPart.split('&').every((pair) => currentSearch.includes(pair));
   };
 
   const groupActive = children.some(isChildActive);
   const isOpen = openGroups[group.label] ?? groupActive;
-
-  if (!children.length) return null;
+  const realChildren = children.filter((c) => c.type !== 'divider');
+  if (!realChildren.length) return null;
 
   return (
     <div>
@@ -158,26 +203,207 @@ function NavGroup({ group, currentPath, currentSearch, openGroups, toggle }) {
 
       {isOpen && (
         <div className="mt-0.5 ml-3 pl-3 border-l border-slate-700/70 space-y-0.5">
-          {children.map((child) => (
-            <Link key={child.label + child.to} to={child.to}
-              className={`flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[13px] transition-colors ${
-                isChildActive(child)
-                  ? 'bg-brand-600 text-white font-medium'
-                  : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}>
-              {child.icon && <child.icon size={14} className="shrink-0 opacity-80" />}
-              <span className="truncate">{child.label}</span>
-            </Link>
-          ))}
+          {children.map((child, i) =>
+            child.type === 'divider' ? (
+              <div key={`d${i}`} className="pt-2 pb-0.5">
+                {child.label
+                  ? <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 px-2.5">
+                      {child.label}
+                    </p>
+                  : <div className="border-t border-slate-700/60 mx-2.5" />}
+              </div>
+            ) : (
+              <Link key={child.label + child.to} to={child.to}
+                className={`flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[13px] transition-colors ${
+                  isChildActive(child)
+                    ? 'bg-brand-600 text-white font-medium'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-700/50'}`}>
+                {child.icon && <child.icon size={14} className="shrink-0 opacity-80" />}
+                <span className="truncate">{child.label}</span>
+              </Link>
+            )
+          )}
         </div>
       )}
     </div>
   );
 }
 
+/* ---------------- top bar widgets ---------------- */
+
+function CalculatorWidget({ open, onClose }) {
+  const [expr, setExpr] = useState('');
+  const [result, setResult] = useState('');
+
+  const press = (key) => {
+    if (key === 'C') { setExpr(''); setResult(''); return; }
+    if (key === '←') { setExpr((e) => e.slice(0, -1)); return; }
+    if (key === '=') {
+      try {
+        if (!/^[0-9+\-*/.() %]*$/.test(expr)) throw new Error('bad');
+        // eslint-disable-next-line no-new-func
+        const value = Function(`"use strict"; return (${expr.replace(/%/g, '/100')})`)();
+        setResult(Number.isFinite(value) ? String(Math.round(value * 100) / 100) : '—');
+      } catch { setResult('—'); }
+      return;
+    }
+    setExpr((e) => e + key);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => {
+      if (/^[0-9+\-*/.]$/.test(e.key)) press(e.key);
+      else if (e.key === 'Enter') press('=');
+      else if (e.key === 'Backspace') press('←');
+      else if (e.key.toLowerCase() === 'c') press('C');
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, expr]); // eslint-disable-line
+
+  return (
+    <Modal open={open} onClose={onClose} title="Calculator" size="sm">
+      <div className="rounded-lg bg-slate-900 text-white p-4 mb-3 text-right">
+        <p className="font-mono text-sm text-slate-400 min-h-[20px] break-all">{expr || '0'}</p>
+        <p className="font-mono text-3xl font-semibold tabular-nums">{result || '—'}</p>
+      </div>
+      <div className="grid grid-cols-4 gap-2">
+        {['7', '8', '9', '/', '4', '5', '6', '*', '1', '2', '3', '-', '0', '.', '%', '+'].map((k) => (
+          <button key={k} onClick={() => press(k)}
+            className="btn-secondary py-3 text-base font-medium">{k}</button>
+        ))}
+        <button onClick={() => press('C')} className="btn-secondary py-3">C</button>
+        <button onClick={() => press('←')} className="btn-secondary py-3">←</button>
+        <button onClick={() => press('=')} className="btn-primary py-3 col-span-2">=</button>
+      </div>
+    </Modal>
+  );
+}
+
+function NotificationBell() {
+  const { locationId } = useAuth();
+  const [data, setData] = useState(null);
+  const [open, setOpen] = useState(false);
+
+  const load = useCallback(() => {
+    api.get('/api/reports/alerts').then(setData).catch(() => {});
+  }, [locationId]);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 120000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const count = data?.count || 0;
+
+  return (
+    <div className="relative">
+      <button onClick={() => { setOpen((o) => !o); load(); }}
+        className="btn-ghost p-2 relative" title="Alerts">
+        <Bell size={18} />
+        {count > 0 && (
+          <span className="absolute top-0.5 right-0.5 h-4 min-w-[16px] px-1 rounded-full bg-rose-600
+                           text-white text-[10px] font-semibold grid place-items-center">
+            {count > 99 ? '99+' : count}
+          </span>
+        )}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 z-40 mt-2 w-80 max-w-[92vw] rounded-xl bg-white shadow-xl
+                          ring-1 ring-slate-200 overflow-hidden">
+            <div className="px-4 py-2.5 border-b border-slate-100">
+              <p className="font-semibold text-sm text-slate-800">Needs attention</p>
+            </div>
+            <div className="max-h-96 overflow-y-auto divide-y divide-slate-100">
+              {!data ? (
+                <p className="p-4 text-sm text-slate-500">Loading…</p>
+              ) : count === 0 ? (
+                <p className="p-4 text-sm text-slate-500">Nothing needs attention right now.</p>
+              ) : (
+                <>
+                  {data.tags_pending > 0 && (
+                    <Link to="/rfid?encoded=false" onClick={() => setOpen(false)}
+                      className="flex items-center gap-2.5 px-4 py-2.5 hover:bg-slate-50">
+                      <Printer size={15} className="text-amber-600 shrink-0" />
+                      <span className="text-sm text-slate-700">
+                        {num(data.tags_pending)} unit{data.tags_pending === 1 ? '' : 's'} waiting for an RFID tag
+                      </span>
+                    </Link>
+                  )}
+                  {data.low_stock.map((s) => (
+                    <Link key={`s${s.variant_id}`} to={`/products/${s.product_id}`}
+                      onClick={() => setOpen(false)}
+                      className="flex items-start gap-2.5 px-4 py-2.5 hover:bg-slate-50">
+                      <AlertTriangle size={15} className="text-amber-600 shrink-0 mt-0.5" />
+                      <span className="text-sm text-slate-700 min-w-0">
+                        <span className="font-medium">{s.product_name}</span>{' '}
+                        <span className="text-slate-500">
+                          {[s.size, s.color].filter(Boolean).join(' / ')}
+                        </span>
+                        <span className="block text-xs text-slate-500">
+                          {num(s.quantity)} left · reorder at {num(s.reorder_point)}
+                        </span>
+                      </span>
+                    </Link>
+                  ))}
+                  {data.unpaid.map((u) => (
+                    <Link key={`u${u.id}`} to={`/sales/${u.id}`} onClick={() => setOpen(false)}
+                      className="flex items-start gap-2.5 px-4 py-2.5 hover:bg-slate-50">
+                      <Coins size={15} className="text-rose-600 shrink-0 mt-0.5" />
+                      <span className="text-sm text-slate-700 min-w-0">
+                        <span className="font-medium">{money(u.balance_due)}</span> owed by {u.customer}
+                        <span className="block text-xs text-slate-500">
+                          {u.invoice_no} · {u.age_days} day{Number(u.age_days) === 1 ? '' : 's'} old
+                        </span>
+                      </span>
+                    </Link>
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function TodaysProfit() {
+  const { locationId } = useAuth();
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    const load = () => api.get('/api/reports/today').then(setData).catch(() => {});
+    load();
+    const t = setInterval(load, 180000);
+    return () => clearInterval(t);
+  }, [locationId]);
+
+  if (!data) return null;
+  return (
+    <Link to="/reports?tab=pl"
+      className="hidden md:flex items-center gap-2 rounded-lg bg-emerald-50 px-3 py-1.5
+                 ring-1 ring-emerald-200 hover:bg-emerald-100 transition-colors">
+      <TrendingUp size={14} className="text-emerald-700 shrink-0" />
+      <span className="text-xs text-emerald-900">
+        <span className="opacity-70">Today</span>{' '}
+        <span className="font-semibold tabular-nums">{money(data.gross_profit)}</span>
+      </span>
+    </Link>
+  );
+}
+
+/* ---------------- shell ---------------- */
+
 export default function Layout() {
   const { user, logout, can } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [net, setNet] = useState({ online: navigator.onLine, queued: 0 });
+  const [calcOpen, setCalcOpen] = useState(false);
   const [openGroups, setOpenGroups] = useState(() => {
     try { return JSON.parse(localStorage.getItem(OPEN_KEY) || '{}'); } catch { return {}; }
   });
@@ -203,8 +429,7 @@ export default function Layout() {
     else toast.info('Nothing waiting to sync');
   };
 
-  const visible = useMemo(
-    () => NAV.filter((g) => !g.perm || can(g.perm)), [can]);
+  const visible = useMemo(() => NAV.filter((g) => !g.perm || can(g.perm)), [can]);
 
   const sidebar = (
     <div className="flex h-full flex-col bg-slate-900">
@@ -236,6 +461,7 @@ export default function Layout() {
         )}
       </nav>
 
+      {/* optional / hardware zone, walled off at the bottom so the core menu never grows */}
       <div className="border-t border-slate-800 p-3">
         <button onClick={() => navigate('/stock-take-mode')}
           className="w-full btn bg-emerald-600 text-white hover:bg-emerald-700 mb-2">
@@ -271,11 +497,12 @@ export default function Layout() {
 
       <div className="lg:pl-60">
         <header className="sticky top-0 z-20 bg-white/90 backdrop-blur border-b border-slate-200">
-          <div className="flex items-center gap-3 px-4 h-14">
+          <div className="flex items-center gap-2 px-4 h-14">
             <button className="lg:hidden btn-ghost p-2" onClick={() => setMobileOpen(true)}>
               <Menu size={20} />
             </button>
             <div className="flex-1" />
+
             {!net.online && (
               <span className="badge bg-amber-100 text-amber-800 gap-1.5">
                 <WifiOff size={13} /> Offline
@@ -286,6 +513,15 @@ export default function Layout() {
                 <CloudUpload size={13} /> {net.queued} to sync
               </button>
             )}
+
+            {/* the owner's glance — hidden from the cashier role */}
+            {can('reports.read') && can('settings.read') && user?.role !== 'cashier' && <TodaysProfit />}
+
+            <button onClick={() => setCalcOpen(true)} className="btn-ghost p-2" title="Calculator">
+              <Calculator size={18} />
+            </button>
+            <NotificationBell />
+
             <button onClick={() => navigate('/pos')} className="btn-primary">
               <ShoppingCart size={16} /> <span className="hidden sm:inline">New sale</span>
             </button>
@@ -296,6 +532,8 @@ export default function Layout() {
           <Outlet context={{ net }} />
         </main>
       </div>
+
+      <CalculatorWidget open={calcOpen} onClose={() => setCalcOpen(false)} />
     </div>
   );
 }

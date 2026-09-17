@@ -8,6 +8,7 @@ import { money, num } from '../lib/format.js';
 import { Card, Loading, Empty, Badge, Modal, Pagination, useToast, Field, ConfirmButton } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import ExportButtons from '../components/ExportButtons.jsx';
 
 export default function Products() {
   const { can, locationId } = useAuth();
@@ -57,7 +58,7 @@ export default function Products() {
         actions={
           <>
             <button className="btn-secondary" onClick={() => api.download('/api/io/products/export?format=xlsx')}>
-              <Download size={16} /> Export
+              <Download size={16} /> Export catalogue
             </button>
             <Link to="/import-export" className="btn-secondary"><FileSpreadsheet size={16} /> Import</Link>
             {can('products.write') && (

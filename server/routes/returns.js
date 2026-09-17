@@ -5,6 +5,7 @@ import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
 import { moveStock, receiveUnits } from '../services/inventory.js';
 import { createSale, loadSale } from './sales.js';
+import { resolveAccountId } from '../services/accounts.js';
 
 const r = Router();
 
@@ -159,9 +160,12 @@ r.post('/', requirePerm('returns.create'), h(async (req, res) => {
       } else if (refundMethod === 'account_credit' && customerId) {
         await c.query('UPDATE customers SET balance = GREATEST(0, balance - $2) WHERE id=$1', [customerId, creditBack]);
       } else if (originalId) {
+        const method = refundMethod === 'cash' ? 'cash' : refundMethod;
+        const accountId = await resolveAccountId(c, method, req.body.account_id);
         await c.query(
-          `INSERT INTO payments (sale_id, method, amount, reference, user_id) VALUES ($1,$2,$3,$4,$5)`,
-          [originalId, refundMethod === 'cash' ? 'cash' : refundMethod, -creditBack, ref, req.user.id]);
+          `INSERT INTO payments (sale_id, method, amount, reference, user_id, account_id)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [originalId, method, -creditBack, ref, req.user.id, accountId]);
       }
     }
 

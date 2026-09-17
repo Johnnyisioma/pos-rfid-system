@@ -16,7 +16,7 @@ export default function ProductEditor() {
   const toast = useToast();
   const { settings, can, locationId, locations } = useAuth();
 
-  const [catalog, setCatalog] = useState({ brands: [], categories: [], templates: [] });
+  const [catalog, setCatalog] = useState({ brands: [], categories: [], templates: [], taxRates: [] });
   const [product, setProduct] = useState(null);
   const [variants, setVariants] = useState([blankVariant()]);
   const [saving, setSaving] = useState(false);
@@ -28,7 +28,7 @@ export default function ProductEditor() {
   useEffect(() => {
     if (isNew) {
       setProduct({
-        name: '', sku: '', type: 'variable', brand_id: '', category_id: '', sub_category_id: '',
+        name: '', sku: '', type: 'variable', brand_id: '', category_id: '', sub_category_id: '', tax_rate_id: '',
         unit: 'pair', description: '', image_url: '',
         tax_rate: settings?.vat_rate ?? 7.5, reorder_point: settings?.low_stock_default ?? 3,
         track_rfid: true, is_active: true,
@@ -74,6 +74,7 @@ export default function ProductEditor() {
       const body = {
         ...product,
         brand_id: product.brand_id || null,
+        tax_rate_id: product.tax_rate_id || null,
         category_id: product.category_id || null,
         sub_category_id: product.sub_category_id || null,
         tax_rate: Number(product.tax_rate),
@@ -147,8 +148,27 @@ export default function ProductEditor() {
                   {children.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
               </Field>
-              <Field label="VAT rate (%)">
+              <Field label="Tax rate"
+                hint={(catalog.taxRates || []).length
+                  ? 'Picking a named rate keeps the VAT return right for exempt lines'
+                  : 'Add named rates under Settings → Tax rates to handle exempt items'}>
+                <select className="input" value={product.tax_rate_id || ''}
+                  onChange={(e) => {
+                    const id = e.target.value;
+                    const hit = (catalog.taxRates || []).find((t) => String(t.id) === String(id));
+                    // Keep the plain percentage in step so older receipts and the
+                    // reports that read p.tax_rate never disagree with the named rate.
+                    setP(hit ? { tax_rate_id: id, tax_rate: hit.rate } : { tax_rate_id: '' });
+                  }}>
+                  <option value="">Business default ({settings?.vat_rate ?? 7.5}%)</option>
+                  {(catalog.taxRates || []).map((t) => (
+                    <option key={t.id} value={t.id}>{t.name} — {Number(t.rate).toFixed(2)}%</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="VAT rate (%)" hint="Used when no named rate is picked">
                 <input type="number" step="0.1" className="input" value={product.tax_rate}
+                  disabled={!!product.tax_rate_id}
                   onChange={(e) => setP({ tax_rate: e.target.value })} />
               </Field>
               <Field label="Reorder point">

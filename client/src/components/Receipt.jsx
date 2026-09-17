@@ -129,10 +129,42 @@ export default function Receipt({ data, preview = false }) {
       <dl className="space-y-0.5">
         {s.subtotal != null && <Line label="Subtotal" value={money(s.subtotal)} />}
         {Number(s.discount_amount) > 0 && <Line label="Discount" value={`− ${money(s.discount_amount)}`} />}
-        {s.tax_amount != null && (
-          <Line label={`VAT @ ${b.vat_rate}%${b.prices_include_vat ? ' (incl.)' : ''}`}
-            value={money(s.tax_amount)} />
-        )}
+        {s.tax_amount != null && (() => {
+          // A basket can mix rates — a standard-rated pair of shoes with a
+          // zero-rated item. One "VAT @ 7.5%" line would then be a false
+          // statement on a tax document, so break it down whenever the lines
+          // actually carry more than one rate.
+          const bands = new Map();
+          (s.items || []).forEach((i) => {
+            const rate = Number(i.tax_rate ?? b.vat_rate);
+            const prev = bands.get(rate) || { net: 0, tax: 0 };
+            const tax = Number(i.tax_amount || 0);
+            bands.set(rate, {
+              net: prev.net + (Number(i.line_total || 0) - (b.prices_include_vat ? tax : 0)),
+              tax: prev.tax + tax,
+            });
+          });
+          const rows = [...bands.entries()].sort((a, c) => c[0] - a[0]);
+          const suffix = b.prices_include_vat ? ' (incl.)' : '';
+
+          if (rows.length <= 1) {
+            const rate = rows.length ? rows[0][0] : Number(b.vat_rate);
+            return <Line label={`VAT @ ${Number(rate).toFixed(rate % 1 ? 2 : 1)}%${suffix}`}
+              value={money(s.tax_amount)} />;
+          }
+          return (
+            <>
+              {rows.map(([rate, v]) => (
+                <Line key={rate}
+                  label={rate === 0
+                    ? `Zero-rated${suffix} on ${money(v.net)}`
+                    : `VAT @ ${Number(rate).toFixed(rate % 1 ? 2 : 1)}%${suffix} on ${money(v.net)}`}
+                  value={money(v.tax)} />
+              ))}
+              <Line label="Total VAT" value={money(s.tax_amount)} />
+            </>
+          );
+        })()}
         {s.total != null && <Line label="TOTAL" value={money(s.total)} bold />}
       </dl>
 

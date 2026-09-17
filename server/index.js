@@ -29,6 +29,7 @@ import expenseRoutes from './routes/expenses.js';
 import reportRoutes from './routes/reports.js';
 import auditRoutes from './routes/audit.js';
 import deviceRoutes from './routes/devices.js';
+import accountRoutes from './routes/accounts.js';
 import syncRoutes from './routes/sync.js';
 
 dotenv.config();
@@ -75,6 +76,7 @@ app.use('/api/expenses', expenseRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/audit', auditRoutes);
 app.use('/api/devices', deviceRoutes);
+app.use('/api/accounts', accountRoutes);
 app.use('/api/sync', syncRoutes);
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Unknown endpoint' }));

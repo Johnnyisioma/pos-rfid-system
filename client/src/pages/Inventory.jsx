@@ -11,6 +11,7 @@ import {
 import { RankedBarChart } from '../components/charts.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import ExportButtons from '../components/ExportButtons.jsx';
 import { useTabParam } from '../lib/useTabParam.js';
 import VariantPicker from '../components/VariantPicker.jsx';
 
@@ -74,9 +75,7 @@ function Levels() {
             <option value="here">This shop</option>
             <option value="all">All shops</option>
           </select>
-          <button className="btn-secondary" onClick={() => api.download('/api/reports/export/inventory?format=xlsx')}>
-            <Download size={16} /> Export
-          </button>
+          <ExportButtons report="inventory" title="Stock on hand" />
           {can('inventory.write') && (
             <>
               <button className="btn-secondary" onClick={() => setAdjust(true)}>

@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Plus, ArrowLeftRight, Truck, PackageCheck, Trash2, Radio } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, dateTime, variantLabel } from '../lib/format.js';
@@ -11,6 +12,7 @@ import VariantPicker from '../components/VariantPicker.jsx';
 
 export default function Transfers() {
   const { can, locationId, locations } = useAuth();
+  const [params, setParams] = useSearchParams();
   const [data, setData] = useState(null);
   const [status, setStatus] = useState('');
   const [page, setPage] = useState(1);
@@ -22,6 +24,14 @@ export default function Transfers() {
     setData(await api.get(`/api/transfers${qs({ status, page, limit: 25 })}`).catch(() => ({ data: [] })));
   }, [status, page, locationId]);
   useEffect(() => { load(); }, [load]);
+
+  // The sidebar's "Add transfer" link lands here with ?new=1. Open the form,
+  // then drop the flag so a refresh or a back-button press does not reopen it.
+  useEffect(() => {
+    if (params.get('new') !== '1') return;
+    if (can('transfers.write') && locations.length > 1) setCreating(true);
+    setParams(new URLSearchParams(), { replace: true });
+  }, [params]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <>

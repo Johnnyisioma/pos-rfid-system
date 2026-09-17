@@ -8,15 +8,16 @@ import { audit } from '../lib/audit.js';
 const r = Router();
 
 r.get('/', h(async (req, res) => {
-  const [brands, categories, templates, expenseCategories, customerGroups] = await Promise.all([
+  const [brands, categories, templates, expenseCategories, customerGroups, taxRates] = await Promise.all([
     many('SELECT * FROM brands ORDER BY name'),
     many(`SELECT c.*, p.name AS parent_name FROM categories c
             LEFT JOIN categories p ON p.id=c.parent_id ORDER BY COALESCE(p.name,c.name), c.name`),
     many('SELECT * FROM variation_templates ORDER BY axis, name'),
     many('SELECT * FROM expense_categories ORDER BY name'),
     many('SELECT * FROM customer_groups ORDER BY name'),
+    many('SELECT * FROM tax_rates WHERE is_active ORDER BY is_default DESC, rate DESC'),
   ]);
-  res.json({ brands, categories, templates, expenseCategories, customerGroups });
+  res.json({ brands, categories, templates, expenseCategories, customerGroups, taxRates });
 }));
 
 r.post('/brands', requirePerm('products.write'), h(async (req, res) => {
@@ -90,6 +91,52 @@ r.put('/customer-groups/:id', requirePerm('customers.write'), h(async (req, res)
     [req.params.id, req.body.name ?? null, req.body.discount_percent ?? null, req.body.notes ?? null]
   );
   res.json(row);
+}));
+
+/* ---------------- tax rates ---------------- */
+r.post('/tax-rates', requirePerm('settings.write'), h(async (req, res) => {
+  const name = str(req.body.name).trim();
+  if (!name) throw bad('Give the tax rate a name');
+  const rate = num(req.body.rate, 0);
+  if (rate < 0 || rate > 100) throw bad('Rate must be between 0 and 100');
+  const row = await one(
+    `INSERT INTO tax_rates (name, rate, is_exempt, is_default)
+     VALUES ($1,$2,$3,FALSE)
+     ON CONFLICT (name) DO UPDATE
+       SET rate = EXCLUDED.rate, is_exempt = EXCLUDED.is_exempt,
+           -- Re-adding a rate that was retired brings it back rather than
+           -- silently returning a row the product form will never show.
+           is_active = TRUE
+     RETURNING *`,
+    [name, rate, rate === 0]);
+  await audit(req, 'upsert', 'tax_rate', row.id, { name, rate });
+  res.status(201).json(row);
+}));
+
+r.put('/tax-rates/:id', requirePerm('settings.write'), h(async (req, res) => {
+  if (req.body.is_default) await query('UPDATE tax_rates SET is_default=FALSE');
+  const row = await one(
+    `UPDATE tax_rates SET name=COALESCE($2,name), rate=COALESCE($3,rate),
+            is_default=COALESCE($4,is_default), is_active=COALESCE($5,is_active),
+            is_exempt = COALESCE($3, rate) = 0
+      WHERE id=$1 RETURNING *`,
+    [req.params.id, req.body.name ?? null, req.body.rate ?? null,
+     'is_default' in req.body ? !!req.body.is_default : null,
+     'is_active' in req.body ? !!req.body.is_active : null]);
+  if (!row) throw bad('Tax rate not found');
+  await audit(req, 'update', 'tax_rate', row.id, {});
+  res.json(row);
+}));
+
+r.delete('/tax-rates/:id', requirePerm('settings.write'), h(async (req, res) => {
+  const used = await one('SELECT 1 FROM products WHERE tax_rate_id=$1 LIMIT 1', [req.params.id]);
+  if (used) {
+    await query('UPDATE tax_rates SET is_active=FALSE WHERE id=$1', [req.params.id]);
+    return res.json({ ok: true, deactivated: true,
+      message: 'Products use this rate, so it was deactivated rather than deleted.' });
+  }
+  await query('DELETE FROM tax_rates WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
 }));
 
 export default r;

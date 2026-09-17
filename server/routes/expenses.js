@@ -45,10 +45,11 @@ r.post('/', requirePerm('expenses.write'), h(async (req, res) => {
   const row = await tx(async (c) => {
     const ref = await nextRef(c, 'expenses', 'EXP');
     const { rows } = await c.query(
-      `INSERT INTO expenses (ref, location_id, category_id, amount, note, expense_date, user_id)
-       VALUES ($1,$2,$3,$4,$5,COALESCE($6::date, CURRENT_DATE),$7) RETURNING *`,
+      `INSERT INTO expenses (ref, location_id, category_id, amount, note, expense_date, user_id, account_id)
+       VALUES ($1,$2,$3,$4,$5,COALESCE($6::date, CURRENT_DATE),$7,$8) RETURNING *`,
       [ref, int(req.body.location_id, req.locationId), int(req.body.category_id) || null,
-       amount, str(req.body.note), req.body.expense_date || null, req.user.id]);
+       amount, str(req.body.note), req.body.expense_date || null, req.user.id,
+       int(req.body.account_id) || null]);
     return rows[0];
   });
   await audit(req, 'create', 'expense', row.id, { ref: row.ref, amount });
@@ -58,9 +59,9 @@ r.post('/', requirePerm('expenses.write'), h(async (req, res) => {
 r.put('/:id', requirePerm('expenses.write'), h(async (req, res) => {
   const row = await one(
     `UPDATE expenses SET category_id=$2, amount=COALESCE($3,amount), note=COALESCE($4,note),
-            expense_date=COALESCE($5::date, expense_date) WHERE id=$1 RETURNING *`,
+            expense_date=COALESCE($5::date, expense_date), account_id=$6 WHERE id=$1 RETURNING *`,
     [req.params.id, int(req.body.category_id) || null, req.body.amount ?? null,
-     req.body.note ?? null, req.body.expense_date || null]);
+     req.body.note ?? null, req.body.expense_date || null, int(req.body.account_id) || null]);
   if (!row) throw notFound('Expense not found');
   await audit(req, 'update', 'expense', row.id, {});
   res.json(row);

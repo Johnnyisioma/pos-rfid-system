@@ -3,6 +3,7 @@ import { many, one, query, tx } from '../db/index.js';
 import { h, bad, notFound, str, num, int, bool, paging, money } from '../lib/util.js';
 import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
+import { resolveAccountId } from '../services/accounts.js';
 
 const r = Router();
 
@@ -90,9 +91,12 @@ r.post('/:id/payments', requirePerm('customers.write'), h(async (req, res) => {
     for (const s of due) {
       if (left <= 0) break;
       const pay = Math.min(left, Number(s.balance_due));
+      const method = str(req.body.method, 'cash');
+      const accountId = await resolveAccountId(c, method, req.body.account_id);
       await c.query(
-        'INSERT INTO payments (sale_id, method, amount, reference, user_id) VALUES ($1,$2,$3,$4,$5)',
-        [s.id, str(req.body.method, 'cash'), pay, str(req.body.reference) || 'Account payment', req.user.id]);
+        `INSERT INTO payments (sale_id, method, amount, reference, user_id, account_id)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [s.id, method, pay, str(req.body.reference) || 'Account payment', req.user.id, accountId]);
       await c.query(
         `UPDATE sales SET amount_paid = amount_paid + $2, balance_due = balance_due - $2,
                 is_credit = (balance_due - $2) > 0, updated_at=now() WHERE id=$1`, [s.id, pay]);

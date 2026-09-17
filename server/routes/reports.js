@@ -314,6 +314,366 @@ r.get('/tax', h(async (req, res) => {
   res.json({ from, to, rows, invoice_sequence_gaps: gaps.gaps });
 }));
 
+
+/* ---------------- top-bar feeds ---------------- */
+
+/**
+ * Today's profit for the top bar. Deliberately tiny — the full dashboard query
+ * is far too heavy to sit behind a number that refreshes every few minutes.
+ * Permission-gated at the UI so a cashier never sees it.
+ */
+r.get('/today', h(async (req, res) => {
+  const locationId = loc(req);
+  const row = await one(
+    `SELECT COUNT(*)::int AS orders,
+            COALESCE(SUM(total),0) AS revenue,
+            COALESCE(SUM(total - tax_amount - cost_total),0) AS gross_profit
+       FROM sales
+      WHERE status IN ${SALE_STATUSES}
+        AND ($1::int IS NULL OR location_id=$1)
+        AND created_at >= date_trunc('day', now())`, [locationId]);
+  res.json(row);
+}));
+
+/** What the notification bell shows: the two things that actually need action. */
+r.get('/alerts', h(async (req, res) => {
+  const locationId = loc(req);
+  const lowStock = await many(
+    `SELECT v.id AS variant_id, p.id AS product_id, p.name AS product_name,
+            v.size, v.color, COALESCE(i.quantity,0) AS quantity,
+            COALESCE(i.reorder_point, v.reorder_point, p.reorder_point, 0) AS reorder_point
+       FROM inventory i
+       JOIN product_variants v ON v.id=i.variant_id
+       JOIN products p ON p.id=v.product_id
+      WHERE p.is_active AND v.is_active
+        AND ($1::int IS NULL OR i.location_id=$1)
+        AND COALESCE(i.quantity,0) <= COALESCE(i.reorder_point, v.reorder_point, p.reorder_point, 0)
+      ORDER BY COALESCE(i.quantity,0) ASC LIMIT 20`, [locationId]);
+
+  const unpaid = await many(
+    `SELECT s.id, s.invoice_no, s.balance_due, s.created_at,
+            COALESCE(c.name,'Walk-in') AS customer,
+            (CURRENT_DATE - s.created_at::date) AS age_days
+       FROM sales s LEFT JOIN customers c ON c.id=s.customer_id
+      WHERE s.balance_due > 0 AND ($1::int IS NULL OR s.location_id=$1)
+      ORDER BY age_days DESC LIMIT 20`, [locationId]);
+
+  const tagsPending = await one(
+    `SELECT COUNT(*)::int AS n FROM stock_units
+      WHERE status='in_stock' AND NOT tag_encoded AND ($1::int IS NULL OR location_id=$1)`,
+    [locationId]);
+
+  res.json({
+    low_stock: lowStock,
+    unpaid,
+    tags_pending: tagsPending.n,
+    count: lowStock.length + unpaid.length + (tagsPending.n > 0 ? 1 : 0),
+  });
+}));
+
+/* ---------------- C1 · aged receivables ---------------- */
+r.get('/payment-by-age', h(async (req, res) => {
+  const locationId = loc(req);
+  const rows = await many(
+    `SELECT s.id, s.invoice_no, s.created_at, s.total, s.amount_paid, s.balance_due,
+            COALESCE(c.name,'Walk-in') AS customer, c.id AS customer_id, c.phone,
+            l.name AS location_name,
+            (CURRENT_DATE - s.created_at::date) AS age_days,
+            CASE
+              WHEN (CURRENT_DATE - s.created_at::date) <= 30 THEN 'current'
+              WHEN (CURRENT_DATE - s.created_at::date) <= 60 THEN 'd31_60'
+              WHEN (CURRENT_DATE - s.created_at::date) <= 90 THEN 'd61_90'
+              ELSE 'over_90'
+            END AS bucket
+       FROM sales s
+       LEFT JOIN customers c ON c.id=s.customer_id
+       JOIN locations l ON l.id=s.location_id
+      WHERE s.balance_due > 0 AND ($1::int IS NULL OR s.location_id=$1)
+      ORDER BY (CURRENT_DATE - s.created_at::date) DESC`, [locationId]);
+
+  const buckets = { current: 0, d31_60: 0, d61_90: 0, over_90: 0 };
+  rows.forEach((x) => { buckets[x.bucket] += Number(x.balance_due); });
+
+  const byCustomer = {};
+  rows.forEach((x) => {
+    const key = x.customer_id || 'walkin';
+    byCustomer[key] ||= {
+      customer_id: x.customer_id, customer: x.customer, phone: x.phone,
+      current: 0, d31_60: 0, d61_90: 0, over_90: 0, total: 0, invoices: 0,
+      oldest_days: 0,
+    };
+    const b = byCustomer[key];
+    b[x.bucket] += Number(x.balance_due);
+    b.total += Number(x.balance_due);
+    b.invoices += 1;
+    b.oldest_days = Math.max(b.oldest_days, Number(x.age_days));
+  });
+
+  res.json({
+    buckets,
+    total: Object.values(buckets).reduce((a, b) => a + b, 0),
+    by_customer: Object.values(byCustomer).sort((a, b) => b.total - a.total),
+    invoices: rows,
+  });
+}));
+
+/* ---------------- C2 · supplier & customer ---------------- */
+r.get('/contacts-balance', h(async (req, res) => {
+  const receivables = await many(
+    `SELECT c.id, c.name, c.phone, g.name AS group_name, c.balance, c.credit_limit,
+            c.store_credit, c.loyalty_points,
+            (SELECT COUNT(*) FROM sales s WHERE s.customer_id=c.id AND s.balance_due > 0) AS open_invoices,
+            (SELECT COALESCE(SUM(total),0) FROM sales s WHERE s.customer_id=c.id) AS lifetime_value
+       FROM customers c LEFT JOIN customer_groups g ON g.id=c.group_id
+      WHERE c.balance > 0 OR c.store_credit > 0
+      ORDER BY c.balance DESC`);
+  const payables = await many(
+    `SELECT s.id, s.name, s.phone, s.contact_person,
+            COALESCE(SUM(po.total - po.amount_paid) FILTER (
+              WHERE po.status IN ('ordered','partial','received')), 0) AS outstanding,
+            COALESCE(SUM(po.total) FILTER (
+              WHERE po.status IN ('ordered','partial','received')), 0) AS purchased,
+            (SELECT COALESCE(SUM(pr.total),0) FROM purchase_returns pr WHERE pr.supplier_id=s.id) AS returned
+       FROM suppliers s LEFT JOIN purchase_orders po ON po.supplier_id=s.id
+      GROUP BY s.id ORDER BY outstanding DESC`);
+  res.json({
+    receivables,
+    payables,
+    total_receivable: receivables.reduce((a, b) => a + Number(b.balance), 0),
+    total_payable: payables.reduce((a, b) => a + Number(b.outstanding), 0),
+    total_store_credit: receivables.reduce((a, b) => a + Number(b.store_credit), 0),
+  });
+}));
+
+/* ---------------- C3 · purchase vs sale ---------------- */
+r.get('/purchase-sale', h(async (req, res) => {
+  const locationId = loc(req);
+  const { from, to } = range(req);
+  const p = [locationId, from, to];
+
+  const sales = await one(
+    `SELECT COUNT(*)::int AS orders, COALESCE(SUM(total),0) AS gross,
+            COALESCE(SUM(tax_amount),0) AS tax, COALESCE(SUM(cost_total),0) AS cost
+       FROM sales WHERE status IN ${SALE_STATUSES} AND ($1::int IS NULL OR location_id=$1)
+         AND created_at >= $2::date AND created_at < ($3::date + interval '1 day')`, p);
+  const sellReturns = await one(
+    `SELECT COALESCE(SUM(total_refund),0) AS total, COUNT(*)::int AS count
+       FROM sale_returns WHERE ($1::int IS NULL OR location_id=$1)
+         AND created_at >= $2::date AND created_at < ($3::date + interval '1 day')`, p);
+  const purchases = await one(
+    `SELECT COUNT(*)::int AS orders, COALESCE(SUM(total),0) AS total,
+            COALESCE(SUM(amount_paid),0) AS paid
+       FROM purchase_orders
+      WHERE status IN ('ordered','partial','received') AND ($1::int IS NULL OR location_id=$1)
+        AND order_date >= $2::date AND order_date <= $3::date`, p);
+  const purchaseReturns = await one(
+    `SELECT COALESCE(SUM(total),0) AS total, COUNT(*)::int AS count
+       FROM purchase_returns WHERE ($1::int IS NULL OR location_id=$1)
+         AND created_at >= $2::date AND created_at < ($3::date + interval '1 day')`, p);
+
+  const netSales = Number(sales.gross) - Number(sellReturns.total);
+  const netPurchases = Number(purchases.total) - Number(purchaseReturns.total);
+  const margin = netSales - Number(sales.tax) - Number(sales.cost);
+
+  res.json({
+    from, to,
+    sales: { ...sales, returns: Number(sellReturns.total), return_count: sellReturns.count, net: netSales },
+    purchases: { ...purchases, returns: Number(purchaseReturns.total),
+      return_count: purchaseReturns.count, net: netPurchases },
+    gross_margin: margin,
+    margin_percent: netSales - Number(sales.tax) > 0
+      ? Math.round((margin / (netSales - Number(sales.tax))) * 1000) / 10 : 0,
+  });
+}));
+
+/* ---------------- C4 · money in and out ---------------- */
+r.get('/payments', h(async (req, res) => {
+  const locationId = loc(req);
+  const { from, to } = range(req);
+  const p = [locationId, from, to];
+
+  const sellByMethod = await many(
+    `SELECT pm.method, COUNT(*)::int AS count, COALESCE(SUM(pm.amount),0) AS amount
+       FROM payments pm JOIN sales s ON s.id=pm.sale_id
+      WHERE ($1::int IS NULL OR s.location_id=$1)
+        AND pm.created_at >= $2::date AND pm.created_at < ($3::date + interval '1 day')
+      GROUP BY pm.method ORDER BY amount DESC`, p);
+  const sellByAccount = await many(
+    `SELECT COALESCE(a.name,'Unassigned') AS account, a.type,
+            COUNT(*)::int AS count, COALESCE(SUM(pm.amount),0) AS amount
+       FROM payments pm
+       JOIN sales s ON s.id=pm.sale_id
+       LEFT JOIN payment_accounts a ON a.id=pm.account_id
+      WHERE ($1::int IS NULL OR s.location_id=$1)
+        AND pm.created_at >= $2::date AND pm.created_at < ($3::date + interval '1 day')
+      GROUP BY 1,2 ORDER BY amount DESC`, p);
+  const purchasePayments = await many(
+    `SELECT COALESCE(s.name,'No supplier') AS supplier, COUNT(*)::int AS orders,
+            COALESCE(SUM(po.amount_paid),0) AS paid,
+            COALESCE(SUM(po.total - po.amount_paid),0) AS outstanding
+       FROM purchase_orders po LEFT JOIN suppliers s ON s.id=po.supplier_id
+      WHERE po.status IN ('ordered','partial','received') AND ($1::int IS NULL OR po.location_id=$1)
+        AND po.order_date >= $2::date AND po.order_date <= $3::date
+      GROUP BY 1 ORDER BY paid DESC`, p);
+  const expenseByAccount = await many(
+    `SELECT COALESCE(a.name,'Unassigned') AS account, COUNT(*)::int AS count,
+            COALESCE(SUM(e.amount),0) AS amount
+       FROM expenses e LEFT JOIN payment_accounts a ON a.id=e.account_id
+      WHERE ($1::int IS NULL OR e.location_id=$1)
+        AND e.expense_date >= $2::date AND e.expense_date <= $3::date
+      GROUP BY 1 ORDER BY amount DESC`, p);
+
+  res.json({
+    from, to,
+    sell_by_method: sellByMethod,
+    sell_by_account: sellByAccount,
+    purchase_payments: purchasePayments,
+    expense_by_account: expenseByAccount,
+    money_in: sellByMethod.reduce((a, b) => a + Number(b.amount), 0),
+    money_out: expenseByAccount.reduce((a, b) => a + Number(b.amount), 0),
+  });
+}));
+
+/* ---------------- C5 · Z report ---------------- */
+r.get('/z-report', h(async (req, res) => {
+  const locationId = loc(req);
+  const sessionId = int(req.query.session_id) || null;
+  const day = str(req.query.date) || new Date().toISOString().slice(0, 10);
+
+  const scope = sessionId
+    ? { where: 's.register_session_id = $1', params: [sessionId] }
+    : { where: `($1::int IS NULL OR s.location_id=$1)
+                AND s.created_at >= $2::date AND s.created_at < ($2::date + interval '1 day')`,
+        params: [locationId, day] };
+
+  const header = sessionId
+    ? await one(
+        `SELECT rs.*, rg.name AS register_name, l.name AS location_name, u.name AS user_name
+           FROM register_sessions rs
+           JOIN registers rg ON rg.id=rs.register_id
+           JOIN locations l ON l.id=rs.location_id
+           LEFT JOIN users u ON u.id=rs.user_id WHERE rs.id=$1`, [sessionId])
+    : null;
+
+  const totals = await one(
+    `SELECT COUNT(*)::int AS transactions, COALESCE(SUM(s.total),0) AS gross,
+            COALESCE(SUM(s.tax_amount),0) AS tax, COALESCE(SUM(s.discount_amount),0) AS discounts,
+            COALESCE(SUM(s.cost_total),0) AS cost, COALESCE(SUM(s.change_due),0) AS change_given,
+            COALESCE(AVG(s.total),0) AS average
+       FROM sales s WHERE s.status IN ${SALE_STATUSES} AND ${scope.where}`, scope.params);
+
+  const tenders = await many(
+    `SELECT pm.method, COUNT(*)::int AS count, COALESCE(SUM(pm.amount),0) AS amount
+       FROM payments pm JOIN sales s ON s.id=pm.sale_id
+      WHERE s.status IN ${SALE_STATUSES} AND ${scope.where}
+      GROUP BY pm.method ORDER BY amount DESC`, scope.params);
+
+  const refunds = await one(
+    `SELECT COUNT(*)::int AS count, COALESCE(SUM(sr.total_refund),0) AS amount
+       FROM sale_returns sr JOIN sales s ON s.id=sr.original_sale_id
+      WHERE ${scope.where}`, scope.params);
+
+  const amendments = await one(
+    `SELECT COUNT(*)::int AS count FROM sales s
+      WHERE s.edit_count > 0 AND ${scope.where}`, scope.params);
+
+  const byStaff = await many(
+    `SELECT COALESCE(u.name,'Unknown') AS staff, COUNT(*)::int AS transactions,
+            COALESCE(SUM(s.total),0) AS amount
+       FROM sales s LEFT JOIN users u ON u.id=s.user_id
+      WHERE s.status IN ${SALE_STATUSES} AND ${scope.where}
+      GROUP BY 1 ORDER BY amount DESC`, scope.params);
+
+  const cashIn = Number(tenders.find((t) => t.method === 'cash')?.amount || 0);
+  const expected = header
+    ? Number(header.opening_cash) + cashIn - Number(totals.change_given)
+    : cashIn - Number(totals.change_given);
+
+  res.json({
+    scope: sessionId ? 'session' : 'day',
+    date: day,
+    session: header,
+    totals,
+    tenders,
+    refunds,
+    amendments: amendments.count,
+    by_staff: byStaff,
+    cash: {
+      opening: header ? Number(header.opening_cash) : 0,
+      taken: cashIn,
+      change_given: Number(totals.change_given),
+      expected,
+      counted: header?.counted_cash == null ? null : Number(header.counted_cash),
+      variance: header?.difference == null ? null : Number(header.difference),
+    },
+    net_sales: Number(totals.gross) - Number(refunds.amount),
+  });
+}));
+
+/* ---------------- C6 · stock adjustments / shrinkage ---------------- */
+r.get('/stock-adjustments', h(async (req, res) => {
+  const locationId = loc(req);
+  const { from, to } = range(req);
+  const p = [locationId, from, to];
+
+  const byReason = await many(
+    `SELECT a.reason, COUNT(DISTINCT a.id)::int AS adjustments,
+            COALESCE(SUM(i.quantity_change),0) AS net_units,
+            COALESCE(SUM(CASE WHEN i.quantity_change < 0
+                 THEN -i.quantity_change * v.cost_price ELSE 0 END),0) AS loss_value,
+            COALESCE(SUM(CASE WHEN i.quantity_change > 0
+                 THEN i.quantity_change * v.cost_price ELSE 0 END),0) AS gain_value
+       FROM stock_adjustments a
+       JOIN stock_adjustment_items i ON i.adjustment_id=a.id
+       JOIN product_variants v ON v.id=i.variant_id
+      WHERE ($1::int IS NULL OR a.location_id=$1)
+        AND a.created_at >= $2::date AND a.created_at < ($3::date + interval '1 day')
+      GROUP BY a.reason ORDER BY loss_value DESC`, p);
+
+  const byUser = await many(
+    `SELECT COALESCE(u.name,'System') AS authorised_by, COUNT(DISTINCT a.id)::int AS adjustments,
+            COALESCE(SUM(CASE WHEN i.quantity_change < 0
+                 THEN -i.quantity_change * v.cost_price ELSE 0 END),0) AS loss_value
+       FROM stock_adjustments a
+       JOIN stock_adjustment_items i ON i.adjustment_id=a.id
+       JOIN product_variants v ON v.id=i.variant_id
+       LEFT JOIN users u ON u.id=a.user_id
+      WHERE ($1::int IS NULL OR a.location_id=$1)
+        AND a.created_at >= $2::date AND a.created_at < ($3::date + interval '1 day')
+      GROUP BY 1 ORDER BY loss_value DESC`, p);
+
+  const byProduct = await many(
+    `SELECT p.name AS product_name, v.sku, v.size, v.color,
+            COALESCE(SUM(-i.quantity_change),0) AS units_lost,
+            COALESCE(SUM(CASE WHEN i.quantity_change < 0
+                 THEN -i.quantity_change * v.cost_price ELSE 0 END),0) AS loss_value
+       FROM stock_adjustments a
+       JOIN stock_adjustment_items i ON i.adjustment_id=a.id
+       JOIN product_variants v ON v.id=i.variant_id
+       JOIN products p ON p.id=v.product_id
+      WHERE ($1::int IS NULL OR a.location_id=$1)
+        AND i.quantity_change < 0
+        AND a.created_at >= $2::date AND a.created_at < ($3::date + interval '1 day')
+      GROUP BY 1,2,3,4 ORDER BY loss_value DESC LIMIT 50`, p);
+
+  const trend = await many(
+    `SELECT to_char(date_trunc('week', a.created_at),'YYYY-MM-DD') AS week,
+            COALESCE(SUM(CASE WHEN i.quantity_change < 0
+                 THEN -i.quantity_change * v.cost_price ELSE 0 END),0) AS loss_value
+       FROM stock_adjustments a
+       JOIN stock_adjustment_items i ON i.adjustment_id=a.id
+       JOIN product_variants v ON v.id=i.variant_id
+      WHERE ($1::int IS NULL OR a.location_id=$1)
+        AND a.created_at >= $2::date AND a.created_at < ($3::date + interval '1 day')
+      GROUP BY 1 ORDER BY 1`, p);
+
+  res.json({
+    from, to, by_reason: byReason, by_user: byUser, by_product: byProduct, trend,
+    total_loss: byReason.reduce((a, b) => a + Number(b.loss_value), 0),
+    total_gain: byReason.reduce((a, b) => a + Number(b.gain_value), 0),
+  });
+}));
+
 /* ---------------- generic export ---------------- */
 r.get('/export/:report', h(async (req, res) => {
   const report = str(req.params.report);
@@ -378,6 +738,31 @@ r.get('/export/:report', h(async (req, res) => {
           AND e.expense_date >= $2::date AND e.expense_date <= $3::date
         ORDER BY e.expense_date DESC`, [locationId, from, to]);
     sheetName = 'Expenses';
+  } else if (report === 'aged-receivables') {
+    rows = await many(
+      `SELECT s.invoice_no, COALESCE(c.name,'Walk-in') AS customer, c.phone,
+              to_char(s.created_at,'YYYY-MM-DD') AS invoice_date,
+              (CURRENT_DATE - s.created_at::date) AS days_outstanding,
+              s.total, s.amount_paid, s.balance_due, l.name AS location
+         FROM sales s LEFT JOIN customers c ON c.id=s.customer_id
+         JOIN locations l ON l.id=s.location_id
+        WHERE s.balance_due > 0 AND ($1::int IS NULL OR s.location_id=$1)
+        ORDER BY days_outstanding DESC`, [locationId]);
+    sheetName = 'Aged receivables';
+  } else if (report === 'purchase-returns') {
+    rows = await many(
+      `SELECT pr.ref, to_char(pr.created_at,'YYYY-MM-DD') AS date,
+              COALESCE(s.name,'—') AS supplier, po.po_number, l.name AS location,
+              pr.reason, pr.total, pr.credit_note, u.name AS recorded_by
+         FROM purchase_returns pr
+         LEFT JOIN suppliers s ON s.id=pr.supplier_id
+         LEFT JOIN purchase_orders po ON po.id=pr.po_id
+         JOIN locations l ON l.id=pr.location_id
+         LEFT JOIN users u ON u.id=pr.user_id
+        WHERE ($1::int IS NULL OR pr.location_id=$1)
+          AND pr.created_at >= $2::date AND pr.created_at < ($3::date + interval '1 day')
+        ORDER BY pr.created_at DESC`, [locationId, from, to]);
+    sheetName = 'Purchase returns';
   } else if (report === 'customers') {
     rows = await many(
       `SELECT c.name, c.phone, c.email, g.name AS group_name, c.loyalty_points, c.store_credit,

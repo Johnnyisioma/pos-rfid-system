@@ -3,7 +3,8 @@ import { many, one, query, tx } from '../db/index.js';
 import { h, bad, notFound, str, num, int, paging, getSettings, money } from '../lib/util.js';
 import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
-import { receiveUnits } from '../services/inventory.js';
+import { receiveUnits, allocateUnits, setUnitStatus, moveStock } from '../services/inventory.js';
+import { nextRef } from '../lib/util.js';
 
 const r = Router();
 
@@ -57,7 +58,8 @@ r.get('/', h(async (req, res) => {
   res.json({ data: rows, page, limit });
 }));
 
-r.get('/:id', h(async (req, res) => {
+// constrained to digits so /purchases/returns is not read as a purchase order id
+r.get('/:id(\\d+)', h(async (req, res) => {
   const po = await loadPo(req.params.id);
   if (!po) throw notFound('Purchase order not found');
   res.json(po);
@@ -187,6 +189,130 @@ r.post('/:id/cancel', requirePerm('purchases.write'), h(async (req, res) => {
   await query("UPDATE purchase_orders SET status='cancelled' WHERE id=$1", [po.id]);
   await audit(req, 'cancel', 'purchase_order', po.id, {});
   res.json({ ok: true });
+}));
+
+
+/* ------------------------------------------------------------------ */
+/*  Purchase returns — sending bad goods back to the supplier           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Goods going back to a supplier must not leave as a stock adjustment: that
+ * buries supplier damage inside shrinkage and corrupts cost of goods. A return
+ * takes the units out of stock with their own status, keeps the cost on the
+ * supplier's account, and shows up in its own report.
+ */
+r.post('/returns', requirePerm('purchases.write'), h(async (req, res) => {
+  const items = Array.isArray(req.body.items) ? req.body.items : [];
+  if (!items.length) throw bad('Add at least one item to return');
+  const reason = str(req.body.reason).trim();
+  if (!reason) throw bad('A reason is required for every purchase return');
+  const locationId = int(req.body.location_id, req.locationId);
+
+  const out = await tx(async (c) => {
+    const ref = await nextRef(c, 'purchase_returns', 'PRT');
+    const { rows } = await c.query(
+      `INSERT INTO purchase_returns (ref, po_id, supplier_id, location_id, reason, notes, credit_note, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [ref, int(req.body.po_id) || null, int(req.body.supplier_id) || null, locationId,
+       reason, str(req.body.notes), str(req.body.credit_note), req.user.id]);
+    const ret = rows[0];
+
+    let total = 0;
+    for (const it of items) {
+      const variantId = int(it.variant_id);
+      const qty = Math.round(num(it.quantity, 0));
+      if (!variantId || qty <= 0) continue;
+
+      const { rows: inv } = await c.query(
+        'SELECT COALESCE(quantity,0) AS q FROM inventory WHERE variant_id=$1 AND location_id=$2',
+        [variantId, locationId]);
+      const have = inv.length ? Number(inv[0].q) : 0;
+      if (have < qty)
+        throw bad(`Only ${have} in stock for that item — cannot return ${qty} to the supplier`);
+
+      const { rows: vr } = await c.query('SELECT cost_price FROM product_variants WHERE id=$1', [variantId]);
+      const unitCost = num(it.unit_cost, Number(vr[0]?.cost_price || 0));
+      const lineTotal = money(unitCost * qty);
+      total = money(total + lineTotal);
+
+      await c.query(
+        `INSERT INTO purchase_return_items (return_id, variant_id, quantity, unit_cost, line_total)
+         VALUES ($1,$2,$3,$4,$5)`, [ret.id, variantId, qty, unitCost, lineTotal]);
+
+      const units = await allocateUnits(c, {
+        variantId, locationId, quantity: qty,
+        preferredUnitIds: (it.unit_ids || []).map(Number).filter(Boolean),
+      });
+      await setUnitStatus(c, units.map((u) => u.id), 'returned_supplier');
+      for (const u of units) {
+        await c.query(
+          'INSERT INTO purchase_return_units (return_id, unit_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+          [ret.id, u.id]);
+      }
+
+      await moveStock(c, {
+        variantId, locationId, delta: -qty, type: 'purchase_return',
+        referenceType: 'purchase_return', referenceId: ret.id,
+        reason: `Returned to supplier on ${ref}: ${reason}`, userId: req.user.id,
+      });
+    }
+
+    await c.query('UPDATE purchase_returns SET total=$2 WHERE id=$1', [ret.id, total]);
+    if (ret.supplier_id) {
+      await c.query('UPDATE suppliers SET amount_due = GREATEST(0, amount_due - $2) WHERE id=$1',
+        [ret.supplier_id, total]);
+    }
+    return { ret, total };
+  });
+
+  await audit(req, 'create', 'purchase_return', out.ret.id, {
+    ref: out.ret.ref, total: out.total, reason });
+  res.status(201).json({ ok: true, ref: out.ret.ref, id: out.ret.id, total: out.total });
+}));
+
+r.get('/returns', h(async (req, res) => {
+  const { limit, offset, page } = paging(req, 30);
+  const locationId = req.query.location_id === 'all' ? null : int(req.query.location_id, req.locationId);
+  const rows = await many(
+    `SELECT pr.*, s.name AS supplier_name, l.name AS location_name, u.name AS user_name,
+            po.po_number,
+            (SELECT COUNT(*) FROM purchase_return_items i WHERE i.return_id=pr.id) AS line_count,
+            (SELECT COALESCE(SUM(quantity),0) FROM purchase_return_items i WHERE i.return_id=pr.id) AS total_qty
+       FROM purchase_returns pr
+       LEFT JOIN suppliers s ON s.id=pr.supplier_id
+       LEFT JOIN purchase_orders po ON po.id=pr.po_id
+       JOIN locations l ON l.id=pr.location_id
+       LEFT JOIN users u ON u.id=pr.user_id
+      WHERE ($1::int IS NULL OR pr.location_id=$1)
+      ORDER BY pr.created_at DESC LIMIT ${limit} OFFSET ${offset}`, [locationId]);
+  const totals = await one(
+    `SELECT COUNT(*)::int AS n, COALESCE(SUM(total),0) AS value FROM purchase_returns
+      WHERE ($1::int IS NULL OR location_id=$1)`, [locationId]);
+  res.json({ data: rows, page, limit, total: totals.n, value: totals.value });
+}));
+
+r.get('/returns/:id', h(async (req, res) => {
+  const ret = await one(
+    `SELECT pr.*, s.name AS supplier_name, l.name AS location_name, u.name AS user_name, po.po_number
+       FROM purchase_returns pr
+       LEFT JOIN suppliers s ON s.id=pr.supplier_id
+       LEFT JOIN purchase_orders po ON po.id=pr.po_id
+       JOIN locations l ON l.id=pr.location_id
+       LEFT JOIN users u ON u.id=pr.user_id WHERE pr.id=$1`, [req.params.id]);
+  if (!ret) throw notFound('Purchase return not found');
+  ret.items = await many(
+    `SELECT pri.*, v.sku, v.size, v.color, p.name AS product_name
+       FROM purchase_return_items pri
+       JOIN product_variants v ON v.id=pri.variant_id
+       JOIN products p ON p.id=v.product_id WHERE pri.return_id=$1`, [req.params.id]);
+  ret.units = await many(
+    `SELECT su.id, su.epc, su.epc_readable, p.name AS product_name, v.size, v.color
+       FROM purchase_return_units pru
+       JOIN stock_units su ON su.id=pru.unit_id
+       JOIN product_variants v ON v.id=su.variant_id
+       JOIN products p ON p.id=v.product_id WHERE pru.return_id=$1`, [req.params.id]);
+  res.json(ret);
 }));
 
 /** Suggested reorder list from reorder points, grouped by supplier's last price. */

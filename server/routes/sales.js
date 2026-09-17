@@ -10,6 +10,7 @@ import { computeTotals } from '../services/pricing.js';
 import { allocateUnits, markUnitsSold, setUnitStatus, moveStock, bundleComponents } from '../services/inventory.js';
 import { many as manyRows } from '../db/index.js';
 import { normalizeEpc } from '../services/epc.js';
+import { resolveAccountId } from '../services/accounts.js';
 
 const r = Router();
 
@@ -246,9 +247,11 @@ export async function createSale(c, body, ctx) {
 
   // ---- payments ----
   for (const p of payments) {
+    const accountId = await resolveAccountId(c, p.method, p.account_id);
     await c.query(
-      'INSERT INTO payments (sale_id, method, amount, reference, user_id) VALUES ($1,$2,$3,$4,$5)',
-      [sale.id, p.method, p.amount, p.reference || null, user.id]);
+      `INSERT INTO payments (sale_id, method, amount, reference, user_id, account_id)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [sale.id, p.method, p.amount, p.reference || null, user.id, accountId]);
   }
 
   // ---- customer ledgers ----
@@ -710,9 +713,12 @@ r.post('/:id/payments', requirePerm('sales.create'), h(async (req, res) => {
     if (Number(sale.balance_due) <= 0) throw bad('That sale is already fully paid');
     const applied = Math.min(amount, Number(sale.balance_due));
 
+    const method = str(req.body.method, 'cash');
+    const accountId = await resolveAccountId(c, method, req.body.account_id);
     await c.query(
-      'INSERT INTO payments (sale_id, method, amount, reference, user_id) VALUES ($1,$2,$3,$4,$5)',
-      [sale.id, str(req.body.method, 'cash'), applied, str(req.body.reference) || null, req.user.id]);
+      `INSERT INTO payments (sale_id, method, amount, reference, user_id, account_id)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [sale.id, method, applied, str(req.body.reference) || null, req.user.id, accountId]);
     const { rows: upd } = await c.query(
       `UPDATE sales SET amount_paid = amount_paid + $2, balance_due = balance_due - $2,
               is_credit = (balance_due - $2) > 0, updated_at=now()

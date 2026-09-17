@@ -1,21 +1,63 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { Search, Receipt, Download, Filter } from 'lucide-react';
+import { Search, Receipt, X } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, dateTime, daysAgo, today } from '../lib/format.js';
 import { Card, Loading, Empty, Badge, Pagination, Stat } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import ExportButtons from '../components/ExportButtons.jsx';
+
+/**
+ * The sidebar links straight at a slice of this list — Held sales, Drafts,
+ * Quotations, Layaway, Unpaid invoices. Each is this same screen with the
+ * filters pre-set, so the URL, not a separate page, carries the intent.
+ */
+const VIEWS = {
+  held: { title: 'Held sales', subtitle: 'Parked baskets waiting for the customer to come back' },
+  draft: { title: 'Draft sales', subtitle: 'Started but never completed' },
+  quotation: { title: 'Quotations', subtitle: 'Priced up for a customer, not yet a sale' },
+  layaway: { title: 'Layaway', subtitle: 'Goods set aside and being paid for in instalments' },
+  credit: { title: 'Unpaid invoices', subtitle: 'Sold on credit and still owing' },
+};
+
+// Held, draft and quotation baskets are not yet sales, so a 30-day window
+// would hide the ones that matter most. Open-ended for those views.
+const OPEN_ENDED = ['held', 'draft', 'quotation', 'layaway'];
 
 export default function Sales() {
   const { locationId } = useAuth();
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
+
+  const urlStatus = params.get('status') || '';
+  const urlSaleType = params.get('sale_type') || '';
+  const urlCredit = params.get('credit') || '';
+  const viewKey = urlCredit === 'true' ? 'credit' : (urlSaleType || urlStatus);
+  const view = VIEWS[viewKey];
+
   const [data, setData] = useState(null);
   const [page, setPage] = useState(1);
-  const [filters, setFilters] = useState({
-    q: '', status: '', from: daysAgo(30), to: today(),
-    location_id: '', credit: params.get('credit') || '',
-  });
+  const [filters, setFilters] = useState(() => ({
+    q: '',
+    status: urlStatus,
+    sale_type: urlSaleType,
+    from: OPEN_ENDED.includes(viewKey) ? daysAgo(365) : daysAgo(30),
+    to: today(),
+    location_id: '',
+    credit: urlCredit,
+  }));
+
+  // Following a sidebar link while already on this page changes the query
+  // string without remounting, so the filters have to follow the URL.
+  useEffect(() => {
+    setFilters((f) => ({
+      ...f,
+      status: urlStatus,
+      sale_type: urlSaleType,
+      credit: urlCredit,
+      from: OPEN_ENDED.includes(viewKey) ? daysAgo(365) : f.from,
+    }));
+  }, [urlStatus, urlSaleType, urlCredit]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const load = useCallback(async () => {
     setData(null);
@@ -25,15 +67,25 @@ export default function Sales() {
   useEffect(() => { load(); }, [load]);
   useEffect(() => { setPage(1); }, [filters]);
 
+  const clearView = () => {
+    setParams(new URLSearchParams(), { replace: true });
+    setFilters((f) => ({ ...f, status: '', sale_type: '', credit: '', from: daysAgo(30) }));
+  };
+
   return (
     <>
-      <PageHeader title="Sales & invoices"
-        subtitle="Every completed sale, quotation, layaway and credit invoice"
+      <PageHeader title={view ? view.title : 'Sales & invoices'}
+        subtitle={view ? view.subtitle : 'Every completed sale, quotation, layaway and credit invoice'}
         actions={
-          <button className="btn-secondary"
-            onClick={() => api.download(`/api/reports/export/sales${qs({ from: filters.from, to: filters.to, format: 'xlsx' })}`)}>
-            <Download size={16} /> Export
-          </button>
+          <>
+            {view && (
+              <button className="btn-secondary" onClick={clearView}>
+                <X size={16} /> Show all sales
+              </button>
+            )}
+            <ExportButtons report="sales" title={view ? view.title : 'Sales'}
+              params={{ from: filters.from, to: filters.to }} />
+          </>
         } />
 
       {data && (
@@ -58,8 +110,14 @@ export default function Sales() {
           <select className="input w-auto" value={filters.status}
             onChange={(e) => setFilters((f) => ({ ...f, status: e.target.value }))}>
             <option value="">All statuses</option>
-            {['completed', 'partially_refunded', 'refunded', 'held', 'quotation', 'layaway']
+            {['completed', 'partially_refunded', 'refunded', 'held', 'draft', 'quotation', 'layaway']
               .map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+          </select>
+          <select className="input w-auto" value={filters.sale_type}
+            onChange={(e) => setFilters((f) => ({ ...f, sale_type: e.target.value }))}>
+            <option value="">All sale types</option>
+            {['sale', 'layaway', 'quotation'].map((s) =>
+              <option key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</option>)}
           </select>
           <select className="input w-auto" value={filters.location_id}
             onChange={(e) => setFilters((f) => ({ ...f, location_id: e.target.value }))}>
@@ -74,8 +132,9 @@ export default function Sales() {
         </div>
 
         {!data ? <Loading /> : data.data.length === 0 ? (
-          <Empty title="No sales in this range" icon={Receipt}
-            hint="Widen the date range or clear the filters." />
+          <Empty title={view ? `No ${view.title.toLowerCase()}` : 'No sales in this range'} icon={Receipt}
+            hint={view ? 'Nothing is sitting in this state right now.'
+              : 'Widen the date range or clear the filters.'} />
         ) : (
           <>
             <div className="table-wrap">
