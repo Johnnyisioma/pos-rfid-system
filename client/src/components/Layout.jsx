@@ -4,9 +4,9 @@ import {
   LayoutDashboard, ShoppingCart, Package, Boxes, Radio, ScanLine, ClipboardCheck, Search,
   Truck, Users, Receipt, RotateCcw, Calculator, Wallet, BarChart3, Settings as Cog,
   ShieldCheck, Menu, X, LogOut, MapPin, ChevronDown, ChevronRight, WifiOff, CloudUpload,
-  Printer, FileSpreadsheet, ArrowLeftRight, Tags, Plus, List, FolderTree, Layers,
+  Printer, FileSpreadsheet, ArrowLeftRight, Tags, Tag, Plus, List, FolderTree, Layers,
   TrendingUp, FileText, Store, UserCog, Building2, Percent, Landmark, Bell, PauseCircle,
-  FileClock, PiggyBank, SlidersHorizontal, Coins, AlertTriangle, Users2, ScrollText,
+  FileClock, PiggyBank, SlidersHorizontal, Coins, AlertTriangle, Users2, ScrollText, Keyboard,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { initOffline, flushQueue } from '../lib/offline.js';
@@ -91,8 +91,10 @@ const NAV = [
   { label: 'RFID', icon: Radio, perm: 'rfid.scan', children: [
     { label: 'Tagged units', to: '/rfid', icon: Radio },
     { label: 'Tags to encode', to: '/rfid?encoded=false', icon: Printer, perm: 'rfid.encode' },
+    { label: 'Tag stock', to: '/rfid/tag-stock', icon: Tag, perm: 'rfid.encode' },
     DIV(),
     { label: 'Scan simulator', to: '/rfid/scan', icon: ScanLine },
+    { label: 'Reader test', to: '/rfid/reader-test', icon: Keyboard },
     { label: 'Stock take', to: '/rfid/stock-take', icon: ClipboardCheck, perm: 'rfid.stocktake' },
     { label: 'Find an item', to: '/rfid/find', icon: Search, perm: 'rfid.find' },
   ]},

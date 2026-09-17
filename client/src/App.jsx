@@ -14,6 +14,8 @@ import Purchases from './pages/Purchases.jsx';
 import Transfers from './pages/Transfers.jsx';
 import RfidUnits from './pages/RfidUnits.jsx';
 import ScanSimulator from './pages/ScanSimulator.jsx';
+import ReaderTest from './pages/ReaderTest.jsx';
+import TagStock from './pages/TagStock.jsx';
 import StockTake from './pages/StockTake.jsx';
 import StockTakeMode from './pages/StockTakeMode.jsx';
 import FindItem from './pages/FindItem.jsx';
@@ -58,6 +60,8 @@ export default function App() {
         <Route path="transfers" element={<Transfers />} />
         <Route path="rfid" element={<RfidUnits />} />
         <Route path="rfid/scan" element={<ScanSimulator />} />
+        <Route path="rfid/reader-test" element={<ReaderTest />} />
+        <Route path="rfid/tag-stock" element={<TagStock />} />
         <Route path="rfid/stock-take" element={<StockTake />} />
         <Route path="rfid/find" element={<FindItem />} />
         <Route path="customers" element={<Customers />} />

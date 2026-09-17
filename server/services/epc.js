@@ -18,7 +18,9 @@
  * this file — nothing else in the system builds or reads an EPC by hand.
  */
 
-export const EPC_HEX_LENGTH = 24;
+export const EPC_HEX_LENGTH = 24;     // what this system mints: 96-bit
+export const MIN_EPC_HEX = 16;        // 64-bit, the smallest Gen2 EPC in the wild
+export const MAX_EPC_HEX = 62;        // the Gen2 EPC bank tops out around 496 bits
 const PREFIX_LEN = 4;
 const VARIANT_LEN = 10;
 const SERIAL_LEN = 10;
@@ -67,9 +69,32 @@ export function normalizeEpc(input) {
   return s.toUpperCase();
 }
 
+/**
+ * Is this a usable Gen2 EPC?
+ *
+ * Deliberately NOT "is it 24 characters". This system MINTS 96-bit EPCs, but it
+ * has to READ whatever is already on a tag, and the EPC memory bank is variable
+ * length — factory-encoded inlays commonly ship with 128-bit EPCs (32 hex), and
+ * 64-bit (16 hex) also exists. Insisting on 24 would reject a shop's own tags as
+ * malformed, which is the sort of thing that makes people give up on RFID.
+ */
 export function isEpcHex(value) {
   const s = normalizeEpc(value);
+  return s.length >= MIN_EPC_HEX
+    && s.length <= MAX_EPC_HEX
+    && s.length % 2 === 0
+    && /^[0-9A-F]+$/.test(s);
+}
+
+/** True only for an EPC this system minted itself, which is always 96-bit. */
+export function isMintedEpc(value) {
+  const s = normalizeEpc(value);
   return s.length === EPC_HEX_LENGTH && /^[0-9A-F]+$/.test(s);
+}
+
+/** How many bits the tag's EPC bank is carrying. */
+export function epcBits(value) {
+  return normalizeEpc(value).length * 4;
 }
 
 /** Decode an EPC back into its parts. Returns null if it isn't our format. */

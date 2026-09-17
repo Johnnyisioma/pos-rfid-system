@@ -4,16 +4,19 @@
   "description": "Multi-location retail POS + RFID inventory management system",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server/index.js",
-    "build": "npm --prefix client install --no-audit --no-fund && npm --prefix client run build",
+    "build": "node scripts/check-refs.mjs && npm --prefix client install --no-audit --no-fund && npm --prefix client run build",
     "migrate": "node server/db/migrate.js",
     "seed": "node server/db/seed.js",
     "reset": "node server/db/migrate.js --fresh && node server/db/seed.js",
     "dev:server": "node --watch server/index.js",
     "dev:client": "npm --prefix client run dev",
-    "test": "node scripts/e2e.js"
+    "test": "node scripts/e2e.js",
+    "check": "node scripts/check-refs.mjs"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

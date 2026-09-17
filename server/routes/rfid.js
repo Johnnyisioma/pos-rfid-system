@@ -8,7 +8,7 @@ import { many, one, query, tx } from '../db/index.js';
 import { h, bad, notFound, str, int, num, paging, nextRef, getSettings } from '../lib/util.js';
 import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
-import { normalizeEpc, parseEpc, isEpcHex, toWords, toBase64 } from '../services/epc.js';
+import { normalizeEpc, parseEpc, isEpcHex, isMintedEpc, epcBits, toWords, toBase64 } from '../services/epc.js';
 import { buildZpl, sendToPrinter, parseReaderPayload, simulateSweep } from '../services/hardware.js';
 import { setUnitStatus } from '../services/inventory.js';
 
@@ -22,6 +22,90 @@ const UNIT_SELECT = `
     JOIN product_variants v ON v.id=su.variant_id
     JOIN products p ON p.id=v.product_id
     LEFT JOIN locations l ON l.id=su.location_id`;
+
+
+/* ------------------------------------------------------------------ */
+/*  Binding a pre-encoded tag to a unit                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The other way round from printing.
+ *
+ * The designed flow is: this system mints a 96-bit EPC, a Zebra RFID printer
+ * writes it onto the inlay. That needs an RFID printer, which most small shops
+ * do not have and do not need — plain pre-encoded UHF labels are cheap, and
+ * every one already carries a unique factory EPC.
+ *
+ * So this is the inverse: stick a tag on the shoe, read it with the handheld,
+ * and bind whatever EPC that tag already holds to this unit. The unit keeps its
+ * human-readable label and its history; only the code the antenna will hear
+ * changes. Same per-unit identity, no printer.
+ */
+r.get('/untagged', h(async (req, res) => {
+  const locationId = req.query.location_id === 'all'
+    ? null : (int(req.query.location_id, req.locationId) || null);
+  const { limit, offset, page } = paging(req, 50);
+  const rows = await many(
+    `${UNIT_SELECT}
+      WHERE su.status = 'in_stock' AND NOT su.tag_encoded
+        AND ($1::int IS NULL OR su.location_id = $1)
+      ORDER BY p.name, v.size, su.serial
+      LIMIT ${limit} OFFSET ${offset}`, [locationId]);
+  const total = await one(
+    `SELECT COUNT(*)::int AS n FROM stock_units su
+      WHERE su.status='in_stock' AND NOT su.tag_encoded
+        AND ($1::int IS NULL OR su.location_id=$1)`, [locationId]);
+  res.json({ data: rows, page, limit, total: total.n });
+}));
+
+r.post('/units/:id/assign-tag', requirePerm('rfid.encode'), h(async (req, res) => {
+  const epc = normalizeEpc(req.body.epc);
+  if (!epc) throw bad('Scan a tag first');
+  if (!isEpcHex(epc))
+    throw bad(`"${epc}" is not a usable EPC. Expected hex, ${epcBits(epc)} bits read.`);
+
+  const unit = await one(`${UNIT_SELECT} WHERE su.id=$1`, [req.params.id]);
+  if (!unit) throw notFound('Unit not found');
+  if (unit.status !== 'in_stock')
+    throw bad(`That unit is ${unit.status}, so it should not be re-tagged.`);
+
+  // Refuse to move a tag that is already doing a job elsewhere. Silently
+  // stealing it would leave the other unit unfindable and the count wrong.
+  const clash = await one(
+    `${UNIT_SELECT} WHERE su.epc=$1 AND su.id <> $2`, [epc, req.params.id]);
+  if (clash) {
+    throw bad(
+      `That tag is already on ${clash.product_name} ${[clash.size, clash.color].filter(Boolean).join(' / ')}`
+      + ` (${clash.epc_readable}, ${clash.status}). Use a different tag.`);
+  }
+
+  const previous = unit.epc;
+  const updated = await one(
+    `UPDATE stock_units
+        SET epc=$2, tag_encoded=TRUE, encoded_at=now(), last_seen_at=now()
+      WHERE id=$1 RETURNING *`, [req.params.id, epc]);
+
+  await audit(req, 'assign_tag', 'stock_unit', unit.id, {
+    readable: unit.epc_readable, from: previous, to: epc, bits: epcBits(epc) });
+
+  res.json({
+    ok: true,
+    unit: { ...unit, ...updated },
+    previous_epc: previous,
+    bits: epcBits(epc),
+    minted_by_us: isMintedEpc(epc),
+    message: `${unit.product_name} ${[unit.size, unit.color].filter(Boolean).join(' / ')} is now on tag ${epc}`,
+  });
+}));
+
+/** Undo a binding — puts the unit back in the untagged queue. */
+r.post('/units/:id/unassign-tag', requirePerm('rfid.encode'), h(async (req, res) => {
+  const unit = await one('SELECT * FROM stock_units WHERE id=$1', [req.params.id]);
+  if (!unit) throw notFound('Unit not found');
+  await query('UPDATE stock_units SET tag_encoded=FALSE, encoded_at=NULL WHERE id=$1', [req.params.id]);
+  await audit(req, 'unassign_tag', 'stock_unit', unit.id, { epc: unit.epc });
+  res.json({ ok: true, message: 'Unit is back in the untagged list. Its code is unchanged.' });
+}));
 
 /* ---------------- unit registry ---------------- */
 r.get('/units', h(async (req, res) => {
@@ -320,11 +404,31 @@ async function applyScansToStockTake(stockTakeId, codes, req) {
   if (!take) throw notFound('Stock take not found');
   if (take.status !== 'open') throw bad('That stock take is already closed');
 
-  const summary = { added: 0, duplicates: 0, unknown: 0, wrong_location: 0, found: 0 };
+  // `results` carries one entry per code so the handheld can render its live
+  // feed straight from this response. Without it the client had to re-fetch the
+  // whole stock take after every read, which a continuous sweep turns into a
+  // request storm.
+  const summary = { added: 0, duplicates: 0, unknown: 0, wrong_location: 0, found: 0, results: [] };
   for (const raw of codes) {
     const epc = normalizeEpc(raw);
-    if (!epc) continue;
-    const unit = await one('SELECT * FROM stock_units WHERE epc=$1', [epc]);
+    const label = String(raw).trim().toUpperCase();
+    if (!epc && !label) continue;
+
+    // A count may come in as the RFID EPC, or — if the reader is in barcode
+    // mode, or a tag is unreadable and someone types the label — as the
+    // human-readable code printed on the same label. Both name the same
+    // physical unit, so both have to resolve, or a barcode-driven count would
+    // silently record every single item as an unknown tag.
+    const UNIT_BY = `SELECT su.*, p.name AS product_name, v.size, v.color, v.sku
+                       FROM stock_units su
+                       JOIN product_variants v ON v.id=su.variant_id
+                       JOIN products p ON p.id=v.product_id`;
+    let unit = epc ? await one(`${UNIT_BY} WHERE su.epc=$1`, [epc]) : null;
+    if (!unit) unit = await one(`${UNIT_BY} WHERE upper(su.epc_readable)=$1`, [label]);
+
+    // Dedupe on the unit's real EPC once we know it, so scanning the barcode
+    // and then reading the tag does not count the same pair twice.
+    const key = unit?.epc || epc || label;
     let result = 'unknown';
     if (unit) {
       if (unit.location_id === take.location_id && unit.status === 'in_stock') result = 'found';
@@ -334,7 +438,15 @@ async function applyScansToStockTake(stockTakeId, codes, req) {
     const ins = await query(
       `INSERT INTO stock_take_scans (stock_take_id, epc, unit_id, result)
        VALUES ($1,$2,$3,$4) ON CONFLICT (stock_take_id, epc) DO NOTHING RETURNING id`,
-      [stockTakeId, epc, unit?.id || null, result]);
+      [stockTakeId, key, unit?.id || null, result]);
+    summary.results.push({
+      code: String(raw),
+      epc: key,
+      result: ins.rowCount ? result : 'duplicate',
+      product_name: unit?.product_name || null,
+      variant: unit ? [unit.size, unit.color].filter(Boolean).join(' / ') : null,
+      sku: unit?.sku || null,
+    });
     if (!ins.rowCount) { summary.duplicates += 1; continue; }
     summary.added += 1;
     if (result === 'found') summary.found += 1;
@@ -344,7 +456,7 @@ async function applyScansToStockTake(stockTakeId, codes, req) {
     await query(
       `INSERT INTO scan_events (epc, unit_id, location_id, context, resolved, user_id)
        VALUES ($1,$2,$3,'stock_take',$4,$5)`,
-      [epc, unit?.id || null, take.location_id, !!unit, req.user.id]);
+      [key, unit?.id || null, take.location_id, !!unit, req.user.id]);
   }
   await refreshStockTakeCounts(stockTakeId);
   return { ...summary, stock_take_id: stockTakeId };
@@ -366,6 +478,8 @@ r.post('/stock-takes/:id/scan', requirePerm('rfid.stocktake'), h(async (req, res
     : String(req.body.codes || req.body.code || '').split(/[\s,;\n\r]+/).filter(Boolean);
   if (!codes.length) throw bad('Nothing scanned');
   const summary = await applyScansToStockTake(int(req.params.id), codes, req);
+  // expected_count is snapshotted when the count starts — deliberately not
+  // recomputed here, or the target would move under the person counting.
   const take = await one('SELECT * FROM stock_takes WHERE id=$1', [req.params.id]);
   res.json({ ok: true, summary, stock_take: take });
 }));
