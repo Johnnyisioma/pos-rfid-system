@@ -22,7 +22,7 @@ Android-based handheld RFID scanner. Works offline and syncs when the connection
 - [Running it locally](#running-it-locally)
 - [Deploying to Railway](#deploying-to-railway)
 - [Connecting real hardware](#connecting-real-hardware)
-- [Demo logins](#demo-logins)
+- [Signing in for the first time](#signing-in-for-the-first-time)
 - [Project layout](#project-layout)
 - [API reference](#api-reference)
 - [Tests](#tests)
@@ -291,15 +291,16 @@ npm install
 cp .env.example .env
 #    edit DATABASE_URL and JWT_SECRET
 
-# 3. create the schema and load demo data
-npm run reset          # = migrate --fresh + seed
+# 3. create the schema and the first-run skeleton
+npm run reset          # = migrate --fresh + bootstrap
 
 # 4. build the front end and start
 npm run build
 npm start
 ```
 
-Open <http://localhost:3000> and sign in with one of the [demo logins](#demo-logins).
+The admin password is generated and **printed once** in the startup output. Write it down,
+then open <http://localhost:3000> and sign in.
 
 ### Working on the code
 
@@ -314,9 +315,23 @@ npm run dev:client     # Vite dev server on :5173, proxies /api to :3000
 |---|---|
 | `npm run migrate` | applies the schema (safe to re-run) |
 | `npm run migrate -- --fresh` | **drops everything** and recreates the schema |
-| `npm run seed` | loads the demo catalogue and 60 days of sample sales |
-| `npm run reset` | fresh schema + seed |
+| `npm run bootstrap` | creates the first-run skeleton (safe to re-run) |
+| `npm run reset` | fresh schema + bootstrap — an empty shop, ready for your stock |
+| `npm run check` | undefined component references |
 | `npm test` | end-to-end API test suite (needs the server running) |
+| `npm run fixtures` | **test data only** — see below |
+| `npm run reset:test` | fresh schema + bootstrap + fixtures, for running the suites |
+
+#### A note on the fixtures
+
+The automated suites need a shop with history to assert against, so
+`scripts/demo-fixtures.js` can build one: products, stock, sixty days of sales, customers,
+suppliers, expenses. It is **test tooling, not application code** — nothing in the server
+imports it, it refuses to run without `ALLOW_DEMO_DATA=1`, and it refuses again if the
+database already contains completed sales.
+
+A live install never creates a single invented row. Delete that file if you would rather
+not have the capability in the tree at all.
 
 ---
 
@@ -347,13 +362,16 @@ The app is a single service: one Node process serves both the API and the built 
    |---|---|
    | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` (Railway resolves the reference) |
    | `JWT_SECRET` | a long random string |
-   | `SEED_ON_BOOT` | `true` for a demo, `false` for real stock |
+   | `ADMIN_EMAIL` | optional — your login. Defaults to `admin@example.com` |
+   | `ADMIN_PASSWORD` | optional — set one, or read the generated one from the deploy logs |
 
 5. Open the app service → **Settings → Networking → Generate Domain**.
 
 Railway builds with `npm install && npm run build` and starts with `npm start`. On first
-boot the server creates its own schema and, if the database is empty and `SEED_ON_BOOT`
-is not `false`, loads the demo data. `/api/health` is the health check.
+boot the server creates its own schema, then a location, a register, an admin login and
+the reference lists — **no sample products, stock, sales or customers, ever**. If you did
+not set `ADMIN_PASSWORD`, the generated one is printed once in the deploy logs.
+`/api/health` is the health check.
 
 ### Option B — from your terminal with the Railway CLI
 
@@ -369,11 +387,21 @@ railway domain
 
 ### After the first deploy
 
-1. Sign in as the admin account.
-2. **Settings → Business** — replace the placeholder name, TIN, address and phone.
-3. **Settings → Staff** — change every demo password, and delete the accounts you don't need.
-4. **Settings → Locations** — rename the two demo branches, or add your own.
-5. When you're ready for real stock, set `SEED_ON_BOOT=false` and clear the demo data.
+You are starting from an empty shop. In order:
+
+1. **Sign in** with the admin login from the deploy logs, then **Settings → My account**
+   and change the password.
+2. **Settings → Business** — your trading name, TIN, RC number, address, phone, VAT rate.
+3. **Settings → Locations** — rename "Main Shop", and add your other branches.
+4. **Settings → Staff** — add your people and give them the narrowest role that works.
+5. **Payment Accounts** — add your bank account and your Opay/Moniepoint wallet, then set
+   the tender defaults so each payment lands in the right place by itself.
+6. **Products** — add your catalogue, or import it from a spreadsheet under
+   **Products → Import / export**.
+7. **Purchases → Add purchase order**, then receive it. That is what creates stock and
+   mints a code for every individual pair.
+8. **RFID → Tag stock** — bind a pre-encoded label to each unit (no printer needed), or
+   **RFID → Devices** to add a Zebra printer and print your own.
 
 ### Free tier
 
@@ -418,6 +446,80 @@ small forwarder there instead.
 
 Install the app on the handheld from its browser ("Add to home screen").
 
+**You may not need an RFID printer at all.** The designed flow is that this system mints a
+96-bit EPC and a Zebra RFID printer writes it onto the inlay. The printer is the most
+expensive part of an RFID setup. The alternative — **RFID → Tag stock** — is the inverse:
+buy plain pre-encoded UHF labels (every one already carries a unique factory EPC), stick
+one on the item, pull the trigger, and that tag becomes that unit's identity. The per-unit
+tracking is identical; two of the same shoe in the same size are still two different tags.
+A tag already bound to another unit is refused rather than moved. Buy the printer only if
+you want your own numbering on the inlay, or the product name and price printed on the
+same label.
+
+EPC length is **not** assumed to be 96-bit. Factory-encoded inlays commonly ship with
+128-bit EPCs (32 hex characters) and 64-bit exists too; all are accepted and resolve to
+the right unit.
+
+#### SEUIC handhelds (Lenvii and other rebadges) — confirmed settings
+
+Verified by decompiling the device's own `com.seuic.uhftool` app, not guessed:
+
+| Setting | Where | Value | Why |
+|---|---|---|---|
+| **Send Mode** | UHF → Settings | **Focus** | `sendmode` 0 = Focus, 1 = Broadcast. Broadcast fires an Android intent (`com.android.server.scannerservice.broadcast`, data in the `scannerdata` extra) that a web page cannot receive. **Ships set to Broadcast.** |
+| Region | UHF → Parameter → Basic param | **ETSI 865–868** | Ships on FCC 902–928. Nigeria is 865.6–867.6 MHz at 2 W ERP. |
+| Power | UHF → Parameter | **~25 dBm** | Ships at 33 dBm (2 W). Full power reads the next aisle and ruins a count. |
+| Region (data) | UHF → Settings | **EPC** | Already correct. TID would send the chip serial instead of your code. |
+| Data start / length | UHF → Settings | **0 / 0** | Already correct. Non-zero silently truncates every read. |
+| Prefix / Suffix | UHF → Settings | **empty** | Anything here is prepended or appended to every code. |
+| Booted start | UHF → Settings | **ON** | Otherwise staff must open the UHF app before the trigger does anything. |
+
+**Focus mode delivers a read as a text commit, not as keystrokes.** The app calls the
+vendor's hidden `InputMethodManager.setCommitText`, so the browser receives one `input`
+event carrying the whole code — no per-character key events, and **no Enter**: the
+terminator is a separate setting (`endchar_on_emu`) that ships off, and the interval
+character only separates one tag from the next.
+
+Every scan surface here handles that: a read is finished by an Enter **or** a short pause,
+and the till picks up a tag committed into its ordinary search box without anyone opening a
+scan dialog first. `scripts/commit-delivery-check.mjs` proves it using Playwright's
+`insertText`, which fires exactly the same events `setCommitText` does.
+
+**Set the radio region first.** Nigeria's RAIN RFID allocation is **865.6–867.6 MHz at
+2 W ERP (ETSI)**. These handhelds usually ship set to the Chinese or US band, where read
+range is poor and you are transmitting outside your allocation. Set the reader to ETSI
+865–868 and start around 20–25 dBm — full power in a small shop reads tags from the next
+aisle, which ruins a count.
+
+**If it does not read, use the Reader test.** **RFID → Reader test** records the raw
+keystrokes, their timing and their terminator before the system tries to interpret
+anything, and names the fault. The three ways a reader fails look identical on a normal
+scan box — nothing happens — but need completely different fixes:
+
+| What the page says | What to change |
+|---|---|
+| Nothing arrives | The reader is not sending to the focused field — on SEUIC, **Send Mode is still Broadcast**. |
+| Delivery: Commit, no terminator | Normal for SEUIC Focus mode. Nothing to fix. |
+| Wrong length | The reader is sending TID, not the EPC memory bank. |
+| Right format, no match | The reader is fine — those tags are not registered here yet. |
+
+**Copy diagnostics** puts a pasteable report on the clipboard.
+
+**Continuous / inventory mode.** Set the reader to continuous (not single-shot) so holding
+the trigger keeps reading. Stock Take Mode is built for exactly that stream:
+
+- Re-reads of a tag already counted are dropped **in the browser** — a tag read two hundred
+  times costs one network call, not two hundred.
+- New tags are batched and posted every 400ms, so a sweep is a handful of requests rather
+  than a request per read.
+- The capture field is uncontrolled and accepts reads with or without a Return suffix, so
+  no characters are lost to a reader typing a 24-character EPC in a few milliseconds.
+- The count lives on the server, one row per (count, EPC). Let go of the trigger, lock the
+  handheld, close the app, come back tomorrow — reopening resumes the same count. Nothing
+  needs restarting.
+- `scripts/sweep-check.mjs` proves it: 300 reads of 20 unique tags arrive as 20 codes in
+  2 requests, with nothing dropped.
+
 - **Keyboard-wedge readers** (most of them) need no setup at all: the scan boxes and
   Stock Take Mode accept their input directly.
 - **SDK-driven readers** post batches to the API:
@@ -433,25 +535,34 @@ Install the app on the handheld from its browser ("Add to home screen").
   The endpoint accepts the payload shapes the common SDKs produce: `epcs`, `tags`,
   a single `epc`, or a whitespace-separated `data` string.
 
-Until hardware is attached, everything runs in mock mode: the exact ZPL is generated and
-stored so you can inspect it, but nothing is transmitted. **The EPCs you generate today
-stay valid** — when the printer arrives, those same codes get written onto physical inlays.
+A count also accepts the **printed barcode** on the label, not just the RFID tag — both
+name the same individual unit, and scanning one after the other never counts it twice. So
+a barcode-only count works if a reader has no keyboard output, or if one tag will not read.
+
+**Nothing is simulated.** If no printer is configured, or the one configured cannot be
+reached, printing fails and says so — a unit is never marked as tagged unless a device
+actually accepted the label. You can still inspect the exact ZPL for any unit before a
+printer exists; it simply is not reported as printed.
 
 ---
 
-## Demo logins
+## Signing in for the first time
 
-Password for all of them: `password123`
+There are no built-in accounts and no default password. On first boot the server creates a
+single administrator and **prints its password once** in the startup output:
 
-| Email | Role | Can do |
-|---|---|---|
-| `admin@millzee.test` | Administrator | everything, all locations |
-| `manager@millzee.test` | Manager | all operations, reports, staff; no discount limit |
-| `cashier@millzee.test` | Cashier (Lagos) | sell, return, till, customers; discounts capped at 5% |
-| `cashier2@millzee.test` | Cashier (Umunede) | same, at the other branch |
-| `stock@millzee.test` | Inventory staff | products, stock, purchasing, transfers, RFID; no checkout |
+```
+  ┌──────────────────────────────────────────────────────────
+  │  FIRST-RUN ADMIN LOGIN — shown once, write it down now
+  │    email:    admin@example.com
+  │    password: 7f3k-9qxa-2mld-p0vv
+  └──────────────────────────────────────────────────────────
+```
 
-**Change these before the system touches real money.**
+Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` before the first boot if you would rather choose
+them. Change the password under **Settings → My account**, then add your staff under
+**Settings → Staff** and give each the narrowest role that lets them do their job
+(**Settings → Roles & permissions** shows exactly what each one can reach).
 
 ---
 
@@ -464,11 +575,11 @@ Password for all of them: `password123`
 │   ├── db/
 │   │   ├── schema.sql        full PostgreSQL schema
 │   │   ├── migrate.js        applies the schema (--fresh to drop first)
-│   │   ├── seed.js           realistic demo data
+│   │   ├── bootstrap.js      first-run skeleton — no sample data, ever
 │   │   └── index.js          pool, query helpers, transaction wrapper
 │   ├── services/
 │   │   ├── epc.js            the ONLY place an EPC is built or parsed
-│   │   ├── hardware.js       Zebra ZPL + reader adapters (mock / TCP / HTTP agent)
+│   │   ├── hardware.js       Zebra ZPL + reader adapters (TCP / HTTP agent)
 │   │   ├── accounts.js       decides which payment account a tender lands in
 │   │   ├── inventory.js      unit creation, allocation, stock movement ledger
 │   │   └── pricing.js        VAT and discount engine, shared with the offline client
@@ -483,7 +594,13 @@ Password for all of them: `password123`
 │       └── lib/              API client, auth context, offline queue, formatting, tab URLs
 └── scripts/
     ├── e2e.js                end-to-end API tests
-    └── ui-check.mjs          headless browser pass over every screen
+    ├── ui-check.mjs          headless browser pass over every screen
+    ├── sweep-check.mjs       continuous UHF sweep against Stock Take Mode
+    ├── reader-test-check.mjs reader fault modes vs. the diagnosis given
+    ├── commit-delivery-check.mjs  the SEUIC text-commit delivery, end to end
+    ├── check-refs.mjs        undefined component references, before they ship
+    ├── empty-state-check.mjs every screen on a brand-new, empty shop
+    └── demo-fixtures.js      TEST DATA ONLY — never loaded by the server
 ```
 
 ### Architecture notes
@@ -513,6 +630,7 @@ needs `Authorization: Bearer <token>`; the active branch is passed as `X-Locatio
 | Products | `GET/POST /products`, `GET/PUT/DELETE /products/:id`, `GET /products/search`, `POST /products/:id/duplicate`, `POST /products/bulk`, `PUT /products/variants/:id/location-price` |
 | Import/export | `GET /io/products/template`, `POST /io/products/validate`, `POST /io/products/import`, `GET /io/products/export` |
 | Inventory | `GET /inventory/levels`, `/low-stock`, `/availability/:variantId`, `/movements`, `/valuation`; `POST /inventory/receive`, `/adjustments` |
+| Tag binding | `GET /rfid/untagged`, `POST /rfid/units/:id/assign-tag`, `POST /rfid/units/:id/unassign-tag` |
 | RFID | `GET /rfid/units`, `/units/:id`, `/units/:id/zpl`, `/find`, `/overview`, `/scan-events`; `POST /rfid/units/:id/encode`, `/encode-batch`, `/resolve`, `/scan-events`, `/simulate-sweep`, `/stock-takes`, `/stock-takes/:id/scan`, `/stock-takes/:id/reconcile` |
 | Sales | `GET/POST /sales`, `GET /sales/:id`, `/sales/:id/receipt`, `/sales/held`, `POST /sales/:id/payments` |
 | Amendments | `PUT /sales/:id` (amend an issued receipt), `GET /sales/:id/editable`, `GET /sales/:id/revisions` |
@@ -535,9 +653,23 @@ needs `Authorization: Bearer <token>`; the active branch is passed as `X-Locatio
 
 ```bash
 npm start                  # in one terminal
-npm test                   # 155 end-to-end API checks
+npm run check              # undefined component references (runs inside npm run build too)
+npm test                   # 183 end-to-end API checks
+# the visual checks drive a real browser:
+npm i -D playwright && npx playwright install chromium
+
 node scripts/ui-check.mjs --shots   # every screen in a headless browser
+node scripts/sweep-check.mjs        # a continuous UHF sweep against the handheld screen
+node scripts/reader-test-check.mjs  # every reader fault mode, and the diagnosis given
+node scripts/commit-delivery-check.mjs  # SEUIC-style commit delivery on every scan surface
+
+# and against a brand-new empty shop:
+npm run reset && npm start
+ADMIN_PASS=… node scripts/empty-state-check.mjs
 ```
+
+Playwright is deliberately not a dependency — it pulls a browser with it, and Railway
+installs dev dependencies during a build. The API suite needs no browser.
 
 The API suite covers the things that would hurt most if they broke: that two identical
 items resolve to two different units, that oversell is blocked, that invoice numbers stay
@@ -553,9 +685,31 @@ at zero in a mixed basket, that returning goods to a supplier drops stock by exa
 amount and never lands in the shrinkage report, that the aged-debt buckets add up to the total, and
 that the Z report's expected cash reconciles.
 
+It also covers the continuous-sweep case directly: that re-reading the same tags forty times
+over adds nothing to the count, that scanner formatting (lowercase, spaced, colon-separated)
+still matches the same units, and that the printed label counts as the same unit as its chip.
+
 The suite is re-runnable: run it twice against the same database and it still reports zero failures.
 
-The UI pass visits all 52 screens and sub-tabs at desktop and phone widths, completes a real sale,
+It also covers binding a pre-encoded tag: that a 128-bit factory EPC binds, resolves and
+sells like a minted one, that a tag already in use is refused rather than moved, and that
+unbinding returns the unit to the queue.
+
+`scripts/sweep-check.mjs` drives the handheld screen in a real browser with a 300-read
+stream and asserts what reaches the server — it is what caught reads being stranded in the
+send queue at the end of a sweep.
+
+`scripts/check-refs.mjs` runs as part of `npm run build` and catches an undefined component
+reference — writing `icon: Tag` when only `Tags` was imported. That is not a syntax error,
+not a bundler error, and builds perfectly; it fails at runtime and, in a shared layout,
+white-screens the whole app.
+
+`scripts/empty-state-check.mjs` walks all 44 screens on a database holding nothing but the
+bootstrap skeleton. Every screen in this system was built against a database full of
+history; a real first day has none, and an empty array is the classic way a fresh install
+greets its owner with a crash.
+
+The UI pass visits all 54 screens and sub-tabs at desktop and phone widths, completes a real sale,
 opens every sidebar group, **follows every sidebar link and fails if any of them falls through to
 the catch-all redirect** — the classic symptom of a menu rewritten ahead of its pages — checks the
 calculator and the export menu open, and fails on any console error, failed request, blank screen or

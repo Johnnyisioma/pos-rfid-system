@@ -11,12 +11,14 @@
     "start": "node server/index.js",
     "build": "node scripts/check-refs.mjs && npm --prefix client install --no-audit --no-fund && npm --prefix client run build",
     "migrate": "node server/db/migrate.js",
-    "seed": "node server/db/seed.js",
-    "reset": "node server/db/migrate.js --fresh && node server/db/seed.js",
+    "reset": "node server/db/migrate.js --fresh && node server/db/bootstrap.js",
     "dev:server": "node --watch server/index.js",
     "dev:client": "npm --prefix client run dev",
     "test": "node scripts/e2e.js",
-    "check": "node scripts/check-refs.mjs"
+    "check": "node scripts/check-refs.mjs",
+    "bootstrap": "node server/db/bootstrap.js",
+    "fixtures": "ALLOW_DEMO_DATA=1 node scripts/demo-fixtures.js",
+    "reset:test": "node server/db/migrate.js --fresh && node server/db/bootstrap.js && ALLOW_DEMO_DATA=1 node scripts/demo-fixtures.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
