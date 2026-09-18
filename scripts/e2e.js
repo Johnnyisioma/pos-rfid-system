@@ -49,6 +49,17 @@ async function run() {
 
   // --- auth ---
   let r = await api('POST', '/api/auth/login', { email: 'admin@millzee.test', password: 'password123' });
+  if (r.status !== 200) {
+    console.log(results.join('\n'));
+    console.error(
+      '\nCould not sign in, so the suite cannot run.\n\n'
+      + 'This suite asserts against a shop with history. A freshly bootstrapped\n'
+      + 'install has no products, sales or test accounts — by design.\n\n'
+      + '  npm run reset:test     # fresh schema + bootstrap + test fixtures\n'
+      + '  npm start              # in another terminal\n'
+      + '  npm test\n');
+    process.exit(1);
+  }
   ok('login as admin', r.status === 200 && !!r.body.token, JSON.stringify(r.body).slice(0, 120));
   token = r.body.token;
   const lagosId = r.body.locations.find((l) => l.code === 'LAG').id;
@@ -114,11 +125,32 @@ async function run() {
   r = await api('POST', '/api/rfid/resolve', { codes: [epcs[0].match(/.{1,4}/g).join(' ')] });
   ok('spaced scanner input normalises', r.body.resolved === 1);
 
-  // --- encode a tag (mock Zebra) ---
+  // --- label generation and printing ---
+  // The ZPL is real and inspectable without hardware; PRINTING without a
+  // printer must fail rather than quietly mark the unit as tagged.
+  r = await api('GET', `/api/rfid/units/${units[0].id}/zpl`);
+  const zplText = r.body._raw || r.body.zpl || '';
+  ok('the exact ZPL is inspectable without a printer',
+    r.status === 200 && zplText.includes('^RFW,H'), zplText.slice(0, 120));
+  ok('ZPL carries the exact EPC', zplText.includes(epcs[0]), zplText.slice(0, 120));
+
+  // The fixtures register a printer at an address that does not answer. A
+  // print must therefore FAIL — the old build reported a cheerful "simulated"
+  // success here and marked the unit tagged, which is how a stock system ends
+  // up insisting a label exists that nobody ever printed.
   r = await api('POST', `/api/rfid/units/${units[0].id}/encode`, {});
-  ok('encode tag returns ZPL', r.status === 200 && r.body.zpl?.includes('^RFW,H'), JSON.stringify(r.body).slice(0, 120));
-  ok('ZPL carries the exact EPC', r.body.zpl?.includes(epcs[0]));
-  ok('mock mode is reported', r.body.status === 'simulated');
+  ok('printing to an unreachable printer fails instead of pretending',
+    r.status >= 400 && /printer/i.test(r.body.error || ''),
+    JSON.stringify(r.body).slice(0, 180));
+
+  r = await api('GET', `/api/rfid/units/${units[0].id}`);
+  ok('a failed print does NOT mark the unit as tagged',
+    r.body.tag_encoded === false, String(r.body.tag_encoded));
+
+  r = await api('GET', '/api/rfid/units/' + units[0].id);
+  ok('the failure is recorded as a print job, not lost',
+    (r.body.print_jobs || []).some((j) => j.status === 'failed'),
+    JSON.stringify(r.body.print_jobs?.slice(0, 2)).slice(0, 180));
 
   // --- checkout ---
   r = await api('GET', '/api/registers');
@@ -220,9 +252,12 @@ async function run() {
   r = await api('POST', '/api/rfid/stock-takes', { location_id: lagosId, scope: 'full' });
   ok('start stock take', (r.status === 201 || r.status === 200) && !!r.body.id, JSON.stringify(r.body).slice(0, 120));
   const take = r.body;
-  r = await api('POST', '/api/rfid/simulate-sweep', { location_id: lagosId, size: 30 });
-  ok('simulated sweep returns reads', Array.isArray(r.body.reads) && r.body.reads.length > 0);
-  const sweep = r.body.reads.map((x) => x.epc);
+  // Real EPCs in stock at this location, read twice over the way a handheld
+  // on a continuous trigger actually delivers them.
+  r = await api('GET', `/api/rfid/units?status=in_stock&limit=30`);
+  const inStock = (r.body.data || []).map((u) => u.epc);
+  ok('there is tagged stock to count', inStock.length > 0, String(inStock.length));
+  const sweep = [...inStock, ...inStock.slice(0, 5)];
   r = await api('POST', `/api/rfid/stock-takes/${take.id}/scan`, { codes: [...sweep, 'AAAAAAAAAAAAAAAAAAAAAAAA'] });
   ok('bulk scan recorded', r.body.summary.added > 0, JSON.stringify(r.body.summary));
   ok('duplicate reads de-duplicated', r.body.summary.duplicates > 0 || sweep.length === new Set(sweep).size);
@@ -481,9 +516,12 @@ async function run() {
   // --- devices ---
   r = await api('GET', '/api/devices');
   ok('devices registered', r.body.length >= 2);
+  ok('no device claims to be a mock',
+    !r.body.some((d) => d.driver === 'mock'), JSON.stringify(r.body.map((d) => d.driver)));
   const printer = r.body.find((d) => d.kind === 'rfid_printer');
   r = await api('POST', `/api/devices/${printer.id}/test`, {});
-  ok('printer test label works in mock mode', r.body.ok === true && r.body.zpl.includes('^RFW'));
+  ok('a printer that cannot be reached reports the failure',
+    r.status >= 400 || r.body.ok === false, JSON.stringify(r.body).slice(0, 180));
 
 
   /* ================================================================ */
@@ -770,6 +808,156 @@ async function run() {
     cashierRole?.areas?.settings && !/write/.test(cashierRole.areas.settings),
     String(cashierRole?.areas?.settings));
   ok('the matrix counts who holds each role', typeof cashierRole?.users === 'number');
+
+
+  /* ---------- continuous-sweep stock take ---------- */
+  // A UHF reader held on the trigger re-reads the same tag over and over. The
+  // count must absorb that without double-counting, and must accept the
+  // printed barcode as well as the tag, since that is the fallback when a
+  // reader has no keyboard output or a tag will not read.
+  r = await api('POST', '/api/inventory/receive', {
+    location_id: locationId, reason: 'E2E sweep stock',
+    items: [{ variant_id: v41.id, quantity: 3, cost_price: 5000 }],
+  });
+  const sweepUnits = r.body.units;
+
+  r = await api('POST', '/api/rfid/stock-takes', { location_id: locationId });
+  ok('start a stock take', r.status === 201 && r.body.id, JSON.stringify(r.body).slice(0, 150));
+  const takeId = r.body.id;
+
+  // First pass: each tag once.
+  r = await api('POST', `/api/rfid/stock-takes/${takeId}/scan`,
+    { codes: sweepUnits.map((u) => u.epc) });
+  ok('a sweep counts each tag once',
+    r.body.summary.added === 3 && r.body.summary.found === 3,
+    JSON.stringify(r.body.summary).slice(0, 200));
+  ok('the scan response carries a per-code result for the live feed',
+    r.body.summary.results?.length === 3 && r.body.summary.results[0].product_name,
+    JSON.stringify(r.body.summary.results?.[0]).slice(0, 180));
+  ok('the scan response carries the counts, so no refetch is needed',
+    Number(r.body.stock_take?.found_count) === 3, JSON.stringify(r.body.stock_take).slice(0, 150));
+
+  // Second pass: the firehose — every tag read many times over.
+  const storm = [];
+  for (let n = 0; n < 40; n += 1) sweepUnits.forEach((u) => storm.push(u.epc));
+  r = await api('POST', `/api/rfid/stock-takes/${takeId}/scan`, { codes: storm });
+  ok('re-reading the same tags never inflates the count',
+    r.body.summary.added === 0 && r.body.summary.duplicates === storm.length,
+    JSON.stringify(r.body.summary).slice(0, 160));
+  ok('the found count is unchanged after the storm',
+    Number(r.body.stock_take.found_count) === 3, String(r.body.stock_take.found_count));
+
+  // Messy input: spaced, lowercase and colon-separated, as scanners emit.
+  r = await api('POST', `/api/rfid/stock-takes/${takeId}/scan`, {
+    codes: [
+      sweepUnits[0].epc.toLowerCase(),
+      sweepUnits[1].epc.match(/.{1,4}/g).join(' '),
+      sweepUnits[2].epc.match(/.{1,2}/g).join(':'),
+    ],
+  });
+  ok('messy scanner formatting still matches the same units',
+    r.body.summary.added === 0 && r.body.summary.duplicates === 3,
+    JSON.stringify(r.body.summary).slice(0, 160));
+
+  // The printed barcode names the same unit as the chip.
+  r = await api('POST', `/api/rfid/stock-takes/${takeId}/scan`,
+    { codes: [sweepUnits[0].epc_readable] });
+  ok('the printed label counts as the same unit as its tag',
+    r.body.summary.added === 0 && r.body.summary.duplicates === 1,
+    JSON.stringify(r.body.summary).slice(0, 160));
+
+  // A label scanned for a unit not yet counted must count, not read as unknown.
+  r = await api('POST', '/api/inventory/receive', {
+    location_id: locationId, reason: 'E2E label-only stock',
+    items: [{ variant_id: v41.id, quantity: 1, cost_price: 5000 }],
+  });
+  const labelUnit = r.body.units[0];
+  r = await api('POST', `/api/rfid/stock-takes/${takeId}/scan`,
+    { codes: [labelUnit.epc_readable] });
+  ok('a barcode-only count resolves the unit rather than logging an unknown tag',
+    r.body.summary.added === 1 && r.body.summary.found === 1 && r.body.summary.unknown === 0,
+    JSON.stringify(r.body.summary).slice(0, 200));
+
+  r = await api('GET', `/api/rfid/stock-takes/${takeId}`);
+  ok('the count survives as a server-side session',
+    r.body.scans.length === 4 && r.body.status === 'open',
+    JSON.stringify({ n: r.body.scans?.length, s: r.body.status }));
+
+
+  /* ---------- binding pre-encoded tags (no RFID printer) ---------- */
+  // Real-world case: the shop has a handheld reader but no RFID printer, and
+  // buys plain pre-encoded labels. Their factory EPCs are NOT the 96-bit codes
+  // this system mints — the tag read off the user's own Lenvii was 128-bit.
+  r = await api('POST', '/api/inventory/receive', {
+    location_id: locationId, reason: 'E2E stock awaiting tags',
+    items: [{ variant_id: v41.id, quantity: 2, cost_price: 5000 }],
+  });
+  const toTag = r.body.units;
+
+  r = await api('GET', '/api/rfid/untagged?limit=500');
+  ok('untagged units are listed for tagging',
+    r.body.data.some((u) => u.id === toTag[0].id) && r.body.total >= 2,
+    JSON.stringify({ total: r.body.total }).slice(0, 120));
+
+  // A genuine 128-bit factory EPC, shaped exactly as the handheld reported it
+  // ("1030C09E0055904D83EB020B1E5EFFF3"), but with a unique tail so re-running
+  // the suite does not collide with the tag bound on the previous run.
+  const uniqTail = Date.now().toString(16).toUpperCase().slice(-8).padStart(8, '0');
+  const factoryEpc = `1030C09E0055904D83EB020B${uniqTail}`;
+  r = await api('POST', `/api/rfid/units/${toTag[0].id}/assign-tag`, { epc: factoryEpc });
+  ok('a 128-bit factory tag binds to a unit', r.status === 200 && r.body.ok,
+    JSON.stringify(r.body).slice(0, 220));
+  ok('the tag length is reported, not assumed', r.body.bits === 128, String(r.body.bits));
+  ok('it is not mistaken for one this system minted', r.body.minted_by_us === false);
+
+  // That EPC must now resolve to that exact unit, everywhere.
+  r = await api('POST', '/api/rfid/resolve', { codes: [factoryEpc] });
+  ok('the bound tag resolves to its unit',
+    r.body.results[0].resolved && r.body.results[0].unit.id === toTag[0].id,
+    JSON.stringify(r.body.results[0]).slice(0, 180));
+  ok('a 128-bit EPC is accepted as a valid format',
+    r.body.results[0].valid_format === true, String(r.body.results[0].valid_format));
+
+  // Messy reader output for the same tag.
+  r = await api('POST', '/api/rfid/resolve',
+    { codes: [factoryEpc.toLowerCase().match(/.{1,4}/g).join(' ')] });
+  ok('the same tag resolves however the reader formats it',
+    r.body.results[0].unit?.id === toTag[0].id);
+
+  // Binding the same tag to a second unit must be refused, not silently moved.
+  r = await api('POST', `/api/rfid/units/${toTag[1].id}/assign-tag`, { epc: factoryEpc });
+  ok('a tag already in use is refused rather than moved',
+    r.status === 400 && /already on/i.test(r.body.error || ''),
+    JSON.stringify(r.body).slice(0, 200));
+
+  r = await api('POST', `/api/rfid/units/${toTag[1].id}/assign-tag`, { epc: 'nonsense!!' });
+  ok('a malformed tag is rejected', r.status === 400, JSON.stringify(r.body).slice(0, 140));
+
+  r = await api('GET', '/api/rfid/untagged?limit=500');
+  ok('a tagged unit leaves the untagged queue',
+    !r.body.data.some((u) => u.id === toTag[0].id), String(r.body.total));
+
+  // Selling by the bound tag must work exactly as by a minted one.
+  r = await api('POST', '/api/sales', {
+    items: [{ variant_id: v41.id, quantity: 1, epcs: [factoryEpc] }],
+    payments: [{ method: 'cash', amount: 100000 }],
+    status: 'completed',
+  });
+  ok('a unit identified by its factory tag sells normally', r.status === 201,
+    JSON.stringify(r.body).slice(0, 180));
+  r = await api('GET', `/api/rfid/units/${toTag[0].id}`);
+  ok('that exact physical unit is the one marked sold',
+    r.body.status === 'sold', JSON.stringify(r.body.status));
+
+  // Unbinding returns it to the queue without changing its code.
+  r = await api('POST', `/api/rfid/units/${toTag[1].id}/assign-tag`,
+    { epc: `AABB1122CCDD3344${uniqTail}` });
+  ok('a 96-bit tag binds too', r.status === 200 && r.body.bits === 96, String(r.body.bits));
+  r = await api('POST', `/api/rfid/units/${toTag[1].id}/unassign-tag`, {});
+  ok('a binding can be undone', r.body.ok === true);
+  r = await api('GET', '/api/rfid/untagged?limit=500');
+  ok('the unbound unit returns to the queue',
+    r.body.data.some((u) => u.id === toTag[1].id));
 
   console.log(results.join('\n'));
   console.log('-'.repeat(64));

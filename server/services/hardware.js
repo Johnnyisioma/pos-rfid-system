@@ -1,13 +1,15 @@
 /**
  * Hardware integration layer.
  *
- * Everything hardware-specific lives behind these two adapters. Today the
- * system runs in `mock` mode: the exact ZPL that WOULD be sent to a Zebra
- * ZD500R is generated, stored and shown on screen, but nothing is transmitted.
+ * Everything hardware-specific lives behind these adapters, and every path here
+ * talks to a real device or fails. Nothing is simulated.
  *
- * To go live with real hardware, nothing in the app changes — you only register
- * a device row (Settings → Devices) with driver `zebra_zpl_tcp`, host = printer
- * IP, port = 9100. The same ZPL then goes down a TCP socket instead.
+ * To connect a printer, register a device (RFID → Devices) with driver
+ * `zebra_zpl_tcp`, host = the printer's IP, port = 9100 — or `http_agent` with
+ * a URL when the printer is only reachable on the shop LAN. The ZPL this file
+ * builds is the real command stream either way; it can be inspected on screen
+ * before a printer exists, but it is never reported as printed unless a device
+ * accepted it.
  */
 import net from 'net';
 
@@ -58,19 +60,23 @@ export function buildZpl({
 
 /**
  * Send ZPL to a device.
- * @returns {Promise<{status:'simulated'|'sent', transport:string, detail:string}>}
+ *
+ * There is no simulation path. If no printer is configured, or the configured
+ * driver cannot reach one, this THROWS. An earlier version returned a cheerful
+ * "simulated" success with nothing on the wire, which meant a unit could be
+ * marked as tagged when no label existed — the worst possible lie for a stock
+ * system to tell, because you only discover it when the shelf and the screen
+ * disagree months later.
+ *
+ * @returns {Promise<{status:'sent', transport:string, detail:string}>}
  */
 export function sendToPrinter(device, zpl) {
-  const driver = device?.driver || 'mock';
-
-  if (driver === 'mock' || !device) {
-    return Promise.resolve({
-      status: 'simulated',
-      transport: 'mock',
-      detail:
-        'Mock mode — ZPL generated and stored but not transmitted. Register a device with driver "zebra_zpl_tcp" to print for real.',
-    });
+  if (!device) {
+    return Promise.reject(new Error(
+      'No printer is configured. Add one under RFID → Devices, or bind pre-encoded '
+      + 'labels with RFID → Tag stock instead.'));
   }
+  const driver = device.driver;
 
   if (driver === 'zebra_zpl_tcp') {
     return new Promise((resolve, reject) => {
@@ -149,16 +155,4 @@ export function parseReaderPayload(body) {
     body.data.split(/[\s,;\n\r]+/).forEach((s) => push(s));
   }
   return out;
-}
-
-/** Simulated reads for demos/tests — mimics a sweep picking up tags twice. */
-export function simulateSweep(epcs, { duplicateRate = 0.25 } = {}) {
-  const reads = [];
-  for (const epc of epcs) {
-    reads.push({ epc, rssi: -(40 + Math.floor(Math.random() * 30)) });
-    if (Math.random() < duplicateRate) {
-      reads.push({ epc, rssi: -(40 + Math.floor(Math.random() * 30)) });
-    }
-  }
-  return reads.sort(() => Math.random() - 0.5);
 }

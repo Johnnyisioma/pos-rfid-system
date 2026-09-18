@@ -13,7 +13,7 @@ import Inventory from './pages/Inventory.jsx';
 import Purchases from './pages/Purchases.jsx';
 import Transfers from './pages/Transfers.jsx';
 import RfidUnits from './pages/RfidUnits.jsx';
-import ScanSimulator from './pages/ScanSimulator.jsx';
+import TagLookup from './pages/TagLookup.jsx';
 import ReaderTest from './pages/ReaderTest.jsx';
 import TagStock from './pages/TagStock.jsx';
 import StockTake from './pages/StockTake.jsx';
@@ -59,7 +59,7 @@ export default function App() {
         <Route path="purchases" element={<Purchases />} />
         <Route path="transfers" element={<Transfers />} />
         <Route path="rfid" element={<RfidUnits />} />
-        <Route path="rfid/scan" element={<ScanSimulator />} />
+        <Route path="rfid/lookup" element={<TagLookup />} />
         <Route path="rfid/reader-test" element={<ReaderTest />} />
         <Route path="rfid/tag-stock" element={<TagStock />} />
         <Route path="rfid/stock-take" element={<StockTake />} />

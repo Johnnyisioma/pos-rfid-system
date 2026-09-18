@@ -56,12 +56,19 @@ export default function ReaderTest() {
   const toast = useToast();
   const { locationId } = useAuth();
   const inputRef = useRef(null);
-  const keysRef = useRef([]);      // {char, at} for the read being assembled
   const idleTimer = useRef(null);
+  // Keystroke bookkeeping for the read being assembled. A SEUIC handheld in
+  // Focus mode delivers through InputMethodManager.setCommitText, which the
+  // browser sees as one `input` event with no keydowns at all — so counting
+  // keydowns is how we tell the two delivery styles apart, not how we read
+  // the data. The field's own value is the data.
+  const keyCount = useRef(0);
+  const firstKeyAt = useRef(0);
+  const lastKeyAt = useRef(0);
 
   const [reads, setReads] = useState([]);
   const [listening, setListening] = useState(true);
-  const [lastKeyAt, setLastKeyAt] = useState(null);
+  const [sawInput, setSawInput] = useState(null);
 
   useEffect(() => {
     if (!listening) return undefined;
@@ -75,25 +82,32 @@ export default function ReaderTest() {
   const finalise = useCallback(async (terminator) => {
     clearTimeout(idleTimer.current);
     idleTimer.current = null;
-    const keys = keysRef.current;
-    keysRef.current = [];
-    if (inputRef.current) inputRef.current.value = '';
-    if (!keys.length) return;
+    const el = inputRef.current;
+    const text = (el?.value || '').replace(/[\r\n\t]+$/, '');
+    const keys = keyCount.current;
+    const span = keys > 1 ? lastKeyAt.current - firstKeyAt.current : 0;
+    keyCount.current = 0;
+    if (el) el.value = '';
+    if (!text) return;
 
-    const text = keys.map((k) => k.char).join('');
-    const span = keys.length > 1 ? keys[keys.length - 1].at - keys[0].at : 0;
-    const perChar = keys.length > 1 ? Math.round((span / (keys.length - 1)) * 10) / 10 : 0;
+    // Did this arrive as keystrokes, or as a single committed string?
+    // Most of the characters having a keydown behind them means a wedge typing;
+    // none of them means an IME-style commit.
+    const via = keys >= Math.max(1, text.length * 0.6) ? 'keystrokes' : 'commit';
+    const perChar = via === 'keystrokes' && keys > 1
+      ? Math.round((span / (keys - 1)) * 10) / 10 : 0;
     const verdict = classify(text);
 
     const entry = {
       id: `${Date.now()}-${Math.random()}`,
       text,
-      chars: keys.length,
+      chars: text.length,
       span,
       perChar,
+      via,
       terminator,
       verdict,
-      typedByHand: perChar > 40,
+      typedByHand: via === 'keystrokes' && perChar > 40,
       at: new Date(),
       resolved: null,
     };
@@ -120,16 +134,28 @@ export default function ReaderTest() {
       return;
     }
     if (e.key.length === 1) {
-      keysRef.current.push({ char: e.key, at: performance.now() });
-      setLastKeyAt(Date.now());
-      clearTimeout(idleTimer.current);
-      idleTimer.current = setTimeout(() => finalise('none'), IDLE_MS);
+      const now = performance.now();
+      if (keyCount.current === 0) firstKeyAt.current = now;
+      lastKeyAt.current = now;
+      keyCount.current += 1;
     }
+  }, [listening, finalise]);
+
+  // Fires for BOTH delivery styles — a wedge typing character by character and
+  // a one-shot text commit. This, not onKeyDown, is what guarantees a read is
+  // seen at all.
+  const onInput = useCallback(() => {
+    if (!listening) return;
+    setSawInput(Date.now());
+    clearTimeout(idleTimer.current);
+    idleTimer.current = setTimeout(() => finalise('none'), IDLE_MS);
   }, [listening, finalise]);
 
   /* ---------- aggregate diagnosis ---------- */
   const withTerm = reads.filter((r) => r.terminator !== 'none').length;
   const wedgeLike = reads.filter((r) => !r.typedByHand).length;
+  const commits = reads.filter((r) => r.via === 'commit').length;
+  const keyed = reads.filter((r) => r.via === 'keystrokes').length;
   const good = reads.filter((r) => r.verdict.kind === 'epc' || r.verdict.kind === 'label').length;
   const matched = reads.filter((r) => r.resolved?.ok).length;
 
@@ -138,21 +164,14 @@ export default function ReaderTest() {
       return {
         tone: 'idle',
         title: 'Waiting for a read',
-        body: 'Pull the trigger, or scan a barcode. If nothing at all appears here, the reader is not in keyboard / wedge mode — that is a setting in the scanner app on the handheld, not in this app.',
-      };
-    }
-    if (withTerm === 0) {
-      return {
-        tone: 'warn',
-        title: 'Reads arrive, but with no terminator',
-        body: 'Characters are coming through, but the reader never sends Enter or Tab to say a read has finished. This app copes with that, but it is better to fix it: set the suffix to Enter / CR / \\r\\n in the scanner settings. Without it, two fast reads can merge into one.',
+        body: 'Pull the trigger, or scan a barcode. Nothing at all appearing here means the reader is not sending to the focused field — on a SEUIC handheld that is UHF app → Settings → Send Mode, which must be Focus rather than Broadcast.',
       };
     }
     if (good === 0) {
       return {
         tone: 'bad',
         title: 'Reads arrive, but not in a format this system knows',
-        body: 'The reader is working and terminating correctly, but what it sends is neither a 24-character EPC nor a printed label. Usually it is sending a different memory bank (TID rather than EPC), or adding a prefix or suffix. Check the read-data and prefix/suffix options in the scanner app.',
+        body: 'Reads are arriving, but what they contain is neither an EPC nor a printed label. Usually the reader is sending a different memory bank (TID rather than EPC), or adding a prefix or suffix. On a SEUIC handheld check UHF app → Settings → Region (should be EPC), Prefix and Suffix (should be empty), and Data start / Data length (both 0).',
       };
     }
     if (matched === 0) {
@@ -162,10 +181,18 @@ export default function ReaderTest() {
         body: 'The reader is set up correctly. These particular tags simply are not registered here — they may be blank inlays, tags from another system, or stock booked in at a different branch. Receive stock to mint EPCs, then read those labels.',
       };
     }
+    const how = commits && !keyed
+      ? 'The reader commits each read as a block of text rather than typing it key by key — that is how a SEUIC handheld behaves in Focus mode, and it is fine.'
+      : keyed && !commits
+        ? 'The reader types each read key by key, like a keyboard.'
+        : 'Reads are arriving both as keystrokes and as committed text.';
+    const term = withTerm === 0
+      ? ' No Enter is sent after a read, which is normal for this mode — every scan box here finishes a read on a short pause instead, so nothing is lost.'
+      : '';
     return {
       tone: 'good',
       title: 'Reader is working end to end',
-      body: `${matched} of ${reads.length} read(s) matched a real unit. Nothing further to configure — Stock Take Mode and the till will both accept this reader.`,
+      body: `${matched} of ${reads.length} read(s) matched a real unit. ${how}${term}`,
     };
   })();
 
@@ -177,7 +204,7 @@ export default function ReaderTest() {
       `diagnosis: ${diagnosis.title}`,
       '',
       ...reads.slice(0, 15).map((r) =>
-        `"${r.text}" | ${r.chars} chars | ${r.perChar}ms/char | terminator: ${r.terminator} | ` +
+        `"${r.text}" | ${r.chars} chars | via ${r.via} | ${r.perChar}ms/char | terminator: ${r.terminator} | ` +
         `${r.verdict.label} | ${r.resolved ? (r.resolved.ok ? 'matched' : 'no match') : 'pending'}`),
     ].join('\n');
     try {
@@ -217,7 +244,8 @@ export default function ReaderTest() {
 
       {/* the capture field — invisible, always focused while listening */}
       <input ref={inputRef} inputMode="none" autoComplete="off" defaultValue=""
-        onKeyDown={onKeyDown} className="absolute opacity-0 pointer-events-none h-0 w-0" />
+        onKeyDown={onKeyDown} onInput={onInput}
+        className="absolute opacity-0 pointer-events-none h-0 w-0" />
 
       <div className={`rounded-xl ring-1 p-4 mb-4 flex items-start gap-3 ${TONE[diagnosis.tone]}`}>
         <DIcon size={20} className="mt-0.5 shrink-0" />
@@ -229,9 +257,9 @@ export default function ReaderTest() {
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
         <Stat label="Reads captured" value={reads.length} icon={Radio} />
-        <Stat label="Sent a terminator" value={`${withTerm} / ${reads.length}`}
-          tone={reads.length && withTerm === reads.length ? 'good' : reads.length ? 'warn' : 'default'}
-          sub="Enter or Tab after each read" />
+        <Stat label="Delivery"
+          value={reads.length ? (commits && !keyed ? 'Commit' : keyed && !commits ? 'Keystrokes' : 'Mixed') : '—'}
+          sub={reads.length ? (withTerm ? 'with a terminator' : 'no terminator — handled') : 'how reads arrive'} />
         <Stat label="Recognised format" value={`${good} / ${reads.length}`}
           tone={reads.length && good === reads.length ? 'good' : reads.length ? 'warn' : 'default'}
           sub="EPC or printed label" />
@@ -251,7 +279,7 @@ export default function ReaderTest() {
                 {listening ? 'Listening — pull the trigger' : 'Not listening'}
               </p>
               <p className="text-sm text-slate-500 mt-1">
-                {lastKeyAt ? 'Keys seen but no complete read yet.' : 'Nothing has arrived yet.'}
+                {sawInput ? 'Something arrived but no complete read yet.' : 'Nothing has arrived yet.'}
               </p>
             </div>
           ) : (
@@ -317,10 +345,14 @@ function ReadRow({ r }) {
         <Badge status={r.terminator === 'none' ? 'partial' : 'completed'}>
           {r.terminator === 'none' ? 'no terminator' : `${r.terminator} suffix`}
         </Badge>
-        <Badge>{r.perChar}ms/char</Badge>
-        <Badge status={r.typedByHand ? undefined : 'found'}>
-          {r.typedByHand ? 'typed by hand' : 'scanner speed'}
+        <Badge status={r.via === 'commit' ? 'found' : undefined}>
+          {r.via === 'commit' ? 'text commit' : `${r.perChar}ms/char`}
         </Badge>
+        {r.via === 'keystrokes' && (
+          <Badge status={r.typedByHand ? undefined : 'found'}>
+            {r.typedByHand ? 'typed by hand' : 'scanner speed'}
+          </Badge>
+        )}
         {r.resolved && (
           <Badge status={r.resolved.ok ? 'completed' : 'cancelled'}>
             {r.resolved.ok

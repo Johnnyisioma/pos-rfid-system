@@ -93,7 +93,7 @@ const NAV = [
     { label: 'Tags to encode', to: '/rfid?encoded=false', icon: Printer, perm: 'rfid.encode' },
     { label: 'Tag stock', to: '/rfid/tag-stock', icon: Tag, perm: 'rfid.encode' },
     DIV(),
-    { label: 'Scan simulator', to: '/rfid/scan', icon: ScanLine },
+    { label: 'Tag lookup', to: '/rfid/lookup', icon: ScanLine },
     { label: 'Reader test', to: '/rfid/reader-test', icon: Keyboard },
     { label: 'Stock take', to: '/rfid/stock-take', icon: ClipboardCheck, perm: 'rfid.stocktake' },
     { label: 'Find an item', to: '/rfid/find', icon: Search, perm: 'rfid.find' },

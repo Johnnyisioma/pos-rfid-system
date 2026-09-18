@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  ClipboardCheck, Play, Zap, CheckCircle2, AlertTriangle, XCircle, MapPin, ScanLine, Trash2,
+  ClipboardCheck, Play, CheckCircle2, AlertTriangle, XCircle, MapPin, ScanLine, Trash2,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { num, money, dateTime, pct, labelize } from '../lib/format.js';
@@ -52,15 +52,6 @@ export default function StockTake() {
       const s = res.summary;
       toast.success(`${s.added} new · ${s.duplicates} repeat · ${s.unknown} unknown`);
     } catch (e) { toast.error(e.message); }
-  };
-
-  const simulate = async () => {
-    setBusy(true);
-    try {
-      const res = await api.post('/api/rfid/simulate-sweep', { location_id: locationId, size: 60 });
-      await scan([...new Set(res.reads.map((r) => r.epc))]);
-    } catch (e) { toast.error(e.message); }
-    finally { setBusy(false); }
   };
 
   const reconcile = async (opts) => {
@@ -117,9 +108,6 @@ export default function StockTake() {
                     <button className="btn-primary flex-1" disabled={!bulk.trim()}
                       onClick={() => { scan(bulk.split(/[\s,;]+/).filter(Boolean)); setBulk(''); }}>
                       Add batch
-                    </button>
-                    <button className="btn-secondary" onClick={simulate} disabled={busy}>
-                      {busy ? <Spinner /> : <Zap size={15} />} Simulate sweep
                     </button>
                   </div>
                 </div>

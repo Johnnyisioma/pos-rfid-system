@@ -4,18 +4,14 @@ import { Tags, LogIn } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { Spinner } from '../components/ui.jsx';
 
-const DEMO = [
-  ['Administrator', 'admin@millzee.test'],
-  ['Manager', 'manager@millzee.test'],
-  ['Cashier', 'cashier@millzee.test'],
-  ['Inventory staff', 'stock@millzee.test'],
-];
-
 export default function Login() {
   const { user, login, loading } = useAuth();
   const loc = useLocation();
-  const [email, setEmail] = useState('admin@millzee.test');
-  const [password, setPassword] = useState('password123');
+  // Empty, always. This page is on the public internet: a prefilled login —
+  // let alone a panel listing accounts and their shared password — hands the
+  // till to anyone who finds the URL.
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -62,18 +58,9 @@ export default function Login() {
           </button>
         </form>
 
-        <div className="mt-5 bg-slate-800/60 rounded-xl p-4">
-          <p className="text-xs font-medium text-slate-300 mb-2">Demo accounts — password <code className="text-brand-300">password123</code></p>
-          <div className="grid grid-cols-2 gap-1.5">
-            {DEMO.map(([role, addr]) => (
-              <button key={addr} type="button" onClick={() => { setEmail(addr); setPassword('password123'); }}
-                className="text-left rounded-lg px-2.5 py-2 bg-slate-700/50 hover:bg-slate-700 transition-colors">
-                <span className="block text-xs font-medium text-white">{role}</span>
-                <span className="block text-[10px] text-slate-400 truncate">{addr}</span>
-              </button>
-            ))}
-          </div>
-        </div>
+        <p className="mt-5 text-center text-xs text-slate-500">
+          Staff accounts are created under Settings → Staff.
+        </p>
       </div>
     </div>
   );

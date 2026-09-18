@@ -119,17 +119,13 @@ async function applySchema() {
 }
 
 /**
- * Demo data takes a while to build, so it runs after the server is already
- * listening: a fresh deploy answers its health check straight away and the
- * sample catalogue appears a few seconds later. Set SEED_ON_BOOT=false to
- * skip it entirely.
+ * First-run setup. Creates only the real skeleton — a location, a register, an
+ * admin login and the reference lists — never sample products, stock or sales.
+ * Safe on every boot: each step is skipped when it already exists.
  */
-async function seedIfEmpty() {
-  if (process.env.SEED_ON_BOOT === 'false') return;
-  const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM users');
-  if (rows[0].n > 0) return;
-  console.log('[pos] empty database - loading demo data in the background');
-  await import('./db/seed.js');
+async function runBootstrap() {
+  const { bootstrap } = await import('./db/bootstrap.js');
+  await bootstrap();
 }
 
 // Every statement in schema.sql is CREATE ... IF NOT EXISTS, so this is safe
@@ -142,7 +138,7 @@ applySchema()
   .finally(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`[pos] listening on :${PORT}`);
-      seedIfEmpty().catch((err) => console.error('[pos] seed failed:', err.message));
+      runBootstrap().catch((err) => console.error('[pos] bootstrap failed:', err.message));
     });
   });
 

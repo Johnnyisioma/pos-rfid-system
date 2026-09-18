@@ -497,7 +497,7 @@ CREATE TABLE IF NOT EXISTS devices (
   name TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('rfid_printer','rfid_reader','barcode_printer','receipt_printer')),
   location_id INT REFERENCES locations(id) ON DELETE SET NULL,
-  driver TEXT NOT NULL DEFAULT 'mock',   -- mock | zebra_zpl_tcp | webusb | http_agent
+  driver TEXT NOT NULL DEFAULT 'zebra_zpl_tcp',  -- zebra_zpl_tcp | http_agent | keyboard_wedge | http_post
   host TEXT,
   port INT DEFAULT 9100,
   config JSONB NOT NULL DEFAULT '{}',
@@ -511,8 +511,8 @@ CREATE TABLE IF NOT EXISTS print_jobs (
   device_id INT REFERENCES devices(id) ON DELETE SET NULL,
   unit_id BIGINT REFERENCES stock_units(id) ON DELETE SET NULL,
   epc TEXT,
-  payload TEXT,             -- the exact ZPL sent (or that WOULD be sent in mock mode)
-  status TEXT NOT NULL DEFAULT 'queued',  -- queued|sent|simulated|failed
+  payload TEXT,             -- the exact ZPL sent to the printer
+  status TEXT NOT NULL DEFAULT 'queued',  -- queued|sent|failed
   error TEXT,
   user_id INT REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()

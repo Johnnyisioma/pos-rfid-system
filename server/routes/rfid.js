@@ -9,7 +9,7 @@ import { h, bad, notFound, str, int, num, paging, nextRef, getSettings } from '.
 import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
 import { normalizeEpc, parseEpc, isEpcHex, isMintedEpc, epcBits, toWords, toBase64 } from '../services/epc.js';
-import { buildZpl, sendToPrinter, parseReaderPayload, simulateSweep } from '../services/hardware.js';
+import { buildZpl, sendToPrinter, parseReaderPayload } from '../services/hardware.js';
 import { setUnitStatus } from '../services/inventory.js';
 
 const r = Router();
@@ -182,7 +182,7 @@ async function encodeUnit(req, unitId, deviceId, copies) {
   await query('UPDATE stock_units SET tag_encoded=TRUE, encoded_at=now() WHERE id=$1', [unit.id]);
   if (device) await query('UPDATE devices SET last_used_at=now() WHERE id=$1', [device.id]);
 
-  return { unit, zpl, job, device: device || { id: null, name: 'Mock printer', driver: 'mock' }, outcome };
+  return { unit, zpl, job, device, outcome };
 }
 
 r.post('/units/:id/encode', requirePerm('rfid.encode'), h(async (req, res) => {
@@ -322,28 +322,7 @@ r.get('/scan-events', h(async (req, res) => {
   res.json(rows);
 }));
 
-/** Generate a realistic mock sweep for demos (uses real EPCs at the location). */
-r.post('/simulate-sweep', h(async (req, res) => {
-  const locationId = int(req.body.location_id, req.locationId);
-  const size = int(req.body.size, 25);
-  const includeMissingRate = num(req.body.missing_rate, 0.1);
-  const units = await many(
-    `SELECT epc FROM stock_units WHERE location_id=$1 AND status='in_stock' ORDER BY random() LIMIT $2`,
-    [locationId, size]);
-  let epcs = units.map((u) => u.epc);
-  // drop a few to emulate tags the reader could not see
-  epcs = epcs.filter(() => Math.random() > includeMissingRate);
-  // and add a stray from another location, if one exists
-  if (req.body.include_stray !== false) {
-    const stray = await one(
-      `SELECT epc FROM stock_units WHERE location_id IS DISTINCT FROM $1 AND status='in_stock' ORDER BY random() LIMIT 1`,
-      [locationId]);
-    if (stray) epcs.push(stray.epc);
-  }
-  res.json({ reads: simulateSweep(epcs), unique: epcs.length });
-}));
-
-/* ---------------- find item ---------------- */
+/* ---------------- find an item ---------------- */
 r.get('/find', h(async (req, res) => {
   const variantId = int(req.query.variant_id) || null;
   const q = str(req.query.q).trim();

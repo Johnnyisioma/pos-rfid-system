@@ -1,27 +1,22 @@
 import { useEffect, useState } from 'react';
-import { ScanLine, Radio, Zap, Trash2, CheckCircle2, XCircle, Info } from 'lucide-react';
+import { ScanLine, Radio, Trash2, CheckCircle2, XCircle, Info } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { money, num, prettyEpc, dateTime, labelize, ago } from '../lib/format.js';
 import { Card, Empty, Badge, useToast, ScanInput, Loading, Field, Spinner } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
 
-export default function ScanSimulator() {
+export default function TagLookup() {
   const toast = useToast();
   const { locationId } = useAuth();
   const [results, setResults] = useState([]);
   const [bulk, setBulk] = useState('');
   const [busy, setBusy] = useState(false);
   const [recent, setRecent] = useState([]);
-  const [samples, setSamples] = useState([]);
 
   const loadRecent = () => api.get('/api/rfid/scan-events?limit=15').then(setRecent).catch(() => {});
   useEffect(() => { loadRecent(); }, [locationId]);
 
-  useEffect(() => {
-    api.get('/api/rfid/units?status=in_stock&limit=6')
-      .then((r) => setSamples(r.data || [])).catch(() => {});
-  }, [locationId]);
 
   const scan = async (codes) => {
     setBusy(true);
@@ -36,37 +31,16 @@ export default function ScanSimulator() {
     finally { setBusy(false); }
   };
 
-  const simulate = async () => {
-    setBusy(true);
-    try {
-      const res = await api.post('/api/rfid/simulate-sweep', { location_id: locationId, size: 12 });
-      const codes = [...new Set(res.reads.map((r) => r.epc))];
-      await scan(codes);
-    } catch (e) { toast.error(e.message); }
-    finally { setBusy(false); }
-  };
-
   return (
     <>
-      <PageHeader title="Scan simulator"
-        subtitle="Type, paste or scan a code exactly as a handheld UHF reader would send it" />
+      <PageHeader title="Tag lookup"
+        subtitle="Scan, type or paste a code and see exactly which unit it is" />
 
       <div className="grid lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2 space-y-4">
-          <Card title="Single scan"
-            subtitle="A handheld acts as a keyboard wedge — it types the EPC and presses Enter">
+          <Card title="Single lookup"
+            subtitle="Pull the trigger with this page open, or type a code by hand if a tag will not read">
             <ScanInput onScan={(code) => scan([code])} />
-            <div className="flex flex-wrap gap-2 mt-3">
-              <button className="btn-secondary text-xs" onClick={simulate} disabled={busy}>
-                {busy ? <Spinner /> : <Zap size={14} />} Simulate a reader sweep
-              </button>
-              {samples.slice(0, 3).map((u) => (
-                <button key={u.id} className="badge bg-slate-100 text-slate-700 hover:bg-slate-200 font-mono"
-                  onClick={() => scan([u.epc])} title={u.product_name}>
-                  {u.epc.slice(-8)}
-                </button>
-              ))}
-            </div>
             <p className="text-xs text-slate-500 mt-3">
               Formats accepted: raw hex, spaced hex (<code>3035 0000 …</code>), <code>epc:3035…</code>,
               the printed label, a SKU, or a barcode.
@@ -151,7 +125,7 @@ export default function ScanSimulator() {
               <li>
                 <strong>Zebra printer.</strong> Register it under Hardware with driver{' '}
                 <code className="text-xs bg-slate-100 px-1 rounded">zebra_zpl_tcp</code>, host = printer IP,
-                port 9100. The same ZPL you see in mock mode then goes down a socket.
+                port 9100. The ZPL you can inspect for any unit then goes down that socket.
               </li>
               <li>
                 <strong>Nothing else changes.</strong> Every EPC is built and read in one service, so the

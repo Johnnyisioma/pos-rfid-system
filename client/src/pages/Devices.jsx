@@ -13,12 +13,14 @@ const KIND_ICON = {
 };
 
 const DRIVERS = [
-  { value: 'mock', label: 'Mock (no hardware attached)',
-    note: 'Generates and stores the exact ZPL, but sends nothing. Use this until the printer is on site.' },
   { value: 'zebra_zpl_tcp', label: 'Zebra ZPL over TCP (port 9100)',
     note: 'Direct socket to a network Zebra printer — ZD500R, ZT411, ZD621R and similar.' },
   { value: 'http_agent', label: 'HTTP print agent',
     note: 'For a printer only reachable on the shop LAN: a small local agent forwards the ZPL.' },
+  { value: 'keyboard_wedge', label: 'Keyboard wedge (handheld reader)',
+    note: 'A reader that types what it reads. Nothing to configure here — it is recorded so scans can be attributed to it.' },
+  { value: 'http_post', label: 'Posts to the API',
+    note: 'A reader or app that sends reads to /api/rfid/scan-events. Recorded so its scans are attributed.' },
 ];
 
 export default function Devices() {
@@ -63,9 +65,9 @@ export default function Devices() {
   return (
     <>
       <PageHeader title="Hardware"
-        subtitle="RFID printers and readers — mock today, real devices whenever you are ready"
+        subtitle="RFID printers and readers — add each one as you connect it"
         actions={can('devices.write') && (
-          <button className="btn-primary" onClick={() => setEditing({ kind: 'rfid_printer', driver: 'mock', port: 9100 })}>
+          <button className="btn-primary" onClick={() => setEditing({ kind: 'rfid_printer', driver: 'zebra_zpl_tcp', port: 9100 })}>
             <Plus size={16} /> Add device
           </button>
         )} />
@@ -91,8 +93,8 @@ export default function Devices() {
                       <p className="font-medium text-slate-800 truncate">{d.name}</p>
                       <p className="text-xs text-slate-500">{labelize(d.kind)}</p>
                       <div className="flex flex-wrap items-center gap-1.5 mt-2">
-                        <Badge status={d.driver === 'mock' ? 'unexpected' : 'found'}>
-                          {d.driver === 'mock' ? 'Mock mode' : labelize(d.driver)}
+                        <Badge status={d.is_active ? 'found' : 'cancelled'}>
+                          {labelize(d.driver)}
                         </Badge>
                         {d.location_name && <Badge>{d.location_name}</Badge>}
                         {!d.is_active && <Badge status="cancelled">Disabled</Badge>}
@@ -136,7 +138,7 @@ export default function Devices() {
                       <td className="font-mono text-xs">{j.epc}</td>
                       <td className="font-mono text-xs text-slate-500">{j.epc_readable || '—'}</td>
                       <td>{j.product_name || '—'}</td>
-                      <td className="text-slate-600">{j.device_name || 'Mock printer'}</td>
+                      <td className="text-slate-600">{j.device_name || '—'}</td>
                       <td>
                         <Badge status={j.status === 'failed' ? 'unknown' : j.status === 'sent' ? 'found' : 'unexpected'}>
                           {labelize(j.status)}
@@ -184,7 +186,7 @@ export default function Devices() {
 function DeviceModal({ device, onClose, onSave }) {
   const { locations, locationId } = useAuth();
   const [form, setForm] = useState({
-    name: '', kind: 'rfid_printer', driver: 'mock', host: '', port: 9100,
+    name: '', kind: 'rfid_printer', driver: 'zebra_zpl_tcp', host: '', port: 9100,
     location_id: locationId, config: {}, ...device,
   });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
@@ -295,13 +297,17 @@ X-Location-Id: 1
         </ol>
       </Card>
 
-      <Card title="Why switching modes is safe" className="lg:col-span-2">
+      <Card title="Nothing here is simulated" className="lg:col-span-2">
         <p className="text-sm text-slate-600">
-          Every EPC in the system is created, parsed and resolved in a single service, and every
-          hardware call goes through one adapter. Mock mode and live mode take exactly the same code
-          path — the only difference is whether the ZPL is written to a socket or stored for you to
-          inspect. That means the tags you generate today stay valid when the printer arrives: the same
-          EPCs simply get written onto physical inlays.
+          If no printer is configured, printing fails and says so — a unit is never marked as tagged
+          unless a device actually accepted the label. Every EPC is created, parsed and resolved in a
+          single service, and every hardware call goes through one adapter, so adding a device is a
+          configuration change rather than a rewrite. You can still inspect the exact ZPL for any unit
+          before a printer exists; it just is not reported as printed.
+        </p>
+        <p className="text-sm text-slate-600 mt-3">
+          No printer at all is a perfectly good setup: use <strong>RFID → Tag stock</strong> to bind
+          pre-encoded labels instead.
         </p>
       </Card>
     </div>

@@ -1,11 +1,45 @@
 /**
- * Realistic demo data for a Nigerian footwear boutique with two branches.
- * Safe to re-run after `npm run migrate -- --fresh`.
+ * TEST FIXTURES — not application code, and never loaded by the server.
+ *
+ * The automated suites need a shop with history to assert against: products
+ * with variants, stock, sales across sixty days, customers with balances,
+ * suppliers, expenses. This builds that.
+ *
+ * It lives under scripts/ rather than server/ because it is test tooling, and
+ * it refuses to run twice over: once without ALLOW_DEMO_DATA=1, and again if
+ * the database already holds real sales. Invented stock in a working shop is
+ * not a cosmetic problem — the first stock count reconciles against it and the
+ * first VAT return is computed from it.
+ *
+ *   npm run fixtures     # sets ALLOW_DEMO_DATA=1 for you
+ *
+ * Delete this file if you never want the capability in the tree; nothing in the
+ * application imports it.
  */
 import bcrypt from 'bcryptjs';
-import { pool, tx } from './index.js';
-import { receiveUnits, allocateUnits, markUnitsSold, moveStock } from '../services/inventory.js';
-import { computeTotals } from '../services/pricing.js';
+import { pool, tx } from '../server/db/index.js';
+import { receiveUnits, allocateUnits, markUnitsSold, moveStock } from '../server/services/inventory.js';
+import { computeTotals } from '../server/services/pricing.js';
+
+if (process.env.ALLOW_DEMO_DATA !== '1') {
+  console.error(
+    '\nRefusing to run: demo fixtures are test data.\n'
+    + 'If you really want them, use `npm run fixtures`.\n'
+    + 'Never do this on a shop database — invented stock and invoices cannot be\n'
+    + 'told apart from real ones afterwards.\n');
+  process.exit(1);
+}
+
+{
+  const { rows } = await pool.query(
+    "SELECT COUNT(*)::int AS n FROM sales WHERE status = 'completed'");
+  if (rows[0].n > 0) {
+    console.error(
+      `\nRefusing to run: this database already has ${rows[0].n} completed sale(s).\n`
+      + 'That looks like a real shop. Fixtures only load into an empty system.\n');
+    process.exit(1);
+  }
+}
 
 const EPC_PREFIX = '3035';
 const rand = (n) => Math.floor(Math.random() * n);
@@ -125,12 +159,13 @@ async function seed() {
     }
     await c.query('INSERT INTO registers (location_id,name) VALUES ($1,$2)', [lagos.id, 'Counter 2']);
 
-    /* ---------- devices (mock hardware) ---------- */
+    /* ---------- devices ----------
+       Registered with real drivers pointed at addresses that do not answer, so
+       the suite can exercise the printer error path. No device pretends to work. */
     await c.query(
       `INSERT INTO devices (name, kind, location_id, driver, host, port, config) VALUES
-        ('Zebra ZD500R (Lagos)','rfid_printer',$1,'mock','192.168.1.50',9100,'{"note":"Switch driver to zebra_zpl_tcp when the printer is on the shop network"}'),
-        ('Handheld UHF Reader (Lagos)','rfid_reader',$1,'mock',NULL,NULL,'{"posts_to":"/api/rfid/scan-events"}'),
-        ('Thermal Receipt Printer','receipt_printer',$1,'mock',NULL,NULL,'{}')`,
+        ('Test Zebra (unreachable)','rfid_printer',$1,'zebra_zpl_tcp','127.0.0.1',9101,'{"timeout_ms":500}'),
+        ('Test handheld reader','rfid_reader',$1,'keyboard_wedge',NULL,NULL,'{}')`,
       [lagos.id]);
 
     /* ---------- catalog scaffolding ---------- */
@@ -485,6 +520,63 @@ async function seed() {
     }
   });
 
+  /* ---------- payment accounts ---------- */
+  /**
+   * The schema creates one cash till so a fresh install works. The demo data
+   * needs the rest of a real Nigerian shop's money map — a bank current
+   * account, a Moniepoint wallet, a card terminal's settlement account — and
+   * the tender mapping that sends each payment to the right one without a
+   * cashier ever choosing. Sales already seeded are then back-filled, so the
+   * account balances and the Money in & out report have something true to say.
+   */
+  await tx(async (c) => {
+    const wanted = [
+      { name: 'Cash till', type: 'cash', opening: 50000, bank: '', number: '', dflt: true },
+      { name: 'GTBank current account', type: 'bank', opening: 1850000,
+        bank: 'Guaranty Trust Bank', number: '0123456789', dflt: false },
+      { name: 'Moniepoint wallet', type: 'mobile_money', opening: 320000,
+        bank: 'Moniepoint MFB', number: '8100112233', dflt: false },
+      { name: 'Card terminal settlement', type: 'card_terminal', opening: 0,
+        bank: 'Interswitch', number: '', dflt: false },
+    ];
+    const ids = {};
+    for (const a of wanted) {
+      const { rows } = await c.query(
+        `INSERT INTO payment_accounts (name, type, opening_balance, bank_name, account_number, is_default)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        [a.name, a.type, a.opening, a.bank, a.number, a.dflt]);
+      if (rows[0]) ids[a.name] = rows[0].id;
+      else {
+        const { rows: existing } = await c.query(
+          'SELECT id FROM payment_accounts WHERE name=$1', [a.name]);
+        if (existing[0]) ids[a.name] = existing[0].id;
+      }
+    }
+
+    const mapping = {
+      cash: ids['Cash till'],
+      transfer: ids['GTBank current account'],
+      mobile_money: ids['Moniepoint wallet'],
+      card: ids['Card terminal settlement'],
+      store_credit: ids['Cash till'],
+    };
+    for (const [method, accountId] of Object.entries(mapping)) {
+      if (!accountId) continue;
+      await c.query(
+        `INSERT INTO payment_method_accounts (method, account_id) VALUES ($1,$2)
+         ON CONFLICT (method) DO UPDATE SET account_id = EXCLUDED.account_id`,
+        [method, accountId]);
+    }
+
+    // Back-fill the sales already written above.
+    await c.query(
+      `UPDATE payments p SET account_id = m.account_id
+         FROM payment_method_accounts m
+        WHERE m.method = p.method AND p.account_id IS NULL`);
+  });
+
   /* ---------- expenses ---------- */
   await tx(async (c) => {
     const { rows: cats } = await c.query('SELECT id,name FROM expense_categories');
@@ -501,9 +593,13 @@ async function seed() {
           const factor = loc.code === 'LAG' ? 1 : 0.45;
           const amount = Math.round((amounts[cat.name] || 20000) * factor * (0.85 + Math.random() * 0.3));
           await c.query(
-            `INSERT INTO expenses (ref,location_id,category_id,amount,note,expense_date,user_id)
+            `INSERT INTO expenses (ref,location_id,category_id,amount,note,expense_date,user_id,account_id)
              VALUES ($1,$2,$3,$4,$5, date_trunc('month', CURRENT_DATE) - ($6 || ' month')::interval + ($7 || ' days')::interval,
-                     (SELECT id FROM users WHERE role='admin' LIMIT 1))`,
+                     (SELECT id FROM users WHERE role='admin' LIMIT 1),
+                     -- rent and salaries leave the bank, small shop costs leave the till
+                     (SELECT id FROM payment_accounts
+                       WHERE type = CASE WHEN $4::numeric > 100000 THEN 'bank' ELSE 'cash' END
+                         AND is_active ORDER BY id LIMIT 1))`,
             [`EXP-${new Date().getFullYear()}-${String(n).padStart(6, '0')}`, loc.id, cat.id, amount,
              `${cat.name} — ${loc.code}`, monthsAgo, rand(26)]);
         }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  X, Play, CheckCircle2, AlertTriangle, XCircle, Zap, Radio, RotateCcw, Pause,
+  X, Play, CheckCircle2, AlertTriangle, XCircle, Radio, RotateCcw, Pause,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { num } from '../lib/format.js';
@@ -236,15 +236,6 @@ export default function StockTakeMode() {
     finally { setBusy(false); }
   };
 
-  const simulate = async () => {
-    setBusy(true);
-    try {
-      const res = await api.post('/api/rfid/simulate-sweep', { location_id: locationId, size: 15 });
-      res.reads.forEach((r) => accept(r.epc));
-    } catch (e) { toast.error(e.message); }
-    finally { setBusy(false); }
-  };
-
   if (loading) return <div className="min-h-screen bg-slate-900 grid place-items-center"><Loading /></div>;
 
   const counted = take ? (take.found?.length ?? take.found_count ?? 0) : 0;
@@ -339,13 +330,9 @@ export default function StockTakeMode() {
             ))}
           </div>
 
-          <div className="p-3 bg-slate-800 shrink-0 grid grid-cols-2 gap-2">
-            <button onClick={simulate} disabled={busy}
-              className="btn-xl bg-slate-700 hover:bg-slate-600 text-white">
-              {busy ? <Spinner /> : <Zap size={20} />} Simulate
-            </button>
+          <div className="p-3 bg-slate-800 shrink-0">
             <button onClick={async () => { await flush(); navigate('/rfid/stock-take'); }}
-              className="btn-xl bg-brand-600 hover:bg-brand-700 text-white">
+              className="btn-xl bg-brand-600 hover:bg-brand-700 text-white w-full">
               <CheckCircle2 size={20} /> Reconcile
             </button>
           </div>

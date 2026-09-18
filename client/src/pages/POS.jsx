@@ -139,6 +139,26 @@ export default function POS() {
   const clearCart = () => { setCart([]); setCustomer(null); setCartDiscount({ type: 'percent', value: 0 }); setNote(''); };
 
   /* ---------- scanning ---------- */
+  /**
+   * Does this look like a tag, rather than something a person typed?
+   *
+   * At the till the focused field is the product search box, and a handheld in
+   * Focus mode commits its read straight into it — the operator never opens a
+   * scan dialog first. Searched as text, an EPC matches no product name or SKU
+   * and the cashier just sees "nothing found". So a scan-shaped code is routed
+   * to the tag resolver instead.
+   *
+   * The test is deliberately narrow: an even-length hex string of at least 16
+   * characters (64-bit and up), or the printed label format. Nothing a person
+   * would plausibly type to search for a shoe.
+   */
+  const looksLikeTag = (raw) => {
+    const v = String(raw).trim();
+    const hex = v.replace(/^epc[:=]/i, '').replace(/[\s:\-_.]/g, '');
+    if (/^[0-9a-fA-F]+$/.test(hex) && hex.length >= 16 && hex.length % 2 === 0) return true;
+    return /^[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{4,}$/i.test(v);
+  };
+
   const handleScan = async (code) => {
     try {
       const res = await api.post('/api/rfid/resolve', { codes: [code], context: 'checkout' });
@@ -239,9 +259,22 @@ export default function POS() {
         <div className="flex gap-2">
           <div className="relative flex-1">
             <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-            <input ref={searchRef} value={query} onChange={(e) => setQuery(e.target.value)}
+            <input ref={searchRef} value={query}
+              onChange={(e) => {
+                const next = e.target.value;
+                setQuery(next);
+                // A committed tag read arrives here whole, in one event, with no
+                // Enter behind it. Take it straight to the resolver.
+                if (looksLikeTag(next)) { setQuery(''); setResults([]); handleScan(next.trim()); }
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return;
+                e.preventDefault();
+                const v = query.trim();
+                if (v) { setQuery(''); setResults([]); handleScan(v); }
+              }}
               className="input pl-10 py-3 text-base" autoFocus
-              placeholder="Search by product, SKU or barcode…" />
+              placeholder="Search, or pull the trigger to scan a tag" />
             {query && (
               <button onClick={() => { setQuery(''); setResults([]); }}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
@@ -404,7 +437,7 @@ export default function POS() {
       <HeldModal open={showHeld} onClose={() => setShowHeld(false)} onResume={resumeHeld} />
 
       <Modal open={showScan} onClose={() => setShowScan(false)} title="Scan an RFID tag or barcode"
-        subtitle="A handheld reader types the code and presses Enter — this box accepts the same input."
+        subtitle="You can also just pull the trigger on the main screen — a read is picked up there automatically."
         size="sm">
         <ScanInput onScan={(code) => handleScan(code)} />
         <p className="text-xs text-slate-500 mt-3">

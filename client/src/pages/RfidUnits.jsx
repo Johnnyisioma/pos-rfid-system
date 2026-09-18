@@ -176,7 +176,7 @@ export default function RfidUnits() {
 
       {encodeResult && (
         <Modal open onClose={() => setEncodeResult(null)} title="Encoding results" size="lg"
-          subtitle="Mock mode — this is the exact ZPL that would go to the Zebra printer"
+          subtitle="The exact ZPL for this unit — what a Zebra printer receives when one is connected"
           footer={<button className="btn-primary" onClick={() => setEncodeResult(null)}>Close</button>}>
           <div className="space-y-3 max-h-[60vh] overflow-y-auto">
             {encodeResult.results.map((r) => (

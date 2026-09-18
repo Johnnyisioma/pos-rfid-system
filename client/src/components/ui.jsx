@@ -204,24 +204,53 @@ export function Pagination({ page, limit, total, onPage }) {
   );
 }
 
-/** Input that behaves like a barcode/RFID wedge: submits on Enter, auto-refocuses. */
-export function ScanInput({ onScan, placeholder = 'Scan or type a code, then press Enter', autoFocus = true, className = '' }) {
+/**
+ * Input that behaves like a barcode/RFID wedge.
+ *
+ * Submitting on Enter alone is not enough. A SEUIC handheld in Focus mode
+ * delivers a read through InputMethodManager.setCommitText — the browser gets
+ * one `input` event with the whole code and NO Enter, because the terminator is
+ * a separate setting that ships off. Waiting for Enter leaves the code sitting
+ * in the box while the operator wonders why nothing happened.
+ *
+ * So a read is finished by either an Enter or a short pause. The pause is long
+ * enough that a person typing a code by hand still gets to finish the word, and
+ * short enough to feel instant after a trigger pull.
+ */
+const SCAN_IDLE_MS = 350;
+
+export function ScanInput({
+  onScan, placeholder = 'Scan a tag, or type a code', autoFocus = true, className = '',
+  idleSubmit = true,
+}) {
   const ref = useRef(null);
+  const idle = useRef(null);
   const [value, setValue] = useState('');
+
   useEffect(() => { if (autoFocus) ref.current?.focus(); }, [autoFocus]);
+  useEffect(() => () => clearTimeout(idle.current), []);
+
+  const submit = (raw) => {
+    clearTimeout(idle.current);
+    const v = String(raw ?? '').trim();
+    if (!v) return;
+    onScan(v);
+    setValue('');
+    ref.current?.focus();
+  };
+
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        const v = value.trim();
-        if (!v) return;
-        onScan(v);
-        setValue('');
-        ref.current?.focus();
-      }}
-      className={`flex gap-2 ${className}`}
-    >
-      <input ref={ref} value={value} onChange={(e) => setValue(e.target.value)}
+    <form onSubmit={(e) => { e.preventDefault(); submit(value); }}
+      className={`flex gap-2 ${className}`}>
+      <input ref={ref} value={value}
+        onChange={(e) => {
+          const next = e.target.value;
+          setValue(next);
+          clearTimeout(idle.current);
+          // A committed read arrives complete in one event; a person typing
+          // keeps going. Either way, a pause means "that's the whole code".
+          if (idleSubmit && next.trim()) idle.current = setTimeout(() => submit(next), SCAN_IDLE_MS);
+        }}
         className="input font-mono" placeholder={placeholder} autoComplete="off" />
       <button type="submit" className="btn-primary">Scan</button>
     </form>

@@ -4,7 +4,7 @@
  *
  *   node scripts/ui-check.mjs [--shots]
  */
-import { chromium } from 'playwright';
+import { launchBrowser } from './lib/browser.mjs';
 import fs from 'fs';
 import path from 'path';
 
@@ -22,7 +22,7 @@ const PAGES = [
   ['purchases', '/purchases'],
   ['transfers', '/transfers'],
   ['rfid-units', '/rfid'],
-  ['rfid-scan', '/rfid/scan'],
+  ['rfid-lookup', '/rfid/lookup'],
   ['rfid-stock-take', '/rfid/stock-take'],
   ['rfid-find', '/rfid/find'],
   ['customers', '/customers'],
@@ -49,6 +49,8 @@ const PAGES = [
 
   // --- screens added with the Ultimate-POS style menu ---
   ['accounts', '/accounts'],
+  ['rfid-reader-test', '/rfid/reader-test'],
+  ['rfid-tag-stock', '/rfid/tag-stock'],
   ['purchases-returns', '/purchases?tab=returns'],
   ['purchases-new', '/purchases?tab=new'],
   ['settings-taxes', '/settings?tab=taxes'],
@@ -83,10 +85,7 @@ fs.mkdirSync(SHOT_DIR, { recursive: true });
 const problems = [];
 
 async function run() {
-  const browser = await chromium.launch({
-    args: ['--no-sandbox'],
-    executablePath: process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
-  });
+  const browser = await launchBrowser();
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 950 } });
   const page = await ctx.newPage();
 
@@ -146,7 +145,7 @@ async function run() {
   // --- a real interaction pass on the till ---
   currentLabel = 'pos-interaction';
   await page.goto(`${BASE}/pos`, { waitUntil: 'networkidle' });
-  await page.fill('input[placeholder*="Search by product"]', 'oxford');
+  await page.fill('input[placeholder*="Search"]', 'oxford');
   await page.waitForTimeout(900);
   const card = page.locator('button.card:not([disabled])').first();
   if (await card.count()) {

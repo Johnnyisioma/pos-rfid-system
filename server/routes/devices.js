@@ -23,7 +23,7 @@ r.post('/', requirePerm('devices.write'), h(async (req, res) => {
   const row = await one(
     `INSERT INTO devices (name, kind, location_id, driver, host, port, config)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [name, kind, int(req.body.location_id, req.locationId) || null, str(req.body.driver, 'mock'),
+    [name, kind, int(req.body.location_id, req.locationId) || null, str(req.body.driver, 'zebra_zpl_tcp'),
      str(req.body.host) || null, int(req.body.port, 9100), JSON.stringify(req.body.config || {})]);
   await audit(req, 'create', 'device', row.id, { name, kind, driver: row.driver });
   res.status(201).json(row);
