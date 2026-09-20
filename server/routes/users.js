@@ -3,7 +3,10 @@ import bcrypt from 'bcryptjs';
 import { many, one, tx } from '../db/index.js';
 import { h, bad, str, num, bool } from '../lib/util.js';
 import { requirePerm } from '../middleware/auth.js';
-import { ROLES, ROLE_PERMISSIONS, ROLE_LABELS } from '../lib/permissions.js';
+import {
+  ROLES, ROLE_PERMISSIONS, ROLE_LABELS, PERMISSION_CATALOG, ALL_PERMISSIONS,
+  effectivePermissions,
+} from '../lib/permissions.js';
 import { audit } from '../lib/audit.js';
 
 const r = Router();
@@ -60,6 +63,91 @@ r.get('/roles', requirePerm('users.read'), h(async (req, res) => {
       };
     }),
     areas,
+  });
+}));
+
+/**
+ * The permission catalogue, so the settings screen can render every switch
+ * without hard-coding a list that drifts out of step with the server's.
+ */
+r.get('/permissions', requirePerm('users.read'), h(async (req, res) => {
+  res.json({ catalog: PERMISSION_CATALOG, roles: ROLE_PERMISSIONS, labels: ROLE_LABELS });
+}));
+
+/** What one person can actually do, preset and exceptions shown separately. */
+r.get('/:id(\\d+)/permissions', requirePerm('users.read'), h(async (req, res) => {
+  const id = Number(req.params.id);
+  const user = await one('SELECT id, name, role FROM users WHERE id=$1', [id]);
+  if (!user) throw bad('User not found');
+  const overrides = await many(
+    `SELECT up.permission, up.effect, up.created_at, u.name AS granted_by_name
+       FROM user_permissions up LEFT JOIN users u ON u.id=up.granted_by
+      WHERE up.user_id=$1 ORDER BY up.permission`, [id]);
+  res.json({
+    user,
+    preset: ROLE_PERMISSIONS[user.role] || [],
+    overrides,
+    effective: effectivePermissions(user.role, overrides),
+    catalog: PERMISSION_CATALOG,
+  });
+}));
+
+/**
+ * Replace a user's exceptions.
+ *
+ * Sent as a whole set rather than one at a time, because a permission screen
+ * is edited as a form and a partial save is how somebody ends up with half the
+ * rights they were meant to have.
+ */
+r.put('/:id(\\d+)/permissions', requirePerm('users.write'), h(async (req, res) => {
+  const id = Number(req.params.id);
+  const user = await one('SELECT id, name, role FROM users WHERE id=$1', [id]);
+  if (!user) throw bad('User not found');
+
+  const incoming = Array.isArray(req.body.overrides) ? req.body.overrides : [];
+  const clean = [];
+  for (const o of incoming) {
+    const permission = str(o.permission);
+    if (!permission) continue;
+    // Only permissions that actually exist, plus area wildcards. Storing a
+    // typo means a switch that appears to be set and does nothing.
+    const valid = ALL_PERMISSIONS.includes(permission)
+      || (permission.endsWith('.*') && ALL_PERMISSIONS.some(
+        (k) => k.startsWith(permission.slice(0, -1))));
+    if (!valid) throw bad(`"${permission}" is not a permission this system has.`);
+    clean.push({ permission, effect: o.effect === 'deny' ? 'deny' : 'grant' });
+  }
+
+  // Do not let somebody lock the last administrator out of user management —
+  // there would then be no way back in without database access.
+  if (user.role === 'admin' && clean.some((o) => o.effect === 'deny' && o.permission.startsWith('users.'))) {
+    const { count } = await one(
+      `SELECT COUNT(*)::int AS count FROM users u
+        WHERE u.role='admin' AND u.is_active AND u.id <> $1
+          AND NOT EXISTS (SELECT 1 FROM user_permissions p
+                           WHERE p.user_id=u.id AND p.effect='deny' AND p.permission LIKE 'users.%')`,
+      [id]);
+    if (!count) throw bad('That would leave nobody able to manage staff. Grant it to another administrator first.');
+  }
+
+  await tx(async (c) => {
+    await c.query('DELETE FROM user_permissions WHERE user_id=$1', [id]);
+    for (const o of clean) {
+      await c.query(
+        `INSERT INTO user_permissions (user_id, permission, effect, granted_by)
+         VALUES ($1,$2,$3,$4)`, [id, o.permission, o.effect, req.user.id]);
+    }
+  });
+
+  await audit(req, 'update_permissions', 'user', id, {
+    grants: clean.filter((o) => o.effect === 'grant').map((o) => o.permission),
+    denies: clean.filter((o) => o.effect === 'deny').map((o) => o.permission),
+  });
+
+  res.json({
+    ok: true,
+    overrides: clean,
+    effective: effectivePermissions(user.role, clean),
   });
 }));
 

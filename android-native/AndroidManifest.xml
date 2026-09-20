@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The POS, as an app on the handheld.
+
+    targetSdkVersion is 24 on purpose, and the reason is specific: an app that
+    targets 33 or above must declare RECEIVER_EXPORTED when it registers a
+    receiver for another app's broadcast, and that constant does not exist in
+    the API 23 platform this is compiled against. Targeting 24 exempts us from
+    the requirement outright. It also clears the floor Android 14 and 15 set on
+    installable apps (23 and 24 respectively), which targeting 23 would not.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="ng.millzee.posrfid"
+    android:versionCode="5"
+    android:versionName="5.0.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="24" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="true"
+        android:usesCleartextTraffic="true"
+        android:largeHeap="true"
+        android:hardwareAccelerated="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:label="@string/app_name"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|locale|uiMode|navigation"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

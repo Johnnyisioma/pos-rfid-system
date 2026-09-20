@@ -4,6 +4,40 @@ import { h, bad, notFound, str, num, int, paging, nextRef } from '../lib/util.js
 import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
 import { allocateUnits, moveStock, setUnitStatus } from '../services/inventory.js';
+import { normalizeEpc, isEpcHex } from '../services/epc.js';
+
+/**
+ * Turn whatever the handheld sent into the units it refers to.
+ *
+ * Accepts an EPC or one of our printed labels, in any of the shapes a reader
+ * emits them in. Anything that resolves to nothing comes back in `unknown`
+ * rather than being dropped, because "four tags in that box are not in the
+ * system" is the single most useful thing a receiving clerk can be told.
+ */
+async function resolveCodes(c, codes) {
+  const cleaned = [...new Set(
+    (codes || []).map((x) => String(x || '').trim()).filter(Boolean))];
+  if (!cleaned.length) return { units: [], unknown: [] };
+
+  const epcs = cleaned.map(normalizeEpc).filter(isEpcHex);
+  const labels = cleaned.filter((x) => !isEpcHex(normalizeEpc(x)));
+
+  const { rows } = await c.query(
+    `SELECT su.*, v.sku AS variant_sku, v.size, v.color, p.name AS product_name
+       FROM stock_units su
+       JOIN product_variants v ON v.id=su.variant_id
+       JOIN products p ON p.id=v.product_id
+      WHERE su.epc = ANY($1::text[]) OR su.epc_readable = ANY($2::text[])`,
+    [epcs, labels.map((l) => l.toUpperCase())]);
+
+  const found = new Set();
+  rows.forEach((u) => { found.add(u.epc); found.add(String(u.epc_readable).toUpperCase()); });
+  const unknown = cleaned.filter((raw) => {
+    const n = normalizeEpc(raw);
+    return !found.has(n) && !found.has(raw.toUpperCase());
+  });
+  return { units: rows, unknown };
+}
 
 const r = Router();
 
@@ -47,7 +81,7 @@ r.get('/', h(async (req, res) => {
   res.json({ data: rows, page, limit });
 }));
 
-r.get('/:id', h(async (req, res) => {
+r.get('/:id(\\d+)', h(async (req, res) => {
   const t = await loadTransfer(req.params.id);
   if (!t) throw notFound('Transfer not found');
   res.json(t);
@@ -112,7 +146,7 @@ r.post('/', requirePerm('transfers.write'), h(async (req, res) => {
   res.status(201).json(await loadTransfer(out.transfer.id));
 }));
 
-r.post('/:id/dispatch', requirePerm('transfers.write'), h(async (req, res) => {
+r.post('/:id(\\d+)/dispatch', requirePerm('transfers.write'), h(async (req, res) => {
   const out = await tx(async (c) => {
     const { rows } = await c.query('SELECT * FROM transfers WHERE id=$1 FOR UPDATE', [req.params.id]);
     const t = rows[0];
@@ -139,10 +173,32 @@ r.post('/:id/dispatch', requirePerm('transfers.write'), h(async (req, res) => {
   res.json(await loadTransfer(req.params.id));
 }));
 
-/** Receive-confirmation step at the destination branch. */
-r.post('/:id/receive', requirePerm('transfers.write'), h(async (req, res) => {
+/**
+ * Receive at the destination branch.
+ *
+ * Two ways in, and the difference matters:
+ *
+ *   by quantity   "six pairs arrived" — the system picks which six units of
+ *                 that variant to land, because nobody scanned anything.
+ *   by scan       the handheld swept the box. Now the system knows exactly
+ *                 which units are physically here, and — more importantly —
+ *                 which ones on the manifest are NOT.
+ *
+ * The second is the whole point of per-unit tags. A quantity receive can only
+ * ever tell you the count matched; a scan receive tells you that the count
+ * matched *and the contents did*, which is a different claim when a box has
+ * been opened somewhere between two branches.
+ *
+ * Either way this is one transaction. A half-received transfer with stock
+ * landed at the destination and still marked in transit at the source is the
+ * kind of thing that takes a day to unpick.
+ */
+r.post('/:id(\\d+)/receive', requirePerm('transfers.write'), h(async (req, res) => {
   const lines = Array.isArray(req.body.items) ? req.body.items : null;
-  const scannedEpcs = Array.isArray(req.body.epcs) ? req.body.epcs : [];
+  const scanned = Array.isArray(req.body.epcs) ? req.body.epcs
+    : Array.isArray(req.body.codes) ? req.body.codes : [];
+
+  if (scanned.length) return receiveByScan(req, res, scanned);
 
   const out = await tx(async (c) => {
     const { rows } = await c.query('SELECT * FROM transfers WHERE id=$1 FOR UPDATE', [req.params.id]);
@@ -196,7 +252,198 @@ r.post('/:id/receive', requirePerm('transfers.write'), h(async (req, res) => {
   res.json(await loadTransfer(req.params.id));
 }));
 
-r.post('/:id/cancel', requirePerm('transfers.write'), h(async (req, res) => {
+/**
+ * Receive exactly what was scanned, and say plainly what is missing.
+ *
+ * Nothing is landed unless the whole set is processed, and a unit that belongs
+ * to a different transfer is refused rather than quietly absorbed — absorbing
+ * it would leave the other transfer permanently short with no record of where
+ * its stock went.
+ */
+async function receiveByScan(req, res, codes) {
+  const out = await tx(async (c) => {
+    const { rows } = await c.query('SELECT * FROM transfers WHERE id=$1 FOR UPDATE', [req.params.id]);
+    const t = rows[0];
+    if (!t) throw notFound('Transfer not found');
+    if (t.status !== 'in_transit') throw bad('Only transfers that are in transit can be received');
+
+    const { units, unknown } = await resolveCodes(c, codes);
+
+    const { rows: manifest } = await c.query(
+      `SELECT tu.unit_id, tu.received, su.variant_id
+         FROM transfer_units tu JOIN stock_units su ON su.id=tu.unit_id
+        WHERE tu.transfer_id=$1 FOR UPDATE`, [t.id]);
+    const onManifest = new Map(manifest.map((m) => [Number(m.unit_id), m]));
+
+    const accept = [];
+    const already = [];
+    const elsewhere = [];
+    for (const u of units) {
+      const m = onManifest.get(Number(u.id));
+      if (!m) { elsewhere.push(u); continue; }
+      if (m.received) { already.push(u); continue; }
+      accept.push(u);
+    }
+
+    // Land the accepted units and move the aggregate figures with them.
+    const perVariant = new Map();
+    for (const u of accept) {
+      perVariant.set(u.variant_id, (perVariant.get(u.variant_id) || 0) + 1);
+    }
+
+    if (accept.length) {
+      const ids = accept.map((u) => u.id);
+      await c.query(
+        `UPDATE stock_units SET status='in_stock', location_id=$2, last_seen_at=now()
+          WHERE id = ANY($1::bigint[])`, [ids, t.to_location_id]);
+      await c.query(
+        'UPDATE transfer_units SET received=TRUE WHERE transfer_id=$1 AND unit_id = ANY($2::bigint[])',
+        [t.id, ids]);
+
+      for (const [variantId, qty] of perVariant) {
+        await c.query(
+          `UPDATE transfer_items SET received_quantity = received_quantity + $3
+            WHERE transfer_id=$1 AND variant_id=$2`, [t.id, variantId, qty]);
+        await moveStock(c, {
+          variantId, locationId: t.to_location_id, delta: qty, type: 'transfer_in',
+          referenceType: 'transfer', referenceId: t.id,
+          reason: `Scanned in on ${t.ref}`, userId: req.user.id });
+      }
+
+      // Every scan is a sighting, which is what makes "where was this last
+      // seen" answerable weeks later.
+      await c.query(
+        `INSERT INTO tag_sightings (epc, unit_id, location_id, context, user_id)
+         SELECT su.epc, su.id, $2, 'transfer', $3 FROM stock_units su
+          WHERE su.id = ANY($1::bigint[])`,
+        [ids, t.to_location_id, req.user?.id || null]);
+    }
+
+    // What the manifest says should be in the box and was not scanned.
+    const stillOut = manifest.filter((m) => !m.received
+      && !accept.some((u) => Number(u.id) === Number(m.unit_id)));
+    const { rows: shortfall } = stillOut.length
+      ? await c.query(
+        `SELECT su.id, su.epc, su.epc_readable, p.name AS product_name, v.size, v.color
+           FROM stock_units su
+           JOIN product_variants v ON v.id=su.variant_id
+           JOIN products p ON p.id=v.product_id
+          WHERE su.id = ANY($1::bigint[]) ORDER BY p.name`,
+        [stillOut.map((m) => m.unit_id)])
+      : { rows: [] };
+
+    const { rows: totals } = await c.query(
+      `SELECT COALESCE(SUM(quantity),0) AS sent, COALESCE(SUM(received_quantity),0) AS got
+         FROM transfer_items WHERE transfer_id=$1`, [t.id]);
+    const complete = Number(totals[0].got) >= Number(totals[0].sent);
+    if (complete) {
+      await c.query(
+        "UPDATE transfers SET status='received', received_at=now(), received_by=$2 WHERE id=$1",
+        [t.id, req.user.id]);
+    }
+
+    return {
+      t, complete,
+      summary: {
+        scanned: codes.length,
+        received: accept.length,
+        already_received: already.length,
+        not_on_this_transfer: elsewhere.map((u) => ({
+          epc: u.epc, product_name: u.product_name,
+          note: 'This unit is not on this transfer. Check the box it came from.' })),
+        unknown_tags: unknown,
+        missing: shortfall,
+      },
+    };
+  });
+
+  await audit(req, 'receive_by_scan', 'transfer', req.params.id, {
+    received: out.summary.received, missing: out.summary.missing.length, complete: out.complete });
+
+  const transfer = await loadTransfer(req.params.id);
+  res.json({ ...transfer, summary: out.summary });
+}
+
+/**
+ * Create a transfer from a sweep.
+ *
+ * The dispatching branch puts the box on the counter, reads it, and sends. No
+ * picking from a list, no typing quantities — the manifest IS what is in the
+ * box, because it was built by reading what is in the box.
+ */
+r.post('/from-scan', requirePerm('transfers.write'), h(async (req, res) => {
+  const from = int(req.body.from_location_id, req.locationId);
+  const to = int(req.body.to_location_id);
+  if (!to) throw bad('Choose a destination location');
+  if (from === to) throw bad('Source and destination must be different');
+  const codes = Array.isArray(req.body.codes) ? req.body.codes
+    : Array.isArray(req.body.epcs) ? req.body.epcs : [];
+  if (!codes.length) throw bad('Scan at least one tag');
+
+  const out = await tx(async (c) => {
+    const { units, unknown } = await resolveCodes(c, codes);
+
+    const sendable = [];
+    const rejected = [];
+    for (const u of units) {
+      if (u.status !== 'in_stock') {
+        rejected.push({ epc: u.epc, product_name: u.product_name,
+          note: `That unit reads as "${u.status}", so it is not available to send.` });
+      } else if (Number(u.location_id) !== Number(from)) {
+        rejected.push({ epc: u.epc, product_name: u.product_name,
+          note: 'That unit is booked to a different branch. Receive it here first.' });
+      } else {
+        sendable.push(u);
+      }
+    }
+    if (!sendable.length) {
+      throw bad('None of those tags can be sent from this branch. '
+        + `${unknown.length} unknown, ${rejected.length} unavailable.`);
+    }
+
+    const ref = await nextRef(c, 'transfers', 'TRF');
+    const { rows } = await c.query(
+      `INSERT INTO transfers (ref, from_location_id, to_location_id, status, notes, created_by, sent_at)
+       VALUES ($1,$2,$3,'in_transit',$4,$5,now()) RETURNING *`,
+      [ref, from, to, str(req.body.notes), req.user.id]);
+    const transfer = rows[0];
+
+    const perVariant = new Map();
+    for (const u of sendable) perVariant.set(u.variant_id, (perVariant.get(u.variant_id) || 0) + 1);
+
+    for (const [variantId, qty] of perVariant) {
+      await c.query('INSERT INTO transfer_items (transfer_id, variant_id, quantity) VALUES ($1,$2,$3)',
+        [transfer.id, variantId, qty]);
+      await moveStock(c, {
+        variantId, locationId: from, delta: -qty, type: 'transfer_out',
+        referenceType: 'transfer', referenceId: transfer.id,
+        reason: `Scanned out on ${ref}`, userId: req.user.id });
+    }
+
+    const ids = sendable.map((u) => u.id);
+    await setUnitStatus(c, ids, 'in_transit');
+    await c.query(
+      `INSERT INTO transfer_units (transfer_id, unit_id)
+       SELECT $1, unnest($2::bigint[]) ON CONFLICT DO NOTHING`, [transfer.id, ids]);
+    await c.query(
+      `INSERT INTO tag_sightings (epc, unit_id, location_id, context, user_id)
+       SELECT su.epc, su.id, $2, 'transfer', $3 FROM stock_units su
+        WHERE su.id = ANY($1::bigint[])`, [ids, from, req.user?.id || null]);
+
+    return { transfer, sent: sendable.length, rejected, unknown };
+  });
+
+  await audit(req, 'create_from_scan', 'transfer', out.transfer.id, {
+    ref: out.transfer.ref, units: out.sent, rejected: out.rejected.length });
+
+  const transfer = await loadTransfer(out.transfer.id);
+  res.status(201).json({
+    ...transfer,
+    summary: { sent: out.sent, rejected: out.rejected, unknown_tags: out.unknown },
+  });
+}));
+
+r.post('/:id(\\d+)/cancel', requirePerm('transfers.write'), h(async (req, res) => {
   const out = await tx(async (c) => {
     const { rows } = await c.query('SELECT * FROM transfers WHERE id=$1 FOR UPDATE', [req.params.id]);
     const t = rows[0];

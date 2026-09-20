@@ -80,13 +80,32 @@ r.post('/units/:id/assign-tag', requirePerm('rfid.encode'), h(async (req, res) =
   }
 
   const previous = unit.epc;
+  const minted = isMintedEpc(epc);
+  const batchId = int(req.body.batch_id, null) || null;
+  const source = str(req.body.source) || (minted ? 'minted' : 'factory');
+
   const updated = await one(
     `UPDATE stock_units
-        SET epc=$2, tag_encoded=TRUE, encoded_at=now(), last_seen_at=now()
-      WHERE id=$1 RETURNING *`, [req.params.id, epc]);
+        SET epc=$2, tag_encoded=TRUE, encoded_at=now(), last_seen_at=now(),
+            epc_bits=$3, minted_by_us=$4, tag_source=$5,
+            paired_at=now(), paired_by=$6, tag_batch_id=$7
+      WHERE id=$1 RETURNING *`,
+    [req.params.id, epc, epcBits(epc), minted, source, req.user?.id || null, batchId]);
+
+  // A pairing is a sighting: the tag was physically in front of somebody.
+  await query(
+    `INSERT INTO tag_sightings (epc, unit_id, location_id, context, user_id)
+     VALUES ($1,$2,$3,'provision',$4)`,
+    [epc, unit.id, unit.location_id, req.user?.id || null]);
+
+  if (batchId) {
+    await query(
+      `UPDATE tag_batches SET provisioned = provisioned + 1 WHERE id=$1 AND status='open'`,
+      [batchId]);
+  }
 
   await audit(req, 'assign_tag', 'stock_unit', unit.id, {
-    readable: unit.epc_readable, from: previous, to: epc, bits: epcBits(epc) });
+    readable: unit.epc_readable, from: previous, to: epc, bits: epcBits(epc), source });
 
   res.json({
     ok: true,
@@ -96,6 +115,142 @@ r.post('/units/:id/assign-tag', requirePerm('rfid.encode'), h(async (req, res) =
     minted_by_us: isMintedEpc(epc),
     message: `${unit.product_name} ${[unit.size, unit.color].filter(Boolean).join(' / ')} is now on tag ${epc}`,
   });
+}));
+
+/* ------------------------------------------------------------------ */
+/*  Batch provisioning                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Tagging forty pairs of the same shoe one at a time means picking the unit
+ * from a list forty times, and the list is forty identical rows. A batch fixes
+ * the variant up front, so the station becomes: scan, scan, scan.
+ *
+ * The batch is bookkeeping, not a lock — it records what somebody set out to
+ * do and how far they got, so an interrupted session can be picked up by
+ * somebody else without counting the shelf again.
+ */
+r.post('/batches', requirePerm('rfid.encode'), h(async (req, res) => {
+  const variantId = int(req.body.variant_id, null);
+  if (!variantId) throw bad('Pick a product variant for this batch');
+  const variant = await one(
+    `SELECT v.*, p.name AS product_name FROM product_variants v
+       JOIN products p ON p.id=v.product_id WHERE v.id=$1`, [variantId]);
+  if (!variant) throw notFound('That variant does not exist');
+
+  const locationId = int(req.body.location_id, req.locationId);
+  const row = await tx(async (c) => {
+    const ref = await nextRef(c, 'tag_batches', 'TB');
+    const { rows } = await c.query(
+      `INSERT INTO tag_batches (ref, variant_id, location_id, mode, planned, notes, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [ref, variantId, locationId, str(req.body.mode) || 'pair',
+       int(req.body.planned, 0), str(req.body.notes), req.user?.id || null]);
+    return rows[0];
+  });
+
+  await audit(req, 'create', 'tag_batch', row.id, { ref: row.ref, variant_id: variantId });
+  res.status(201).json({ ...row, product_name: variant.product_name, variant_sku: variant.sku });
+}));
+
+r.get('/batches', h(async (req, res) => {
+  const rows = await many(
+    `SELECT b.*, p.name AS product_name, v.sku AS variant_sku, v.size, v.color,
+            l.name AS location_name, u.name AS created_by_name,
+            (SELECT COUNT(*)::int FROM stock_units su
+              WHERE su.variant_id = b.variant_id AND su.status='in_stock'
+                AND NOT su.tag_encoded
+                AND (b.location_id IS NULL OR su.location_id = b.location_id)) AS remaining
+       FROM tag_batches b
+       LEFT JOIN product_variants v ON v.id=b.variant_id
+       LEFT JOIN products p ON p.id=v.product_id
+       LEFT JOIN locations l ON l.id=b.location_id
+       LEFT JOIN users u ON u.id=b.created_by
+      WHERE ($1::text IS NULL OR b.status = $1)
+      ORDER BY b.created_at DESC LIMIT 100`,
+    [str(req.query.status) || null]);
+  res.json(rows);
+}));
+
+/**
+ * Pair one tag inside a batch.
+ *
+ * The server picks the unit, not the client: the next untagged unit of this
+ * batch's variant at this batch's location. Two people running the same batch
+ * at two stations therefore cannot both be handed the same unit.
+ */
+r.post('/batches/:id(\\d+)/pair', requirePerm('rfid.encode'), h(async (req, res) => {
+  const epc = normalizeEpc(req.body.epc);
+  if (!epc) throw bad('Scan a tag first');
+  if (!isEpcHex(epc))
+    throw bad(`"${epc}" is not a usable EPC. Expected hex, ${epcBits(epc)} bits read.`);
+
+  const out = await tx(async (c) => {
+    const { rows: batches } = await c.query(
+      'SELECT * FROM tag_batches WHERE id=$1 FOR UPDATE', [req.params.id]);
+    const batch = batches[0];
+    if (!batch) throw notFound('Batch not found');
+    if (batch.status !== 'open') throw bad('That batch is closed.');
+
+    const { rows: clashes } = await c.query(
+      'SELECT id, epc_readable, status FROM stock_units WHERE epc=$1', [epc]);
+    if (clashes.length) {
+      throw bad(`That tag is already on ${clashes[0].epc_readable} (${clashes[0].status}). Use a different tag.`);
+    }
+
+    // FOR UPDATE SKIP LOCKED is what makes two stations safe: each one takes a
+    // different row rather than queueing behind the same one.
+    const { rows: units } = await c.query(
+      `SELECT su.id FROM stock_units su
+        WHERE su.variant_id=$1 AND su.status='in_stock' AND NOT su.tag_encoded
+          AND ($2::int IS NULL OR su.location_id=$2)
+        ORDER BY su.serial
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1`, [batch.variant_id, batch.location_id]);
+    if (!units.length) {
+      throw bad('Every unit of this product at this location already has a tag.');
+    }
+
+    const { rows: updated } = await c.query(
+      `UPDATE stock_units
+          SET epc=$2, tag_encoded=TRUE, encoded_at=now(), last_seen_at=now(),
+              epc_bits=$3, minted_by_us=$4, tag_source=$5,
+              paired_at=now(), paired_by=$6, tag_batch_id=$7
+        WHERE id=$1 RETURNING *`,
+      [units[0].id, epc, epcBits(epc), isMintedEpc(epc),
+       isMintedEpc(epc) ? 'minted' : 'factory', req.user?.id || null, batch.id]);
+
+    await c.query(
+      `INSERT INTO tag_sightings (epc, unit_id, location_id, context, user_id)
+       VALUES ($1,$2,$3,'provision',$4)`,
+      [epc, units[0].id, batch.location_id, req.user?.id || null]);
+
+    const { rows: counted } = await c.query(
+      `UPDATE tag_batches SET provisioned = provisioned + 1 WHERE id=$1 RETURNING *`, [batch.id]);
+
+    const { rows: left } = await c.query(
+      `SELECT COUNT(*)::int AS n FROM stock_units
+        WHERE variant_id=$1 AND status='in_stock' AND NOT tag_encoded
+          AND ($2::int IS NULL OR location_id=$2)`, [batch.variant_id, batch.location_id]);
+
+    return { unit: updated[0], batch: counted[0], remaining: left[0].n };
+  });
+
+  res.json({
+    ok: true,
+    ...out,
+    bits: epcBits(epc),
+    message: `Tag ${epc} paired. ${out.remaining} left in this batch.`,
+  });
+}));
+
+r.post('/batches/:id(\\d+)/close', requirePerm('rfid.encode'), h(async (req, res) => {
+  const row = await one(
+    `UPDATE tag_batches SET status='closed', closed_at=now()
+      WHERE id=$1 AND status='open' RETURNING *`, [req.params.id]);
+  if (!row) throw bad('That batch is already closed.');
+  await audit(req, 'close', 'tag_batch', row.id, { provisioned: row.provisioned });
+  res.json(row);
 }));
 
 /** Undo a binding — puts the unit back in the untagged queue. */

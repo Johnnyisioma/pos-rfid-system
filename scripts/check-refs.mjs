@@ -69,10 +69,62 @@ for (const file of walk(ROOT)) {
       problems.push(`${path.relative('.', file)}:${line}  <${name}> is used but never imported or defined`);
     }
   }
+
+  /*
+    The other half of the same bug.
+
+    A component that calls `feature(...)` without destructuring `feature` from
+    useAuth() builds perfectly and throws ReferenceError the moment it renders
+    — exactly like `icon: Tag` did. The names below are the ones useAuth hands
+    out, so a component that CALLS one must also take it from the hook.
+
+    Checked PER COMPONENT, not per file. One file usually holds several
+    components, and a sibling that happens to destructure `feature` is exactly
+    what let this bug through the first time: the file looked fine, the
+    component next to it crashed.
+
+    Deliberately limited to these names — a general "is this identifier bound"
+    check is a linter, and half a linter finds false positives all day.
+  */
+  const HOOK_VALUES = ['can', 'feature', 'switchLocation', 'reloadSettings', 'logout'];
+
+  // Top-level function declarations, which is how every component in this
+  // codebase is written. Each one's body runs from its `function` keyword to
+  // the next one's.
+  const starts = [...src.matchAll(/^(?:export\s+default\s+)?function\s+([A-Za-z_$][\w$]*)/gm)]
+    .map((m) => ({ name: m[1], index: m.index }));
+
+  for (let i = 0; i < starts.length; i++) {
+    const body = src.slice(starts[i].index, starts[i + 1]?.index ?? src.length);
+    if (!/useAuth\(\)/.test(body) && !HOOK_VALUES.some((n) => body.includes(`${n}(`))) continue;
+
+    const bound = new Set();
+    for (const m of body.matchAll(/(?:const|let|var)\s*\{([^}]+)\}\s*=\s*useAuth\(\)/g))
+      for (const part of m[1].split(',')) bound.add(part.trim().split(/[:=]/).pop().trim());
+
+    for (const name of HOOK_VALUES) {
+      if (bound.has(name)) continue;
+      // A call, not a mention: `feature(` rather than `feature:` in a nav entry.
+      const call = new RegExp(`(?<![.\\w$'"\`])${name}\\s*\\(`, 'g');
+      const hit = [...body.matchAll(call)].find((m) => {
+        const before = body.slice(Math.max(0, m.index - 40), m.index);
+        // its own declaration, or a prop being passed down
+        return !/(function|const|let|var)\s+$/.test(before) && !/[.:]\s*$/.test(before);
+      });
+      if (!hit) continue;
+      // It may legitimately arrive as a prop instead of from the hook.
+      const params = body.slice(0, body.indexOf(')') + 1);
+      if (params.includes(name)) continue;
+      const line = src.slice(0, starts[i].index + hit.index).split('\n').length;
+      problems.push(
+        `${path.relative('.', file)}:${line}  ${starts[i].name}() calls ${name}() `
+        + 'but never takes it from useAuth()');
+    }
+  }
 }
 
 if (problems.length) {
-  console.log(`\nUndefined component references (${problems.length}):\n`);
+  console.log(`\nReferences that build but crash at runtime (${problems.length}):\n`);
   problems.forEach((p) => console.log(`  ${p}`));
   console.log('\nThese build fine and crash at runtime.\n');
   process.exit(1);

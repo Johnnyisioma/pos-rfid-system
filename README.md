@@ -22,6 +22,7 @@ Android-based handheld RFID scanner. Works offline and syncs when the connection
 - [Running it locally](#running-it-locally)
 - [Deploying to Railway](#deploying-to-railway)
 - [Connecting real hardware](#connecting-real-hardware)
+- [The Android app](#the-android-app)
 - [Signing in for the first time](#signing-in-for-the-first-time)
 - [Project layout](#project-layout)
 - [API reference](#api-reference)
@@ -546,6 +547,24 @@ printer exists; it simply is not reported as printed.
 
 ---
 
+## The Android app
+
+`android-app/` builds the POS into an installable Android app with a native bridge to the
+handheld's UHF radio. See [`android-app/README.md`](android-app/README.md) for the build.
+
+The short version of why it matters: in a browser the reader can only reach the POS by
+pretending to be a keyboard, and the SEUIC handheld ships on **Broadcast** mode, not Focus —
+so out of the box the browser receives nothing and it looks like the reader is broken. The
+app listens for the broadcast directly, which also lets the POS **start and stop the radio
+itself**. That is the difference between holding a trigger down for an hour during a stock
+take and putting the handheld in a trolley and walking the aisles.
+
+```bash
+cd android-app && npm install && npm run apk
+```
+
+---
+
 ## Signing in for the first time
 
 There are no built-in accounts and no default password. On first boot the server creates a
@@ -654,7 +673,7 @@ needs `Authorization: Bearer <token>`; the active branch is passed as `X-Locatio
 ```bash
 npm start                  # in one terminal
 npm run check              # undefined component references (runs inside npm run build too)
-npm test                   # 183 end-to-end API checks
+npm test                   # 252 end-to-end API checks
 # the visual checks drive a real browser:
 npm i -D playwright && npx playwright install chromium
 
@@ -662,6 +681,7 @@ node scripts/ui-check.mjs --shots   # every screen in a headless browser
 node scripts/sweep-check.mjs        # a continuous UHF sweep against the handheld screen
 node scripts/reader-test-check.mjs  # every reader fault mode, and the diagnosis given
 node scripts/commit-delivery-check.mjs  # SEUIC-style commit delivery on every scan surface
+node scripts/native-bridge-check.mjs    # the Android bridge, without an Android device
 
 # and against a brand-new empty shop:
 npm run reset && npm start
@@ -697,19 +717,32 @@ unbinding returns the unit to the queue.
 
 `scripts/sweep-check.mjs` drives the handheld screen in a real browser with a 300-read
 stream and asserts what reaches the server — it is what caught reads being stranded in the
-send queue at the end of a sweep.
+send queue at the end of a sweep, and later caught the V5 scan hook buffering a read in two
+places at once and emitting only its last character.
 
-`scripts/check-refs.mjs` runs as part of `npm run build` and catches an undefined component
-reference — writing `icon: Tag` when only `Tags` was imported. That is not a syntax error,
-not a bundler error, and builds perfectly; it fails at runtime and, in a shared layout,
-white-screens the whole app.
+`scripts/native-bridge-check.mjs` stands a fake Capacitor plugin in front of the app — the
+same method names and event shapes `RfidPlugin.java` sends — and drives the till, the stock
+take and the diagnostics through it. It proves the app detects the reader, that pressing
+Sweep actually calls through to the radio rather than only flipping a label, that a
+broadcast tag reaches the cart with no field focused and no Enter key anywhere, that
+re-reads do not double-add, and that leaving a screen releases the radio instead of leaking
+a listener. It cannot prove the Java compiles or that `com.seuic.uhftool` answers — only a
+device can.
 
-`scripts/empty-state-check.mjs` walks all 44 screens on a database holding nothing but the
+`scripts/check-refs.mjs` runs as part of `npm run build` and catches two bugs that build
+perfectly and crash at runtime. The first is an undefined component reference — writing
+`icon: Tag` when only `Tags` was imported. The second is its twin, found while building
+V5: a component calling `feature(...)` without destructuring `feature` from `useAuth()`.
+In a shared layout either one white-screens the whole app. The hook check is scoped per
+component rather than per file, because a sibling component in the same file that *does*
+destructure it is exactly what let the bug through the first time.
+
+`scripts/empty-state-check.mjs` walks all 49 screens on a database holding nothing but the
 bootstrap skeleton. Every screen in this system was built against a database full of
 history; a real first day has none, and an empty array is the classic way a fresh install
 greets its owner with a crash.
 
-The UI pass visits all 54 screens and sub-tabs at desktop and phone widths, completes a real sale,
+The UI pass visits all 60 screens and sub-tabs at desktop and phone widths, completes a real sale,
 opens every sidebar group, **follows every sidebar link and fails if any of them falls through to
 the catch-all redirect** — the classic symptom of a menu rewritten ahead of its pages — checks the
 calculator and the export menu open, and fails on any console error, failed request, blank screen or

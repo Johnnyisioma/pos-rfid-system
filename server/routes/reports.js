@@ -675,6 +675,87 @@ r.get('/stock-adjustments', h(async (req, res) => {
 }));
 
 /* ---------------- generic export ---------------- */
+/**
+ * Deadstock ageing.
+ *
+ * Not "what is not selling" — that is a sales report and every system has one.
+ * This is "what money is sitting on the shelf, and for how long", which is the
+ * question that decides whether to discount, transfer, or stop reordering.
+ *
+ * Age is measured from when each individual unit was received, which is only
+ * possible because there is a row per unit: a variant restocked every month
+ * would otherwise look young forever, while the three pairs from January sit
+ * there unnoticed.
+ */
+r.get('/deadstock', h(async (req, res) => {
+  const locationId = req.query.location_id === 'all'
+    ? null : int(req.query.location_id, req.locationId);
+  const minDays = Math.max(0, int(req.query.min_days, 60));
+
+  const rows = await many(
+    `SELECT p.id AS product_id, p.name AS product_name, v.id AS variant_id, v.sku,
+            v.size, v.color, l.name AS location_name, l.id AS location_id,
+            COUNT(*)::int                       AS units,
+            COALESCE(SUM(d.cost_price),0)       AS tied_up,
+            MIN(d.received_at)                  AS oldest_received,
+            MAX(d.days_held)                    AS max_days,
+            ROUND(AVG(d.days_held))::int        AS avg_days,
+            MAX(d.last_seen_at)                 AS last_seen,
+            (SELECT MAX(s.created_at) FROM sale_items si
+               JOIN sales s ON s.id=si.sale_id
+              WHERE si.variant_id = v.id
+                AND s.status IN ('completed','partially_refunded')) AS last_sold_at
+       FROM deadstock_units d
+       JOIN product_variants v ON v.id=d.variant_id
+       JOIN products p ON p.id=v.product_id
+       LEFT JOIN locations l ON l.id=d.location_id
+      WHERE d.days_held >= $1
+        AND ($2::int IS NULL OR d.location_id = $2)
+      GROUP BY p.id, p.name, v.id, v.sku, v.size, v.color, l.name, l.id
+      ORDER BY tied_up DESC, max_days DESC
+      LIMIT 500`, [minDays, locationId]);
+
+  // Buckets, because "₦1.4m is older than six months" is the sentence that
+  // makes somebody act, and a 500-row table is not.
+  const buckets = [
+    { key: '0-30',   label: 'Under a month', from: 0,   to: 30 },
+    { key: '31-60',  label: '1–2 months',    from: 31,  to: 60 },
+    { key: '61-90',  label: '2–3 months',    from: 61,  to: 90 },
+    { key: '91-180', label: '3–6 months',    from: 91,  to: 180 },
+    { key: '181-365', label: '6–12 months',  from: 181, to: 365 },
+    { key: '365+',   label: 'Over a year',   from: 366, to: 100000 },
+  ];
+  const ageing = await many(
+    `SELECT CASE
+              WHEN d.days_held <= 30  THEN '0-30'
+              WHEN d.days_held <= 60  THEN '31-60'
+              WHEN d.days_held <= 90  THEN '61-90'
+              WHEN d.days_held <= 180 THEN '91-180'
+              WHEN d.days_held <= 365 THEN '181-365'
+              ELSE '365+' END          AS bucket,
+            COUNT(*)::int              AS units,
+            COALESCE(SUM(d.cost_price),0) AS tied_up
+       FROM deadstock_units d
+      WHERE ($1::int IS NULL OR d.location_id = $1)
+      GROUP BY bucket`, [locationId]);
+  const byBucket = Object.fromEntries(ageing.map((a) => [a.bucket, a]));
+
+  const totals = await one(
+    `SELECT COUNT(*)::int AS units, COALESCE(SUM(cost_price),0) AS tied_up
+       FROM deadstock_units WHERE ($1::int IS NULL OR location_id = $1)`, [locationId]);
+
+  res.json({
+    min_days: minDays,
+    rows,
+    totals,
+    ageing: buckets.map((b) => ({
+      ...b,
+      units: byBucket[b.key]?.units || 0,
+      tied_up: Number(byBucket[b.key]?.tied_up || 0),
+    })),
+  });
+}));
+
 r.get('/export/:report', h(async (req, res) => {
   const report = str(req.params.report);
   const format = str(req.query.format, 'xlsx');

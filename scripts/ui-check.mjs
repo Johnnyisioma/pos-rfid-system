@@ -70,6 +70,14 @@ const PAGES = [
   ['expenses-new', '/expenses?new=1'],
 
   ['stock-take-mode', '/stock-take-mode'],
+
+  // --- v5 ---
+  ['quarantine', '/rfid/quarantine'],
+  ['quarantine-all', '/rfid/quarantine?tab=all'],
+  ['commissions', '/commissions'],
+  ['commission-rules', '/commissions?tab=rules'],
+  ['reports-deadstock', '/reports?tab=deadstock'],
+  ['settings-features', '/settings?tab=features'],
 ];
 
 const IGNORE = [
@@ -247,6 +255,62 @@ async function run() {
     await page.keyboard.press('Escape');
   } else {
     problems.push({ page: 'export-toolbar', kind: 'flow', text: 'No export button on the sales list' });
+  }
+
+  /* --- the price cascade on the product editor ---
+     Forty sizes of the same shoe are usually the same price. The awkward part
+     is the one size that genuinely is not, so this checks both halves: that
+     the bar sets every row, and that it leaves a row somebody priced
+     differently alone when asked to. */
+  currentLabel = 'variant-cascade';
+  const editableId = await page.evaluate(async () => {
+    const t = localStorage.getItem('pos.token');
+    const l = localStorage.getItem('pos.location');
+    const r = await fetch('/api/products?limit=20', {
+      headers: { Authorization: `Bearer ${t}`, 'X-Location-Id': l } }).then((x) => x.json());
+    const pick = (r.data || []).find((x) => Number(x.variant_count) > 3) || (r.data || [])[0];
+    return pick?.id || null;
+  });
+  if (editableId) {
+    await page.goto(`${BASE}/products/${editableId}`, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(900);
+
+    const cascade = page.locator('.bg-slate-50 input[type=number]');
+    const rowPrices = () => page.evaluate(() =>
+      [...document.querySelectorAll('td input[type=number]')]
+        .map((e) => e.value).filter((_, i) => i % 2 === 1));
+
+    if (await cascade.count() < 2) {
+      problems.push({ page: 'variant-cascade', kind: 'flow', text: 'No price-for-all bar on the variants table' });
+    } else {
+      await cascade.nth(1).fill('5000');
+      await page.click('button:has-text("Apply to")');
+      await page.waitForTimeout(400);
+      const flat = await rowPrices();
+      if (new Set(flat).size !== 1 || flat[0] !== '5000') {
+        problems.push({ page: 'variant-cascade', kind: 'flow',
+          text: `Apply-to-all left ${new Set(flat).size} different prices` });
+      }
+
+      // One row priced differently is now an exception worth protecting.
+      await page.locator('td input[type=number]').nth(1).fill('7777');
+      await page.waitForTimeout(250);
+      await cascade.nth(1).fill('9999');
+      await page.waitForTimeout(250);
+      await page.click('button:has-text("Apply to")');
+      await page.waitForTimeout(400);
+      const kept = await rowPrices();
+      if (!kept.includes('7777')) {
+        problems.push({ page: 'variant-cascade', kind: 'flow',
+          text: 'The row priced differently was flattened instead of left alone' });
+      }
+      if (kept.filter((v) => v === '9999').length !== kept.length - 1) {
+        problems.push({ page: 'variant-cascade', kind: 'flow',
+          text: 'Apply-to-all did not set the remaining rows' });
+      }
+      if (wantShots) await page.screenshot({ path: path.join(SHOT_DIR, '95-variant-cascade.png') });
+    }
+    // Leave without saving — this pass must not rewrite the shop's prices.
   }
 
   // --- mobile viewport pass ---

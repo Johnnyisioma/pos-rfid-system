@@ -1,6 +1,9 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Plus, ArrowLeftRight, Truck, PackageCheck, Trash2, Radio } from 'lucide-react';
+import {
+  Plus, ArrowLeftRight, Truck, PackageCheck, Trash2, Radio, ScanLine, Square,
+  AlertTriangle, CheckCircle2, X,
+} from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, dateTime, variantLabel } from '../lib/format.js';
 import {
@@ -9,6 +12,7 @@ import {
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
 import VariantPicker from '../components/VariantPicker.jsx';
+import { useRfidScan } from '../lib/useRfidScan.jsx';
 
 export default function Transfers() {
   const { can, locationId, locations } = useAuth();
@@ -17,6 +21,7 @@ export default function Transfers() {
   const [status, setStatus] = useState('');
   const [page, setPage] = useState(1);
   const [creating, setCreating] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [open, setOpen] = useState(null);
 
   const load = useCallback(async () => {
@@ -38,9 +43,14 @@ export default function Transfers() {
       <PageHeader title="Stock transfers"
         subtitle="Move stock between branches with an in-transit stage and a receive confirmation"
         actions={can('transfers.write') && locations.length > 1 && (
-          <button className="btn-primary" onClick={() => setCreating(true)}>
-            <Plus size={16} /> New transfer
-          </button>
+          <>
+            <button className="btn-secondary" onClick={() => setScanning(true)}>
+              <ScanLine size={16} /> Scan a box
+            </button>
+            <button className="btn-primary" onClick={() => setCreating(true)}>
+              <Plus size={16} /> New transfer
+            </button>
+          </>
         )} />
 
       <Card bodyClass="p-0">
@@ -85,6 +95,8 @@ export default function Transfers() {
 
       <TransferEditor open={creating} onClose={() => setCreating(false)}
         onDone={() => { setCreating(false); load(); }} />
+      <ScanToSend open={scanning} onClose={() => setScanning(false)}
+        onDone={(t) => { setScanning(false); load(); setOpen(t.id); }} />
       {open && <TransferDetail id={open} onClose={() => setOpen(null)} onChanged={load} />}
     </>
   );
@@ -183,11 +195,241 @@ function TransferEditor({ open, onClose, onDone }) {
   );
 }
 
+/**
+ * Send a box by reading it.
+ *
+ * The manifest is built from what the reader hears, so it cannot disagree with
+ * what is physically in the box — which is the failure mode of every
+ * pick-from-a-list transfer: the list says six, the box holds five, and nobody
+ * finds out until the other branch counts it a week later.
+ */
+function ScanToSend({ open, onClose, onDone }) {
+  const toast = useToast();
+  const { locations, locationId } = useAuth();
+  const [to, setTo] = useState('');
+  const [codes, setCodes] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const add = useCallback((code) => {
+    setCodes((c) => (c.includes(code) ? c : [...c, code]));
+    if (navigator.vibrate) navigator.vibrate(25);
+  }, []);
+
+  const scan = useRfidScan(add, { dedupeMs: 3000, tagsOnly: true, enabled: open });
+
+  useEffect(() => { if (open) { setCodes([]); setResult(null); setTo(''); } }, [open]);
+
+  const send = async () => {
+    setBusy(true);
+    try {
+      const t = await api.post('/api/transfers/from-scan', {
+        from_location_id: locationId, to_location_id: Number(to), codes });
+      setResult(t.summary);
+      toast.success(`${t.ref} dispatched — ${t.summary.sent} unit(s) on their way`);
+      // Anything the reader picked up that could not be sent is worth looking
+      // at before the box is taped shut, so hold the modal open when there is
+      // something to report.
+      if (!t.summary.rejected.length && !t.summary.unknown_tags.length) onDone(t);
+      else setCodes([]);
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} size="lg" title="Scan a box out"
+      subtitle="Read everything going into the box — the manifest is what the reader hears"
+      footer={
+        <>
+          <span className="mr-auto text-sm text-slate-500">
+            {num(codes.length)} tag(s) read
+          </span>
+          <button className="btn-secondary" onClick={() => setCodes([])} disabled={!codes.length}>
+            Clear
+          </button>
+          <button className="btn-primary" onClick={send} disabled={busy || !codes.length || !to}>
+            {busy ? <Spinner /> : <Truck size={16} />} Dispatch to branch
+          </button>
+        </>
+      }>
+      <scan.CaptureField />
+
+      <div className="grid sm:grid-cols-2 gap-3 mb-4">
+        <Field label="Send to">
+          <select className="input" value={to} onChange={(e) => setTo(e.target.value)}>
+            <option value="">Choose a branch…</option>
+            {locations.filter((l) => l.id !== locationId).map((l) =>
+              <option key={l.id} value={l.id}>{l.name}</option>)}
+          </select>
+        </Field>
+        {scan.native && (
+          <Field label="Reader">
+            <button onClick={scan.toggle} className={scan.scanning ? 'btn-danger w-full' : 'btn-secondary w-full'}>
+              {scan.scanning ? <><Square size={16} /> Stop reading</> : <><Radio size={16} /> Read continuously</>}
+            </button>
+          </Field>
+        )}
+      </div>
+
+      {result && (
+        <div className="space-y-2 mb-4">
+          {result.rejected.map((x, i) => (
+            <div key={i} className="rounded-lg bg-amber-50 ring-1 ring-amber-200 p-3 text-sm flex gap-2">
+              <AlertTriangle size={16} className="text-amber-600 shrink-0 mt-0.5" />
+              <span className="text-amber-900"><strong>{x.product_name}</strong> — {x.note}</span>
+            </div>
+          ))}
+          {result.unknown_tags.length > 0 && (
+            <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 p-3 text-sm flex gap-2">
+              <AlertTriangle size={16} className="text-rose-600 shrink-0 mt-0.5" />
+              <span className="text-rose-900">
+                {result.unknown_tags.length} tag(s) are not in the system at all. Tag that stock
+                before sending it, or it will arrive as a surprise at the other end.
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {codes.length === 0 ? (
+        <Empty title="Nothing read yet" icon={Radio}
+          hint={scan.native
+            ? 'Press Read continuously, or pull the trigger, and sweep the box.'
+            : 'Pull the trigger on the handheld and sweep the box.'} />
+      ) : (
+        <div className="table-wrap max-h-72 overflow-y-auto">
+          <table className="data">
+            <thead><tr><th>#</th><th>Tag</th><th /></tr></thead>
+            <tbody>
+              {codes.map((c, i) => (
+                <tr key={c}>
+                  <td className="text-slate-400">{i + 1}</td>
+                  <td className="font-mono text-xs">{c}</td>
+                  <td className="text-right">
+                    <button className="btn-ghost text-rose-600 text-xs"
+                      onClick={() => setCodes((x) => x.filter((y) => y !== c))}>
+                      <X size={14} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/**
+ * Receive a box by reading it.
+ *
+ * This is where per-unit tags pay for themselves: a quantity receive can only
+ * confirm the count matched, while this confirms the contents did, and names
+ * anything on the manifest that did not turn up.
+ */
+function ScanToReceive({ open, transfer, onClose, onDone }) {
+  const toast = useToast();
+  const [codes, setCodes] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [summary, setSummary] = useState(null);
+
+  const add = useCallback((code) => {
+    setCodes((c) => (c.includes(code) ? c : [...c, code]));
+    if (navigator.vibrate) navigator.vibrate(25);
+  }, []);
+  const scan = useRfidScan(add, { dedupeMs: 3000, tagsOnly: true, enabled: open });
+
+  useEffect(() => { if (open) { setCodes([]); setSummary(null); } }, [open]);
+
+  const receive = async () => {
+    setBusy(true);
+    try {
+      const t = await api.post(`/api/transfers/${transfer.id}/receive`, { codes });
+      setSummary(t.summary);
+      toast.success(`${t.summary.received} unit(s) received into stock`);
+      onDone(t);
+      setCodes([]);
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const expected = (transfer.units || []).filter((u) => !u.received).length;
+
+  return (
+    <Modal open={open} onClose={onClose} size="lg" title={`Scan in ${transfer.ref}`}
+      subtitle={`${expected} unit(s) still expected from ${transfer.from_location_name}`}
+      footer={
+        <>
+          <span className="mr-auto text-sm text-slate-500">{num(codes.length)} tag(s) read</span>
+          <button className="btn-primary" onClick={receive} disabled={busy || !codes.length}>
+            {busy ? <Spinner /> : <PackageCheck size={16} />} Receive what was scanned
+          </button>
+        </>
+      }>
+      <scan.CaptureField />
+
+      {scan.native && (
+        <button onClick={scan.toggle}
+          className={`${scan.scanning ? 'btn-danger' : 'btn-secondary'} w-full mb-4`}>
+          {scan.scanning ? <><Square size={16} /> Stop reading</> : <><Radio size={16} /> Read continuously</>}
+        </button>
+      )}
+
+      {summary ? (
+        <div className="space-y-2">
+          <div className="rounded-lg bg-emerald-50 ring-1 ring-emerald-200 p-3 text-sm flex gap-2">
+            <CheckCircle2 size={16} className="text-emerald-600 shrink-0 mt-0.5" />
+            <span className="text-emerald-900">
+              {summary.received} unit(s) landed in stock here.
+            </span>
+          </div>
+          {summary.missing.length > 0 && (
+            <div className="rounded-lg bg-rose-50 ring-1 ring-rose-200 p-3 text-sm">
+              <p className="font-medium text-rose-900 flex items-center gap-2">
+                <AlertTriangle size={16} /> {summary.missing.length} unit(s) on the manifest were not in the box
+              </p>
+              <ul className="mt-2 space-y-0.5 text-rose-800 text-xs">
+                {summary.missing.slice(0, 20).map((m) => (
+                  <li key={m.id}>
+                    {m.product_name} {[m.size, m.color].filter(Boolean).join(' / ')}
+                    <span className="font-mono text-rose-600"> · {m.epc_readable}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="text-xs text-rose-700 mt-2">
+                They stay in transit until they turn up, so neither branch counts them as stock.
+              </p>
+            </div>
+          )}
+          {summary.not_on_this_transfer.length > 0 && (
+            <div className="rounded-lg bg-amber-50 ring-1 ring-amber-200 p-3 text-sm text-amber-900">
+              {summary.not_on_this_transfer.length} unit(s) in the box are not on this transfer.
+            </div>
+          )}
+          {summary.unknown_tags.length > 0 && (
+            <div className="rounded-lg bg-slate-50 ring-1 ring-slate-200 p-3 text-sm text-slate-700">
+              {summary.unknown_tags.length} tag(s) are not in the system at all.
+            </div>
+          )}
+        </div>
+      ) : codes.length === 0 ? (
+        <Empty title="Nothing read yet" icon={Radio} hint="Sweep the box as you unpack it." />
+      ) : (
+        <p className="text-sm text-slate-600">
+          {num(codes.length)} tag(s) read so far. Receive when the box is empty.
+        </p>
+      )}
+    </Modal>
+  );
+}
+
 function TransferDetail({ id, onClose, onChanged }) {
   const toast = useToast();
   const { can, locationId } = useAuth();
   const [t, setT] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [receiveScan, setReceiveScan] = useState(false);
 
   const load = useCallback(() => api.get(`/api/transfers/${id}`).then(setT).catch((e) => toast.error(e.message)), [id]); // eslint-disable-line
   useEffect(() => { load(); }, [load]);
@@ -222,9 +464,14 @@ function TransferDetail({ id, onClose, onChanged }) {
               onConfirm={() => act('cancel')}>Cancel transfer</ConfirmButton>
           )}
           {canReceive && (
-            <button className="btn-primary" onClick={() => act('receive')} disabled={busy}>
-              {busy ? <Spinner /> : <PackageCheck size={16} />} Confirm receipt
-            </button>
+            <>
+              <button className="btn-secondary" onClick={() => setReceiveScan(true)} disabled={busy}>
+                <ScanLine size={16} /> Scan the box in
+              </button>
+              <button className="btn-primary" onClick={() => act('receive')} disabled={busy}>
+                {busy ? <Spinner /> : <PackageCheck size={16} />} Confirm receipt
+              </button>
+            </>
           )}
         </>
       }>
@@ -272,6 +519,11 @@ function TransferDetail({ id, onClose, onChanged }) {
         </div>
       )}
       {t.notes && <p className="text-xs text-slate-500 mt-3">{t.notes}</p>}
+
+      {receiveScan && (
+        <ScanToReceive open transfer={t} onClose={() => setReceiveScan(false)}
+          onDone={(next) => { setT({ ...t, ...next }); onChanged?.(); }} />
+      )}
     </Modal>
   );
 }

@@ -668,3 +668,343 @@ SELECT 'cash', id FROM payment_accounts
  WHERE type = 'cash' AND is_default
    AND NOT EXISTS (SELECT 1 FROM payment_method_accounts)
  ORDER BY id LIMIT 1;
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  VERSION 5
+--
+--  The V5 specification was written as SQLite DDL (TEXT primary keys, REAL,
+--  DATETIME, BOOLEAN DEFAULT 0) against a blank database. This system is
+--  PostgreSQL 16 with integer keys, NUMERIC(14,2) money and TIMESTAMPTZ, and
+--  it is already holding a shop's real sales, transfers and stock counts.
+--
+--  Running that DDL literally would have dropped every foreign key and taken
+--  the data with it. So V5 is mapped onto what is here instead:
+--
+--    spec table        what it actually is here
+--    ──────────────    ───────────────────────────────────────────────────
+--    rfid_tags         stock_units — already one row per physical item, with
+--                      sales history, transfers and stock-take scans hanging
+--                      off it. Exposed below as a VIEW under the spec's name.
+--    register_shifts   register_sessions, extended with the blind-count and
+--                      X/Z-report columns. Also exposed as a VIEW.
+--    locations         already exists, SERIAL not TEXT
+--    products          already exists, with product_variants beneath it
+--
+--  Everything genuinely new gets a real table. Every statement is idempotent,
+--  so this file stays safe to run on every boot.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ---------- the licence-plate model ----------
+-- An EPC is a licence plate: it identifies ONE physical item and says nothing
+-- about what that item is. Everything else is looked up from it. These columns
+-- record where a plate came from, because a factory-encoded 128-bit tag and one
+-- this system minted behave differently when reprinting or auditing.
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS epc_bits      INT;
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS minted_by_us  BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS tag_source    TEXT NOT NULL DEFAULT 'minted'
+  CHECK (tag_source IN ('minted','factory','manual','imported'));
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS paired_at     TIMESTAMPTZ;
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS paired_by     INT REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS quarantine_reason TEXT;
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS held_for_sale_id BIGINT;
+UPDATE stock_units SET epc_bits = length(epc) * 4 WHERE epc_bits IS NULL;
+
+-- A unit can now sit in quarantine awaiting a decision, or be held for a
+-- customer at another branch, without leaving stock or being counted as sold.
+ALTER TABLE stock_units DROP CONSTRAINT IF EXISTS stock_units_status_check;
+ALTER TABLE stock_units ADD CONSTRAINT stock_units_status_check
+  CHECK (status IN ('in_stock','sold','in_transit','damaged','lost','returned',
+                    'reserved','returned_supplier','quarantined','held'));
+
+-- Every plate ever seen, including ones that turned up on a sweep and belong to
+-- nothing. Reading an unknown tag is information, not an error.
+CREATE TABLE IF NOT EXISTS tag_sightings (
+  id           BIGSERIAL PRIMARY KEY,
+  epc          TEXT NOT NULL,
+  unit_id      BIGINT REFERENCES stock_units(id) ON DELETE SET NULL,
+  location_id  INT REFERENCES locations(id) ON DELETE SET NULL,
+  device_id    INT REFERENCES devices(id) ON DELETE SET NULL,
+  context      TEXT NOT NULL DEFAULT 'sweep',   -- sweep|checkout|transfer|stock_take|provision|lookup
+  rssi         INT,
+  user_id      INT REFERENCES users(id) ON DELETE SET NULL,
+  seen_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sightings_epc  ON tag_sightings(epc);
+CREATE INDEX IF NOT EXISTS idx_sightings_seen ON tag_sightings(seen_at DESC);
+
+-- A provisioning run: "I am about to pair 40 blank labels to this variant."
+CREATE TABLE IF NOT EXISTS tag_batches (
+  id          SERIAL PRIMARY KEY,
+  ref         TEXT NOT NULL UNIQUE,
+  variant_id  INT REFERENCES product_variants(id) ON DELETE SET NULL,
+  location_id INT REFERENCES locations(id) ON DELETE SET NULL,
+  mode        TEXT NOT NULL DEFAULT 'pair' CHECK (mode IN ('pair','mint','import')),
+  planned     INT NOT NULL DEFAULT 0,
+  provisioned INT NOT NULL DEFAULT 0,
+  status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed','cancelled')),
+  notes       TEXT DEFAULT '',
+  created_by  INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at   TIMESTAMPTZ
+);
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS tag_batch_id INT REFERENCES tag_batches(id) ON DELETE SET NULL;
+
+-- The spec's rfid_tags table, as a view. Anything written against the spec's
+-- names keeps working; there is still exactly one row per physical item.
+CREATE OR REPLACE VIEW rfid_tags AS
+  SELECT u.epc              AS epc,
+         u.id               AS unit_id,
+         u.variant_id       AS variant_id,
+         u.location_id      AS location_id,
+         u.status           AS status,
+         u.epc_readable     AS license_plate,
+         u.epc_bits         AS bits,
+         u.tag_source       AS source,
+         u.minted_by_us     AS minted_by_us,
+         u.cost_price       AS cost_price,
+         u.received_at      AS received_at,
+         u.last_seen_at     AS last_seen_at,
+         u.sold_at          AS sold_at,
+         u.sale_id          AS sale_id
+    FROM stock_units u;
+
+-- ---------- shifts: blind cash-out, X and Z reports ----------
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS blind_count      BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS counted_at       TIMESTAMPTZ;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS counted_by       INT REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS denominations    JSONB;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS variance_reason  TEXT;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS approved_by      INT REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS approved_at      TIMESTAMPTZ;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS z_number         BIGINT;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS cash_in          NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE register_sessions ADD COLUMN IF NOT EXISTS cash_out         NUMERIC(14,2) NOT NULL DEFAULT 0;
+
+CREATE OR REPLACE VIEW register_shifts AS
+  SELECT s.id, s.register_id, s.location_id, s.user_id, s.status,
+         s.opening_cash, s.counted_cash, s.expected_cash, s.difference,
+         s.blind_count, s.z_number, s.opened_at, s.closed_at
+    FROM register_sessions s;
+
+-- Cash movements that are not sales: a float top-up, a payout, a drop to safe.
+CREATE TABLE IF NOT EXISTS register_cash_movements (
+  id          BIGSERIAL PRIMARY KEY,
+  session_id  INT NOT NULL REFERENCES register_sessions(id) ON DELETE CASCADE,
+  direction   TEXT NOT NULL CHECK (direction IN ('in','out')),
+  amount      NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+  reason      TEXT NOT NULL DEFAULT '',
+  user_id     INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- An X report is a snapshot taken mid-shift; a Z report is the one at close.
+-- Both are stored because "what did the till say at 4pm" is a question that
+-- gets asked after the fact, and a re-computed answer is not the same answer.
+CREATE TABLE IF NOT EXISTS register_reports (
+  id          BIGSERIAL PRIMARY KEY,
+  session_id  INT NOT NULL REFERENCES register_sessions(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL CHECK (kind IN ('X','Z')),
+  seq         BIGINT,
+  payload     JSONB NOT NULL,
+  user_id     INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reg_reports_session ON register_reports(session_id, created_at DESC);
+
+-- ---------- granular permissions ----------
+-- Roles stay as presets. These are the exceptions on top of them, which is how
+-- a real shop works: the senior cashier may void a sale, the junior may not,
+-- and neither of them is a manager.
+CREATE TABLE IF NOT EXISTS user_permissions (
+  user_id    INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  permission TEXT NOT NULL,
+  effect     TEXT NOT NULL DEFAULT 'grant' CHECK (effect IN ('grant','deny')),
+  granted_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, permission)
+);
+
+-- Whole areas a shop simply does not use. Off here means gone from the menu,
+-- not greyed out, and the API refuses it too.
+CREATE TABLE IF NOT EXISTS feature_flags (
+  id          SERIAL PRIMARY KEY,
+  key         TEXT NOT NULL,
+  enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+  location_id INT REFERENCES locations(id) ON DELETE CASCADE,
+  updated_by  INT REFERENCES users(id) ON DELETE SET NULL,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- An earlier shape of this table made `key` the primary key, which allowed
+-- exactly one row per feature and therefore no per-branch exceptions. Move it
+-- across if that is what is in the database.
+ALTER TABLE feature_flags ADD COLUMN IF NOT EXISTS id SERIAL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conname = 'feature_flags_pkey'
+       AND conrelid = 'feature_flags'::regclass
+       AND (SELECT array_agg(attname::text ORDER BY attname) FROM pg_attribute
+             WHERE attrelid = conrelid AND attnum = ANY(conkey)) = ARRAY['key']::text[]
+  ) THEN
+    ALTER TABLE feature_flags DROP CONSTRAINT feature_flags_pkey;
+    ALTER TABLE feature_flags ADD PRIMARY KEY (id);
+  END IF;
+END $$;
+
+-- One row per key business-wide, and at most one per key per branch. A plain
+-- UNIQUE(key, location_id) would not do it: in SQL two NULLs are not equal, so
+-- the business-wide row could be inserted over and over.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_feature_flags_scope
+  ON feature_flags (key, COALESCE(location_id, 0));
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_sales_rep   BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_hash       TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active      BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- ---------- sales-rep commission ----------
+CREATE TABLE IF NOT EXISTS commission_rules (
+  id          SERIAL PRIMARY KEY,
+  name        TEXT NOT NULL,
+  scope       TEXT NOT NULL DEFAULT 'all' CHECK (scope IN ('all','category','brand','product')),
+  scope_id    INT,
+  basis       TEXT NOT NULL DEFAULT 'revenue' CHECK (basis IN ('revenue','profit','unit')),
+  rate        NUMERIC(8,3) NOT NULL DEFAULT 0,   -- percent, or naira per unit when basis='unit'
+  user_id     INT REFERENCES users(id) ON DELETE CASCADE,  -- NULL = applies to every rep
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per earning or clawback. A return does not edit the original row;
+-- it writes a negative one, so the ledger explains itself.
+CREATE TABLE IF NOT EXISTS commission_entries (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sale_id     BIGINT REFERENCES sales(id) ON DELETE SET NULL,
+  return_id   BIGINT REFERENCES sale_returns(id) ON DELETE SET NULL,
+  rule_id     INT REFERENCES commission_rules(id) ON DELETE SET NULL,
+  basis_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  amount      NUMERIC(14,2) NOT NULL DEFAULT 0,   -- negative on a clawback
+  kind        TEXT NOT NULL DEFAULT 'earned' CHECK (kind IN ('earned','clawback','adjustment','paid')),
+  period      DATE,
+  note        TEXT DEFAULT '',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_commission_user ON commission_entries(user_id, created_at DESC);
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_rep_id INT REFERENCES users(id) ON DELETE SET NULL;
+
+-- ---------- customer credit and layaway ----------
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS credit_limit   NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS credit_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS whatsapp       TEXT;
+
+CREATE TABLE IF NOT EXISTS layaway_plans (
+  id           SERIAL PRIMARY KEY,
+  sale_id      BIGINT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  customer_id  INT REFERENCES customers(id) ON DELETE SET NULL,
+  deposit      NUMERIC(14,2) NOT NULL DEFAULT 0,
+  instalments  INT NOT NULL DEFAULT 1,
+  every_days   INT NOT NULL DEFAULT 30,
+  due_date     DATE,
+  status       TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','cancelled','defaulted')),
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS layaway_instalments (
+  id         SERIAL PRIMARY KEY,
+  plan_id    INT NOT NULL REFERENCES layaway_plans(id) ON DELETE CASCADE,
+  seq        INT NOT NULL,
+  due_date   DATE NOT NULL,
+  amount     NUMERIC(14,2) NOT NULL,
+  paid_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+  paid_at    TIMESTAMPTZ,
+  UNIQUE (plan_id, seq)
+);
+
+-- ---------- cross-branch holds ----------
+-- "They have it at Ikeja" is only useful if you can stop someone else selling
+-- it in the four hours it takes to get there.
+CREATE TABLE IF NOT EXISTS stock_holds (
+  id          SERIAL PRIMARY KEY,
+  ref         TEXT NOT NULL UNIQUE,
+  variant_id  INT NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+  unit_id     BIGINT REFERENCES stock_units(id) ON DELETE SET NULL,
+  location_id INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  quantity    NUMERIC(14,3) NOT NULL DEFAULT 1,
+  customer_id INT REFERENCES customers(id) ON DELETE SET NULL,
+  for_location_id INT REFERENCES locations(id) ON DELETE SET NULL,
+  status      TEXT NOT NULL DEFAULT 'active'
+              CHECK (status IN ('active','collected','released','expired','transferred')),
+  note        TEXT DEFAULT '',
+  expires_at  TIMESTAMPTZ,
+  created_by  INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_holds_variant ON stock_holds(variant_id, status);
+
+-- ---------- quarantine / return to vendor ----------
+CREATE TABLE IF NOT EXISTS quarantine_items (
+  id          BIGSERIAL PRIMARY KEY,
+  unit_id     BIGINT REFERENCES stock_units(id) ON DELETE SET NULL,
+  variant_id  INT REFERENCES product_variants(id) ON DELETE SET NULL,
+  location_id INT REFERENCES locations(id) ON DELETE SET NULL,
+  reason      TEXT NOT NULL,        -- damaged|wrong_item|customer_return|supplier_fault|other
+  detail      TEXT DEFAULT '',
+  outcome     TEXT NOT NULL DEFAULT 'pending'
+              CHECK (outcome IN ('pending','returned_to_stock','returned_to_vendor','written_off','repaired')),
+  purchase_return_id INT REFERENCES purchase_returns(id) ON DELETE SET NULL,
+  photo_url   TEXT,
+  raised_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  resolved_by INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at TIMESTAMPTZ
+);
+
+-- ---------- digital receipts ----------
+CREATE TABLE IF NOT EXISTS receipt_deliveries (
+  id         BIGSERIAL PRIMARY KEY,
+  sale_id    BIGINT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  channel    TEXT NOT NULL CHECK (channel IN ('whatsapp','sms','email','link','print')),
+  address    TEXT,
+  token      TEXT UNIQUE,
+  status     TEXT NOT NULL DEFAULT 'prepared'
+             CHECK (status IN ('prepared','opened','sent','failed')),
+  opened_at  TIMESTAMPTZ,
+  user_id    INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_deliv_sale ON receipt_deliveries(sale_id);
+
+-- ---------- the Android app ----------
+-- A handheld is a device the shop owns, not a browser session. Recording it
+-- means a stock count can say which gun it came from, and a lost handheld can
+-- be cut off without changing anyone's password.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS platform      TEXT;      -- android|web|printer
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS app_version   TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS android_id    TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_seen_at  TIMESTAMPTZ;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS reader_model  TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS rf_power      INT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS rf_region     TEXT;
+
+-- Defaults for a Nigerian shop: RAIN RFID here is 865.6–867.6 MHz at 2 W ERP
+-- (the ETSI band). The handheld ships configured for FCC 902–928 MHz, which is
+-- someone else's spectrum. This is the value the app pushes to the reader.
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS rfid_region    TEXT NOT NULL DEFAULT 'ETSI_NG';
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS rfid_power     INT  NOT NULL DEFAULT 26;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS whatsapp_number TEXT;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS public_base_url TEXT;
+
+-- ---------- deadstock ----------
+-- Nothing new to store: age is received_at, movement is stock_movements. The
+-- view exists so the report is one query rather than a page of joins.
+CREATE OR REPLACE VIEW deadstock_units AS
+  SELECT u.id, u.epc, u.epc_readable, u.variant_id, u.location_id, u.cost_price,
+         u.received_at,
+         GREATEST(0, DATE_PART('day', now() - u.received_at))::INT AS days_held,
+         u.last_seen_at
+    FROM stock_units u
+   WHERE u.status = 'in_stock';

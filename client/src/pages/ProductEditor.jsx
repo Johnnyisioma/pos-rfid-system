@@ -210,6 +210,9 @@ export default function ProductEditor() {
                 </button>
               </>
             } bodyClass="p-0">
+
+            <CascadeBar variants={variants} setVariants={setVariants} />
+
             <div className="table-wrap">
               <table className="data">
                 <thead>
@@ -420,5 +423,135 @@ function LocationPriceModal({ variant, onClose, locations, currentLocation }) {
         <input type="number" className="input" value={price} onChange={(e) => setPrice(e.target.value)} />
       </Field>
     </Modal>
+  );
+}
+
+/**
+ * Set a price across every variant at once.
+ *
+ * Forty sizes of the same shoe are usually the same price, and typing it forty
+ * times is where people give up and go back to the spreadsheet. The awkward
+ * part is the exceptions — the one size that genuinely does cost more — so
+ * this counts the rows that already disagree and offers to leave those alone
+ * rather than flattening them silently.
+ *
+ * Nothing is written until the form is saved: this only fills the rows on
+ * screen, so a mistake is undone by not pressing Save.
+ */
+function CascadeBar({ variants, setVariants }) {
+  const [cost, setCost] = useState('');
+  const [price, setPrice] = useState('');
+  const [keep, setKeep] = useState(null);      // null = follow the default below
+
+  const distinct = (key) => [...new Set(
+    variants.map((v) => String(v[key] ?? '')).filter((x) => x !== ''))];
+
+  /**
+   * Is there a "usual" value for this column, and what is it?
+   *
+   * Only when the commonest value covers more than half the filled rows. Below
+   * that there is no rule, only twelve different prices — and calling eight of
+   * them "exceptions to protect" would leave the button looking broken,
+   * because pressing it would change almost nothing.
+   */
+  const rule = (key) => {
+    const counts = {};
+    let filled = 0;
+    for (const v of variants) {
+      const k = String(v[key] ?? '');
+      if (k === '') continue;
+      filled += 1;
+      counts[k] = (counts[k] || 0) + 1;
+    }
+    const best = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    if (!best || best[1] <= filled / 2) return null;
+    return { value: best[0], odd: filled - best[1] };
+  };
+
+  const costRule = rule('cost_price');
+  const priceRule = rule('selling_price');
+  const costValues = distinct('cost_price');
+  const priceValues = distinct('selling_price');
+
+  // Only offer to protect exceptions when there is something to protect them
+  // from — a usual price, and rows that disagree with it.
+  const exceptions = (cost !== '' ? (costRule?.odd || 0) : 0)
+    + (price !== '' ? (priceRule?.odd || 0) : 0);
+  const keepOverrides = keep === null ? exceptions > 0 : keep;
+
+  const apply = () => {
+    setVariants((vs) => vs.map((v) => {
+      const next = { ...v };
+      if (cost !== '') {
+        const isException = keepOverrides && costRule
+          && String(v.cost_price ?? '') !== '' && String(v.cost_price) !== costRule.value;
+        if (!isException) next.cost_price = cost;
+      }
+      if (price !== '') {
+        const isException = keepOverrides && priceRule
+          && String(v.selling_price ?? '') !== '' && String(v.selling_price) !== priceRule.value;
+        if (!isException) next.selling_price = price;
+      }
+      return next;
+    }));
+    setCost('');
+    setPrice('');
+    setKeep(null);
+  };
+
+  const willChange = variants.filter((v) => {
+    if (cost !== '') {
+      const ex = keepOverrides && costRule
+        && String(v.cost_price ?? '') !== '' && String(v.cost_price) !== costRule.value;
+      if (!ex) return true;
+    }
+    if (price !== '') {
+      const ex = keepOverrides && priceRule
+        && String(v.selling_price ?? '') !== '' && String(v.selling_price) !== priceRule.value;
+      if (!ex) return true;
+    }
+    return false;
+  }).length;
+
+  return (
+    <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex flex-wrap items-end gap-2">
+      <div>
+        <label className="block text-[11px] uppercase tracking-wide text-slate-500 mb-1">
+          Cost for all
+        </label>
+        <input type="number" className="input py-1 w-28 text-right" value={cost}
+          placeholder={costValues.length === 1 ? costValues[0] : 'mixed'}
+          onChange={(e) => setCost(e.target.value)} />
+      </div>
+      <div>
+        <label className="block text-[11px] uppercase tracking-wide text-slate-500 mb-1">
+          Price for all
+        </label>
+        <input type="number" className="input py-1 w-28 text-right" value={price}
+          placeholder={priceValues.length === 1 ? priceValues[0] : 'mixed'}
+          onChange={(e) => setPrice(e.target.value)} />
+      </div>
+
+      <button className="btn-secondary text-xs" disabled={cost === '' && price === ''}
+        onClick={apply}>
+        Apply to {cost === '' && price === ''
+          ? `${variants.length} variant${variants.length === 1 ? '' : 's'}`
+          : `${willChange} of ${variants.length}`}
+      </button>
+
+      {exceptions > 0 && (
+        <label className="flex items-center gap-1.5 text-xs text-slate-600 ml-1">
+          <input type="checkbox" className="h-3.5 w-3.5 rounded border-slate-300"
+            checked={keepOverrides} onChange={(e) => setKeep(e.target.checked)} />
+          Leave the {exceptions} row{exceptions === 1 ? '' : 's'} priced differently alone
+        </label>
+      )}
+
+      <p className="text-[11px] text-slate-400 w-full">
+        {costValues.length > 1 && priceValues.length > 1 && !costRule && !priceRule
+          ? 'Every row is priced differently, so there is no usual price to protect — this will set all of them.'
+          : 'Nothing is saved until you press Save — this only fills the rows below.'}
+      </p>
+    </div>
   );
 }

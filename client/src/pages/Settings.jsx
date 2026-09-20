@@ -26,6 +26,7 @@ export default function Settings() {
         { value: 'registers', label: 'Registers' },
         { value: 'users', label: 'Staff' },
         { value: 'roles', label: 'Roles & permissions' },
+        { value: 'features', label: 'Features' },
         { value: 'taxes', label: 'Tax rates' },
         { value: 'catalog', label: 'Catalogue options' },
         { value: 'account', label: 'My account' },
@@ -36,6 +37,7 @@ export default function Settings() {
       {tab === 'registers' && <Registers />}
       {tab === 'users' && <Staff />}
       {tab === 'roles' && <RolesMatrix />}
+      {tab === 'features' && <FeatureMatrix />}
       {tab === 'taxes' && <TaxRates />}
       {tab === 'catalog' && <CatalogOptions />}
       {tab === 'account' && <Account />}
@@ -489,6 +491,7 @@ function Staff() {
   const toast = useToast();
   const [rows, setRows] = useState(null);
   const [editing, setEditing] = useState(null);
+  const [permsFor, setPermsFor] = useState(null);
 
   const load = () => api.get('/api/users').then(setRows).catch(() => setRows([]));
   useEffect(() => { load(); }, []);
@@ -531,7 +534,13 @@ function Staff() {
                   <td className="text-xs text-slate-500 whitespace-nowrap">
                     {u.last_login_at ? dateTime(u.last_login_at) : 'never'}
                   </td>
-                  <td className="text-right">
+                  <td className="text-right whitespace-nowrap">
+                    {can('users.write') && (
+                      <button className="btn-ghost text-xs"
+                        onClick={() => setPermsFor(u)}>
+                        Permissions
+                      </button>
+                    )}
                     {can('users.write') && (
                       <button className="btn-ghost text-xs"
                         onClick={() => setEditing({ ...u, location_ids: u.locations.map((l) => l.id) })}>
@@ -546,7 +555,8 @@ function Staff() {
         </div>
       </Card>
 
-      <Card className="mt-4" title="What each role can do">
+      <Card className="mt-4" title="What each role can do"
+        subtitle="Roles are the starting point. Press Permissions on anyone to grant or withhold one thing.">
         <dl className="grid sm:grid-cols-2 gap-3 text-sm">
           {Object.entries(ROLE_NOTES).map(([role, note]) => (
             <div key={role} className="rounded-lg ring-1 ring-slate-200 p-3">
@@ -556,6 +566,10 @@ function Staff() {
           ))}
         </dl>
       </Card>
+
+      {permsFor && (
+        <UserPermissions user={permsFor} onClose={() => setPermsFor(null)} onSaved={load} />
+      )}
 
       {editing && (
         <Modal open onClose={() => setEditing(null)} title={editing.id ? 'Edit staff member' : 'New staff member'}
@@ -1050,5 +1064,194 @@ function RolesMatrix() {
         </div>
       </Card>
     </>
+  );
+}
+
+/* ---------------- per-user permissions ---------------- */
+
+/**
+ * One person's exceptions.
+ *
+ * Each switch has three positions, and the third is the one that matters:
+ *
+ *   Role default  inherit whatever the role says, now and if it changes later
+ *   Allowed       grant this even though the role does not
+ *   Blocked       withhold this even though the role does
+ *
+ * Without "Blocked" the only way to stop one cashier discounting is to stop
+ * every cashier discounting, and the usual outcome of that is that everybody
+ * shares the manager's login.
+ */
+function UserPermissions({ user, onClose, onSaved }) {
+  const toast = useToast();
+  const [data, setData] = useState(null);
+  const [state, setState] = useState({});      // key -> 'grant' | 'deny'
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.get(`/api/users/${user.id}/permissions`)
+      .then((d) => {
+        setData(d);
+        setState(Object.fromEntries(d.overrides.map((o) => [o.permission, o.effect])));
+      })
+      .catch(() => setData({ catalog: [], preset: [], overrides: [] }));
+  }, [user.id]);
+
+  const inRole = (key) => {
+    const preset = data?.preset || [];
+    if (preset.includes('*') || preset.includes(key)) return true;
+    return preset.includes(`${key.split('.')[0]}.*`);
+  };
+
+  const set = (key, value) => setState((s) => {
+    const next = { ...s };
+    if (!value) delete next[key];
+    else next[key] = value;
+    return next;
+  });
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.put(`/api/users/${user.id}/permissions`, {
+        overrides: Object.entries(state).map(([permission, effect]) => ({ permission, effect })),
+      });
+      toast.success(`Permissions saved for ${user.name}`);
+      onSaved?.();
+      onClose();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const changed = Object.keys(state).length;
+
+  return (
+    <Modal open onClose={onClose} size="lg"
+      title={`Permissions — ${user.name}`}
+      subtitle={`${labelize(user.role)} preset, with ${changed} exception${changed === 1 ? '' : 's'}`}
+      footer={
+        <>
+          <button className="btn-secondary mr-auto" onClick={() => setState({})} disabled={!changed}>
+            Back to role defaults
+          </button>
+          <button className="btn-secondary" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={save} disabled={busy}>
+            {busy ? <Spinner /> : null} Save permissions
+          </button>
+        </>
+      }>
+      {!data ? <Loading /> : (
+        <div className="space-y-5 max-h-[60vh] overflow-y-auto pr-1">
+          {data.catalog.map((group) => (
+            <div key={group.group}>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">
+                {group.group}
+              </p>
+              <div className="space-y-1">
+                {group.items.map((item) => {
+                  const current = state[item.key] || '';
+                  const base = inRole(item.key);
+                  const effective = current ? current === 'grant' : base;
+                  return (
+                    <div key={item.key}
+                      className="flex items-center gap-3 py-1.5 px-2 rounded-lg hover:bg-slate-50">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm text-slate-800">
+                          {item.label}
+                          {item.sensitive && (
+                            <span className="ml-1.5 text-[10px] uppercase tracking-wide text-amber-700
+                              bg-amber-100 rounded px-1 py-0.5">care</span>
+                          )}
+                        </p>
+                        <p className="text-[11px] text-slate-400 font-mono">{item.key}</p>
+                      </div>
+                      <span className={`text-[11px] w-14 text-right ${
+                        effective ? 'text-emerald-600' : 'text-slate-400'}`}>
+                        {effective ? 'can' : 'cannot'}
+                      </span>
+                      <select className="input w-36 py-1 text-xs" value={current}
+                        onChange={(e) => set(item.key, e.target.value)}>
+                        <option value="">Role default ({base ? 'can' : 'cannot'})</option>
+                        <option value="grant">Allowed</option>
+                        <option value="deny">Blocked</option>
+                      </select>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/* ---------------- feature matrix ---------------- */
+
+/**
+ * Which parts of the system this shop uses.
+ *
+ * Switched off means gone from the menu and refused by the API — not greyed
+ * out. A one-branch shop looking at a Transfers menu every day is being asked
+ * to ignore something, and people who learn to ignore one thing on a screen
+ * learn to ignore the next one too.
+ */
+function FeatureMatrix() {
+  const toast = useToast();
+  const { can, reloadSettings } = useAuth();
+  const [data, setData] = useState(null);
+  const [values, setValues] = useState({});
+  const [busy, setBusy] = useState(false);
+
+  const load = () => api.get('/api/settings/features')
+    .then((d) => { setData(d); setValues(d.values); })
+    .catch(() => setData({ catalog: [], values: {} }));
+  useEffect(() => { load(); }, []);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.put('/api/settings/features', { values });
+      toast.success('Features updated');
+      await reloadSettings();
+      load();
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  if (!data) return <Loading />;
+  const dirty = data.catalog.some((f) => Boolean(values[f.key]) !== Boolean(data.values[f.key]));
+
+  return (
+    <Card title="Features"
+      subtitle="Turn off what this shop does not use — it disappears from the menu rather than sitting there unused"
+      actions={can('settings.write') && (
+        <button className="btn-primary text-xs" onClick={save} disabled={busy || !dirty}>
+          {busy ? <Spinner /> : null} Save
+        </button>
+      )}>
+      <div className="divide-y divide-slate-100">
+        {data.catalog.map((f) => (
+          <label key={f.key} className="flex items-center gap-3 py-3 cursor-pointer">
+            <input type="checkbox" className="h-4 w-4 rounded border-slate-300"
+              disabled={!can('settings.write')}
+              checked={Boolean(values[f.key])}
+              onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.checked }))} />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm text-slate-800">{f.label}</p>
+              <p className="text-[11px] text-slate-400 font-mono">{f.key}</p>
+            </div>
+            <Badge status={values[f.key] ? 'completed' : 'cancelled'}>
+              {values[f.key] ? 'On' : 'Off'}
+            </Badge>
+          </label>
+        ))}
+      </div>
+      <p className="text-xs text-slate-500 mt-3">
+        Turning something off never deletes anything. The records stay, and switching it back on
+        brings the screens back exactly as they were.
+      </p>
+    </Card>
   );
 }

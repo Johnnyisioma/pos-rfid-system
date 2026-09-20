@@ -78,9 +78,17 @@ async function run() {
 
   r = await api('GET', '/api/products/search?q=oxford');
   ok('POS variant search', Array.isArray(r.body) && r.body.length > 0);
-  ok('search puts sellable stock first',
-    r.body.length < 2 || Number(r.body[0].stock) >= Number(r.body[r.body.length - 1].stock),
-    JSON.stringify(r.body.map((x) => x.stock)));
+  // The query promises "in stock before out of stock", then alphabetical — NOT
+  // descending by quantity. Asserting first >= last was testing something the
+  // search never claimed, and it passed or failed depending on where the seed
+  // happened to put its inventory.
+  {
+    const stocks = r.body.map((x) => Number(x.stock));
+    const firstEmpty = stocks.findIndex((n) => n <= 0);
+    ok('search puts sellable stock before out-of-stock',
+      firstEmpty === -1 || stocks.slice(firstEmpty).every((n) => n <= 0),
+      JSON.stringify(stocks));
+  }
   // Later tests sell this three times over, so it has to be a line with real
   // stock at THIS location — picking row 0 blind makes the suite depend on
   // where the seed happened to land its inventory.
@@ -497,13 +505,76 @@ async function run() {
     headers: { Authorization: `Bearer ${token}`, 'X-Location-Id': String(locationId) } });
   ok('inventory report exports to CSV', res3.status === 200);
 
-  // --- register close ---
+  // --- register: blind count, X report, Z report ---
   r = await api('GET', '/api/registers/sessions/current');
   if (r.body?.id) {
+    const sessionId = r.body.id;
     const expected = Number(r.body.expected_cash);
-    r = await api('POST', `/api/registers/sessions/${r.body.id}/close`, { counted_cash: expected - 500 });
+    ok('an auditor sees the expected cash', Number.isFinite(expected));
+
+    // Cash that is not a sale has to move the expected figure, or every
+    // legitimate payout looks like a shortage.
+    r = await api('POST', `/api/registers/sessions/${sessionId}/cash`,
+      { direction: 'out', amount: 2000, reason: 'Dispatch rider' });
+    ok('a payout is recorded against the shift', r.status === 201);
+    r = await api('POST', `/api/registers/sessions/${sessionId}/cash`, { direction: 'out', amount: 500 });
+    ok('a payout with no reason is refused', r.status === 400);
+
+    r = await api('GET', `/api/registers/sessions/${sessionId}`);
+    ok('the payout moves the expected cash', Number(r.body.expected_cash) === expected - 2000,
+      `${r.body.expected_cash} vs ${expected - 2000}`);
+    const nowExpected = Number(r.body.expected_cash);
+
+    r = await api('POST', `/api/registers/sessions/${sessionId}/x-report`, {});
+    ok('an X report can be cut mid-shift', r.status === 201 && r.body.payload?.expected_cash === nowExpected);
+    r = await api('GET', `/api/registers/sessions/${sessionId}/reports`);
+    ok('the X report is kept', r.body.some?.((x) => x.kind === 'X'));
+
+    // A variance nobody has to explain is a variance nobody looks at.
+    r = await api('POST', `/api/registers/sessions/${sessionId}/close`, { counted_cash: nowExpected - 500 });
+    ok('closing short without a reason is refused', r.status === 400);
+
+    r = await api('POST', `/api/registers/sessions/${sessionId}/close`,
+      { counted_cash: nowExpected - 500, variance_reason: 'Short — investigating' });
     ok('close register with a short count', Number(r.body.difference) === -500, JSON.stringify(r.body).slice(0, 150));
+    ok('closing cuts a Z report', r.body.z_report?.kind === 'Z' && Number(r.body.z_report.seq) > 0);
+    ok('the Z number is on the shift', Number(r.body.z_number) > 0);
   } else ok('close register with a short count', false, 'no open session for this user');
+
+  // --- blind cash-out: a cashier must not be shown the target ---
+  {
+    const adminToken = token;
+    const adminLocation = locationId;
+    r = await api('POST', '/api/auth/login', { email: 'cashier@millzee.test', password: 'password123' });
+    if (r.body?.token) {
+      token = r.body.token;
+      locationId = r.body.locations[0].id;
+      const regs = await api('GET', '/api/registers');
+      const free = (regs.body || []).find((x) => !x.open_session);
+      if (free) {
+        let s = await api('POST', `/api/registers/${free.id}/open`, { opening_cash: 5000 });
+        const sid = s.body?.id;
+        ok('a cashier can open a shift', s.status === 201);
+        s = await api('GET', '/api/registers/sessions/current');
+        ok('the cashier is NOT shown the expected cash', s.body?.expected_cash === undefined,
+          JSON.stringify(s.body?.expected_cash));
+        ok('and is told the count is blind', s.body?.blind === true);
+
+        s = await api('POST', `/api/registers/sessions/${sid}/count`, { counted_cash: 5000 });
+        ok('submitting the count reveals the figure', Number.isFinite(Number(s.body?.expected_cash)));
+
+        s = await api('POST', `/api/registers/sessions/${sid}/x-report`, {});
+        ok('a cashier cannot cut an X report', s.status === 403);
+
+        s = await api('POST', `/api/registers/sessions/${sid}/close`, { counted_cash: 5000 });
+        ok('the cashier can still close their own shift', s.status === 200);
+      } else {
+        ok('a cashier can open a shift', false, 'no free register');
+      }
+    }
+    token = adminToken;
+    locationId = adminLocation;
+  }
 
   // --- expenses ---
   r = await api('POST', '/api/expenses', { amount: 15000, note: 'E2E generator fuel' });
@@ -958,6 +1029,235 @@ async function run() {
   r = await api('GET', '/api/rfid/untagged?limit=500');
   ok('the unbound unit returns to the queue',
     r.body.data.some((u) => u.id === toTag[1].id));
+
+  /* ================================================================
+     Version 5
+     ================================================================ */
+
+  // --- batch tag provisioning ---
+  r = await api('GET', '/api/rfid/untagged?limit=5');
+  const batchUnit = r.body.data?.[0];
+  if (batchUnit) {
+    r = await api('POST', '/api/rfid/batches', { variant_id: batchUnit.variant_id });
+    const batch = r.body;
+    ok('a tagging batch can be opened', r.status === 201 && !!batch.ref);
+
+    const bTag = Date.now().toString(16).toUpperCase().slice(-6);
+    r = await api('POST', `/api/rfid/batches/${batch.id}/pair`, { epc: `E28011606000${bTag}0001` });
+    ok('a batch pairs a tag without naming the unit', r.status === 200 && r.body.ok === true,
+      JSON.stringify(r.body).slice(0, 140));
+    ok('the batch reports what is left', Number.isFinite(Number(r.body.remaining)));
+
+    // The same label twice is the commonest mistake at a tagging station.
+    r = await api('POST', `/api/rfid/batches/${batch.id}/pair`, { epc: `E28011606000${bTag}0001` });
+    ok('the same tag cannot be paired twice', r.status === 400);
+
+    r = await api('POST', `/api/rfid/batches/${batch.id}/close`, {});
+    ok('a batch can be closed', r.status === 200 && r.body.status === 'closed');
+    r = await api('POST', `/api/rfid/batches/${batch.id}/pair`, { epc: `E28011606000${bTag}0002` });
+    ok('a closed batch refuses more tags', r.status === 400);
+  }
+
+  // --- transfers built and received by scanning ---
+  r = await api('GET', '/api/locations');
+  const allLocs = Array.isArray(r.body) ? r.body : r.body.data || [];
+  const otherLoc = allLocs.find((l) => l.id !== locationId);
+  if (otherLoc) {
+    r = await api('GET', `/api/rfid/units?status=in_stock&limit=3&location_id=${locationId}`);
+    const toSend = (r.body.data || []).slice(0, 2);
+    if (toSend.length === 2) {
+      r = await api('POST', '/api/transfers/from-scan', {
+        to_location_id: otherLoc.id,
+        codes: [...toSend.map((u) => u.epc), 'DEADBEEFDEADBEEF'],
+      });
+      const trf = r.body;
+      ok('a transfer can be built from a sweep', r.status === 201 && trf.summary?.sent === 2,
+        JSON.stringify(r.body).slice(0, 160));
+      ok('an unknown tag in the box is reported, not swallowed',
+        trf.summary?.unknown_tags?.length === 1);
+      ok('the scanned units are in transit', trf.units?.every((u) => u.status === 'in_transit'));
+
+      // Receive only ONE of the two — the missing one is the whole point.
+      r = await api('POST', `/api/transfers/${trf.id}/receive`, { codes: [toSend[0].epc] });
+      ok('a partial scan-in receives only what was scanned', r.body.summary?.received === 1,
+        JSON.stringify(r.body.summary).slice(0, 160));
+      ok('the unit that was not in the box is named', r.body.summary?.missing?.length === 1);
+      ok('the transfer stays open until it all arrives', r.body.status === 'in_transit');
+
+      r = await api('GET', `/api/rfid/units/${toSend[0].id}`);
+      ok('the received unit landed at the destination', Number(r.body.location_id) === Number(otherLoc.id));
+
+      r = await api('POST', `/api/transfers/${trf.id}/receive`, { codes: [toSend[1].epc] });
+      ok('scanning the rest completes the transfer', r.body.status === 'received');
+    }
+  }
+
+  // --- granular permissions ---
+  r = await api('GET', '/api/users');
+  const cashierUser = (r.body || []).find((u) => u.role === 'cashier');
+  if (cashierUser) {
+    r = await api('GET', `/api/users/${cashierUser.id}/permissions`);
+    ok('a user\'s permissions can be read', r.status === 200 && Array.isArray(r.body.catalog));
+    ok('the role preset is shown separately from the exceptions',
+      Array.isArray(r.body.preset) && Array.isArray(r.body.overrides));
+
+    r = await api('PUT', `/api/users/${cashierUser.id}/permissions`, {
+      overrides: [{ permission: 'settings.write', effect: 'grant' },
+                  { permission: 'sales.hold', effect: 'deny' }] });
+    ok('exceptions can be set on one person', r.status === 200);
+    ok('the effective list reflects the grant', r.body.effective.includes('settings.write'));
+    ok('and records the deny', r.body.effective.includes('!sales.hold'));
+
+    r = await api('PUT', `/api/users/${cashierUser.id}/permissions`, {
+      overrides: [{ permission: 'not.a.real.permission', effect: 'grant' }] });
+    ok('a permission that does not exist is refused', r.status === 400);
+
+    // Prove the deny actually bites at the API, not just in the menu.
+    const adminToken2 = token; const adminLoc2 = locationId;
+    r = await api('POST', '/api/auth/login', { email: cashierUser.email, password: 'password123' });
+    if (r.body?.token) {
+      token = r.body.token; locationId = r.body.locations[0].id;
+      r = await api('PUT', '/api/settings', { receipt_footer: 'granted by exception' });
+      ok('the granted permission works for that person', r.status === 200,
+        JSON.stringify(r.body).slice(0, 120));
+    }
+    token = adminToken2; locationId = adminLoc2;
+
+    await api('PUT', `/api/users/${cashierUser.id}/permissions`, { overrides: [] });
+  }
+
+  // --- feature toggles ---
+  r = await api('GET', '/api/settings/features');
+  ok('the feature catalogue is published', Array.isArray(r.body.catalog) && r.body.catalog.length > 0);
+  r = await api('PUT', '/api/settings/features', { values: { commissions: true, holds: true, credit: true } });
+  ok('features can be switched on', r.body.values?.commissions === true);
+  r = await api('PUT', '/api/settings/features', { values: { nonsense: true } });
+  ok('an unknown feature is refused', r.status === 400);
+
+  // --- commission with a clawback ---
+  r = await api('GET', '/api/users');
+  const rep = (r.body || []).find((u) => u.role === 'cashier');
+  r = await api('POST', '/api/commissions/rules',
+    { name: 'E2E 10% of revenue', basis: 'revenue', rate: 10 });
+  const rule = r.body;
+  ok('a commission rule can be created', r.status === 201 && Number(rule.rate) === 10);
+  r = await api('POST', '/api/commissions/rules', { name: 'silly', basis: 'revenue', rate: 400 });
+  ok('an absurd percentage is refused', r.status === 400);
+
+  r = await api('GET', `/api/products/search${''}?q=`);
+  r = await api('GET', '/api/rfid/units?status=in_stock&limit=1');
+  const commUnit = r.body.data?.[0];
+  if (commUnit && rep) {
+    r = await api('POST', '/api/sales', {
+      items: [{ variant_id: commUnit.variant_id, quantity: 1, unit_price: 50000 }],
+      payments: [{ method: 'cash', amount: 50000 }],
+      status: 'completed',
+      sales_rep_id: rep.id,
+    });
+    const commSale = r.body;
+    ok('a sale can name the rep who served the customer', r.status === 201);
+
+    r = await api('GET', `/api/commissions?user_id=${rep.id}`);
+    const earned = r.body.summary?.[0];
+    ok('commission is accrued on the sale', Number(earned?.earned) >= 5000,
+      JSON.stringify(earned).slice(0, 140));
+
+    // Return the whole thing. The commission has to come back with it.
+    r = await api('GET', `/api/sales/${commSale.id}`);
+    const line = r.body.items?.[0];
+    r = await api('POST', '/api/returns', {
+      original_sale_id: commSale.id,
+      items: [{ sale_item_id: line.id, quantity: 1 }],
+      refund_method: 'cash', reason: 'E2E clawback',
+    });
+    ok('the sale can be returned', r.status === 201, JSON.stringify(r.body).slice(0, 140));
+
+    r = await api('GET', `/api/commissions?user_id=${rep.id}`);
+    const after = r.body.summary?.[0];
+    ok('the commission is clawed back', Number(after?.clawed_back) <= -5000,
+      JSON.stringify(after).slice(0, 140));
+    ok('and the clawback is a separate row, not an edit',
+      r.body.data.some((x) => x.kind === 'clawback' && !!x.return_ref));
+
+    r = await api('POST', '/api/commissions/pay', { user_id: rep.id, amount: 999999 });
+    ok('paying more than is owed is refused', r.status === 400);
+  }
+
+  // --- quarantine ---
+  r = await api('GET', '/api/rfid/units?status=in_stock&limit=1');
+  const badUnit = r.body.data?.[0];
+  if (badUnit) {
+    r = await api('POST', '/api/quarantine', { epc: badUnit.epc, reason: 'damaged', detail: 'Sole split' });
+    const q = r.body;
+    ok('a scanned item can be quarantined', r.status === 201 && q.outcome === 'pending',
+      JSON.stringify(r.body).slice(0, 140));
+
+    r = await api('GET', `/api/rfid/units/${badUnit.id}`);
+    ok('the unit leaves sellable stock', r.body.status === 'quarantined');
+
+    r = await api('POST', '/api/quarantine', { epc: badUnit.epc, reason: 'damaged' });
+    ok('the same item cannot be quarantined twice', r.status === 400);
+
+    r = await api('POST', `/api/quarantine/${q.id}/resolve`, { outcome: 'returned_to_stock' });
+    ok('it can be put back in stock', r.status === 200 && r.body.outcome === 'returned_to_stock');
+    r = await api('GET', `/api/rfid/units/${badUnit.id}`);
+    ok('and is sellable again', r.body.status === 'in_stock');
+  }
+
+  // --- cross-branch availability and holds ---
+  if (badUnit) {
+    r = await api('GET', `/api/holds/availability?variant_id=${badUnit.variant_id}`);
+    ok('availability is reported per branch', Array.isArray(r.body) && r.body.length > 0);
+    ok('the current branch is flagged', r.body.some((x) => x.is_current));
+
+    r = await api('POST', '/api/holds', { variant_id: badUnit.variant_id, hours: 24, note: 'E2E' });
+    const hold = r.body;
+    ok('stock can be held for a customer', r.status === 201 && !!hold.ref,
+      JSON.stringify(r.body).slice(0, 140));
+
+    r = await api('GET', `/api/holds/availability?variant_id=${badUnit.variant_id}`);
+    const here = r.body.find((x) => x.is_current);
+    ok('a hold reduces what is available to sell', Number(here.held) >= 1);
+
+    r = await api('POST', `/api/holds/${hold.id}/close`, { status: 'released' });
+    ok('a hold can be released', r.status === 200 && r.body.status === 'released');
+    r = await api('POST', `/api/holds/${hold.id}/close`, { status: 'released' });
+    ok('a closed hold cannot be closed again', r.status === 400);
+  }
+
+  // --- deadstock ageing ---
+  r = await api('GET', '/api/reports/deadstock?min_days=0');
+  ok('deadstock ages by unit, not by product', Array.isArray(r.body.rows));
+  ok('and is bucketed for a human to act on',
+    Array.isArray(r.body.ageing) && r.body.ageing.length === 6);
+  ok('the total tied up is reported', Number(r.body.totals?.tied_up) >= 0);
+
+  // --- digital receipts ---
+  r = await api('GET', '/api/sales?limit=1');
+  const anySale = r.body.data?.[0];
+  if (anySale) {
+    r = await api('POST', `/api/receipts/${anySale.id}/share`,
+      { channel: 'whatsapp', address: '08031234567' });
+    const share = r.body;
+    ok('a receipt can be prepared for WhatsApp', r.status === 201 && !!share.link);
+    ok('the Nigerian number is converted for wa.me',
+      share.share.whatsapp?.includes('wa.me/2348031234567'), share.share.whatsapp?.slice(0, 40));
+
+    const token2 = share.link.split('/r/')[1];
+    const pub = await fetch(`${BASE}/api/r/${token2}`);
+    const pubBody = await pub.json();
+    ok('the public receipt opens with no login', pub.status === 200 && !!pubBody.sale);
+    ok('it shows the line items', Array.isArray(pubBody.items));
+    ok('it does not leak anything but that sale',
+      pubBody.sale.id === anySale.id && pubBody.customer === undefined);
+
+    const bad = await fetch(`${BASE}/api/r/not-a-real-token-value`);
+    ok('a wrong token gets nothing', bad.status === 404);
+
+    r = await api('GET', `/api/receipts/${anySale.id}/deliveries`);
+    ok('deliveries are listed', Array.isArray(r.body) && r.body.length > 0);
+    ok('but the tokens are not handed back out', r.body.every((d) => d.token === undefined));
+  }
 
   console.log(results.join('\n'));
   console.log('-'.repeat(64));

@@ -1,44 +1,54 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Tag, CheckCircle2, SkipForward, Radio, Undo2, PackageCheck, Info, AlertTriangle,
+  Layers, Keyboard, Square, Smartphone, X,
 } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { num, variantLabel } from '../lib/format.js';
-import { Card, Loading, Empty, Badge, useToast, Stat, Spinner } from '../components/ui.jsx';
+import { Card, Loading, Empty, Badge, useToast, Stat, Spinner, Modal, Field } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useRfidScan } from '../lib/useRfidScan.jsx';
 
 /**
- * Tag stock — bind a pre-encoded label to a physical unit.
+ * Tag stock — give a physical item its licence plate.
  *
- * The designed flow for this system is that it mints a 96-bit EPC and a Zebra
- * RFID printer writes it onto the inlay. That needs an RFID printer, which is
- * the single most expensive part of an RFID setup and the one a small shop is
- * least likely to own.
+ * An EPC is a licence plate. It identifies one item and says nothing about what
+ * that item is; everything else is looked up from it. That is why a
+ * factory-encoded tag works exactly as well as one this system minted: the
+ * number does not have to mean anything, it only has to be unique and stuck to
+ * the right shoe.
  *
- * This is the same result without one. Plain pre-encoded UHF labels cost very
- * little and every one already carries a unique factory EPC. Stick a label on
- * the shoe, pull the trigger, and that tag becomes this unit's identity. The
- * per-unit tracking is identical — two of the same shoe in the same size are
- * still two different tags — it just uses the tag's own code rather than one
- * this system wrote.
+ * Which matters commercially, because minting your own means owning an RFID
+ * printer — the most expensive part of an RFID setup and the one a small shop
+ * is least likely to have. Plain pre-encoded labels cost very little and every
+ * one already carries a unique factory EPC.
  *
- * Built as a station: one unit in front of you, scan, next. No hunting through
- * a list between items, because that is what makes people stop doing it.
+ * Two ways to work:
+ *
+ *   One at a time   the queue picks the next untagged unit, you scan, it moves
+ *                   on. Right for mixed stock coming off a delivery.
+ *   Batch           fix one product and size up front and just scan, scan,
+ *                   scan. Right for forty pairs of the same shoe, where picking
+ *                   from a list of forty identical rows is the slow part.
  */
 export default function TagStock() {
   const toast = useToast();
   const { locationId, location } = useAuth();
-  const inputRef = useRef(null);
-  const idleTimer = useRef(null);
   const busyRef = useRef(false);
 
+  const [mode, setMode] = useState('queue');       // queue | batch
   const [queue, setQueue] = useState(null);
   const [total, setTotal] = useState(0);
   const [index, setIndex] = useState(0);
   const [done, setDone] = useState([]);
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState(null);
+
+  const [batch, setBatch] = useState(null);
+  const [showNewBatch, setShowNewBatch] = useState(false);
+  const [manual, setManual] = useState('');
+  const [showManual, setShowManual] = useState(false);
 
   const load = useCallback(async () => {
     setQueue(null);
@@ -53,63 +63,64 @@ export default function TagStock() {
   }, [locationId]);
   useEffect(() => { load(); }, [load]);
 
-  // Keep the capture field focused so the trigger always lands somewhere.
-  useEffect(() => {
-    const focus = () => inputRef.current?.focus();
-    focus();
-    const t = setInterval(focus, 1000);
-    document.addEventListener('click', focus);
-    return () => { clearInterval(t); document.removeEventListener('click', focus); };
-  }, [queue, index]);
-
   const current = queue?.[index] || null;
+
+  /* ---------------- pairing ---------------- */
+
+  const pairInBatch = useCallback(async (code) => {
+    const res = await api.post(`/api/rfid/batches/${batch.id}/pair`, { epc: code });
+    setBatch((b) => ({ ...b, ...res.batch, remaining: res.remaining }));
+    setDone((d) => [{
+      id: res.unit.id, epc: code, bits: res.bits,
+      product_name: batch.product_name, size: batch.size, color: batch.color,
+    }, ...d].slice(0, 25));
+    setTotal((t) => Math.max(0, t - 1));
+    return res.message;
+  }, [batch]);
+
+  const pairInQueue = useCallback(async (code) => {
+    const unit = queue?.[index];
+    if (!unit) throw new Error('Nothing left in the queue to tag.');
+    const res = await api.post(`/api/rfid/units/${unit.id}/assign-tag`, { epc: code });
+    setDone((d) => [{ ...unit, epc: code, bits: res.bits }, ...d].slice(0, 25));
+    setIndex((i) => i + 1);
+    setTotal((t) => Math.max(0, t - 1));
+    return res.message;
+  }, [queue, index]);
 
   const assign = useCallback(async (raw) => {
     const code = String(raw).trim();
     if (!code || busyRef.current) return;
-    const unit = queue?.[index];
-    if (!unit) return;
+    if (mode === 'batch' && !batch) return;
+    if (mode === 'queue' && !queue?.[index]) return;
 
     busyRef.current = true;
     setBusy(true);
     setProblem(null);
     try {
-      const res = await api.post(`/api/rfid/units/${unit.id}/assign-tag`, { epc: code });
-      setDone((d) => [{ ...unit, epc: code, bits: res.bits }, ...d].slice(0, 25));
-      setIndex((i) => i + 1);
-      setTotal((t) => Math.max(0, t - 1));
+      const message = mode === 'batch' ? await pairInBatch(code) : await pairInQueue(code);
       if (navigator.vibrate) navigator.vibrate(40);
-      toast.success(res.message);
+      toast.success(message);
     } catch (e) {
-      // Almost always "that tag is already on something else" — show it in
-      // place rather than as a toast that vanishes before they look up.
+      // Almost always "that tag is already on something else". Shown in place
+      // rather than as a toast, because a toast is gone before someone tagging
+      // a shelf looks up from the shelf.
       setProblem(e.message);
       if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
     } finally {
       busyRef.current = false;
       setBusy(false);
     }
-  }, [queue, index, toast]);
+  }, [mode, batch, queue, index, pairInBatch, pairInQueue, toast]);
 
-  // Uncontrolled capture, Enter or idle-terminated — same handling as the
-  // stock-take screen, because the same reader feeds both.
-  const drain = useCallback(() => {
-    clearTimeout(idleTimer.current);
-    const el = inputRef.current;
-    if (!el) return;
-    const v = el.value;
-    el.value = '';
-    const first = v.split(/[\s,;\n\r]+/).filter(Boolean)[0];
-    if (first) assign(first);
-  }, [assign]);
+  /*
+    One tag at a time, deliberately.
 
-  const onKeyDown = (e) => {
-    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); drain(); }
-  };
-  const onInput = () => {
-    clearTimeout(idleTimer.current);
-    idleTimer.current = setTimeout(drain, 150);
-  };
+    dedupeMs is short because the operator is holding ONE label to the reader
+    and the next label is a different tag a second later — a long window would
+    swallow real work. tagsOnly keeps a stray keypress from being paired.
+  */
+  const scan = useRfidScan(assign, { dedupeMs: 700, tagsOnly: true });
 
   const undo = async (unit) => {
     try {
@@ -122,32 +133,75 @@ export default function TagStock() {
 
   if (!queue) return <Loading />;
 
+  const waiting = mode === 'batch' ? (batch?.remaining ?? 0) : total;
+
   return (
     <>
       <PageHeader title="Tag stock"
-        subtitle="Stick a pre-encoded label on the item, pull the trigger, and that tag becomes this unit"
+        subtitle="Stick a label on the item, read it, and that tag becomes this unit's licence plate"
         actions={
-          <button className="btn-secondary" onClick={load}>
-            <PackageCheck size={16} /> Refresh queue
-          </button>
+          <>
+            <button className="btn-secondary" onClick={() => setShowManual(true)}>
+              <Keyboard size={16} /> Type a tag
+            </button>
+            <button className="btn-secondary" onClick={load}>
+              <PackageCheck size={16} /> Refresh
+            </button>
+          </>
         } />
 
-      {/* capture field */}
-      <input ref={inputRef} inputMode="none" autoComplete="off" defaultValue=""
-        onKeyDown={onKeyDown} onInput={onInput}
-        className="absolute opacity-0 pointer-events-none h-0 w-0" />
+      <scan.CaptureField />
+
+      {/* mode switch */}
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <div className="inline-flex rounded-xl bg-slate-100 p-1">
+          <button onClick={() => setMode('queue')}
+            className={`px-3 py-1.5 text-sm rounded-lg font-medium ${
+              mode === 'queue' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-600'}`}>
+            One at a time
+          </button>
+          <button onClick={() => setMode('batch')}
+            className={`px-3 py-1.5 text-sm rounded-lg font-medium ${
+              mode === 'batch' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-600'}`}>
+            <Layers size={14} className="inline mr-1 -mt-0.5" /> Batch
+          </button>
+        </div>
+
+        {scan.native && (
+          <>
+            <button onClick={scan.toggle}
+              className={scan.scanning ? 'btn-danger' : 'btn-secondary'}>
+              {scan.scanning ? <><Square size={16} /> Stop reading</> : <><Radio size={16} /> Read continuously</>}
+            </button>
+            <span className="text-xs text-brand-700 flex items-center gap-1">
+              <Smartphone size={13} /> handheld connected
+            </span>
+          </>
+        )}
+      </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
-        <Stat label="Waiting for a tag" value={num(total)} icon={Tag}
-          sub={location?.name} />
+        <Stat label="Waiting for a tag" value={num(waiting)} icon={Tag} sub={location?.name} />
         <Stat label="Tagged this session" value={num(done.length)} tone="good" />
-        <Stat label="In this batch" value={num(queue.length)} />
-        <Stat label="Position" value={queue.length ? `${Math.min(index + 1, queue.length)} of ${queue.length}` : '—'} />
+        <Stat label={mode === 'batch' ? 'Paired in batch' : 'In this batch'}
+          value={num(mode === 'batch' ? (batch?.provisioned || 0) : queue.length)} />
+        <Stat label="Position"
+          value={mode === 'batch'
+            ? (batch ? batch.ref : '—')
+            : (queue.length ? `${Math.min(index + 1, queue.length)} of ${queue.length}` : '—')} />
       </div>
 
       <div className="grid lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2 space-y-4">
-          {!current ? (
+          {mode === 'batch' && !batch ? (
+            <Card>
+              <Empty title="Start a batch" icon={Layers}
+                hint="Pick one product and size, then scan labels one after another without touching the screen."
+                action={<button className="btn-primary" onClick={() => setShowNewBatch(true)}>
+                  <Layers size={16} /> New batch
+                </button>} />
+            </Card>
+          ) : (mode === 'queue' && !current) ? (
             <Card>
               <Empty title={queue.length ? 'Batch finished' : 'Everything is tagged'}
                 icon={CheckCircle2}
@@ -157,19 +211,35 @@ export default function TagStock() {
             </Card>
           ) : (
             <Card bodyClass="p-0">
-              <div className="p-5 border-b border-slate-100">
-                <p className="text-xs uppercase tracking-wide text-slate-400 mb-1">Tag this one</p>
-                <h2 className="text-2xl font-semibold text-slate-900 leading-tight">
-                  {current.product_name}
-                </h2>
-                <p className="text-lg text-slate-600 mt-0.5">
-                  {variantLabel(current) || 'default'}
-                </p>
-                <div className="flex flex-wrap gap-2 mt-3">
-                  <Badge>{current.variant_sku}</Badge>
-                  <Badge status="found">{current.epc_readable}</Badge>
-                  {current.location_name && <Badge>{current.location_name}</Badge>}
+              <div className="p-5 border-b border-slate-100 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs uppercase tracking-wide text-slate-400 mb-1">
+                    {mode === 'batch' ? 'Tagging this product' : 'Tag this one'}
+                  </p>
+                  <h2 className="text-2xl font-semibold text-slate-900 leading-tight">
+                    {mode === 'batch' ? batch.product_name : current.product_name}
+                  </h2>
+                  <p className="text-lg text-slate-600 mt-0.5">
+                    {variantLabel(mode === 'batch' ? batch : current) || 'default'}
+                  </p>
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    <Badge>{mode === 'batch' ? batch.variant_sku : current.variant_sku}</Badge>
+                    {mode === 'queue' && <Badge status="found">{current.epc_readable}</Badge>}
+                    {mode === 'batch' && <Badge status="found">{num(batch.remaining ?? 0)} left</Badge>}
+                    {(mode === 'batch' ? batch.location_name : current.location_name) && (
+                      <Badge>{mode === 'batch' ? batch.location_name : current.location_name}</Badge>
+                    )}
+                  </div>
                 </div>
+                {mode === 'batch' && (
+                  <button className="btn-ghost text-slate-400 shrink-0"
+                    onClick={async () => {
+                      try { await api.post(`/api/rfid/batches/${batch.id}/close`, {}); } catch { /* already closed */ }
+                      setBatch(null); load();
+                    }} title="Finish this batch">
+                    <X size={18} />
+                  </button>
+                )}
               </div>
 
               <div className="p-5">
@@ -189,13 +259,13 @@ export default function TagStock() {
                     {busy ? (
                       <>
                         <Spinner className="mx-auto text-brand-600" />
-                        <p className="text-brand-900 font-medium mt-2">Binding…</p>
+                        <p className="text-brand-900 font-medium mt-2">Pairing…</p>
                       </>
                     ) : (
                       <>
                         <Radio size={40} className="mx-auto text-brand-600 animate-pulse" />
                         <p className="text-lg font-medium text-brand-900 mt-2">
-                          Pull the trigger on a blank label
+                          {scan.scanning ? 'Hold a label to the reader' : 'Pull the trigger on a blank label'}
                         </p>
                         <p className="text-sm text-brand-800/80 mt-1">
                           Hold just this one tag near the reader — anything else in range could be
@@ -206,12 +276,14 @@ export default function TagStock() {
                   </div>
                 )}
 
-                <div className="flex gap-2 mt-4">
-                  <button className="btn-secondary flex-1"
-                    onClick={() => { setProblem(null); setIndex((i) => i + 1); }}>
-                    <SkipForward size={16} /> Skip this one
-                  </button>
-                </div>
+                {mode === 'queue' && (
+                  <div className="flex gap-2 mt-4">
+                    <button className="btn-secondary flex-1"
+                      onClick={() => { setProblem(null); setIndex((i) => i + 1); }}>
+                      <SkipForward size={16} /> Skip this one
+                    </button>
+                  </div>
+                )}
               </div>
             </Card>
           )}
@@ -267,6 +339,87 @@ export default function TagStock() {
           </div>
         </Card>
       </div>
+
+      <NewBatchModal open={showNewBatch} onClose={() => setShowNewBatch(false)}
+        onCreated={(b) => { setBatch({ ...b, remaining: b.remaining ?? 0 }); setShowNewBatch(false); }} />
+
+      <Modal open={showManual} onClose={() => setShowManual(false)} size="sm"
+        title="Type a tag code"
+        subtitle="For a tag the reader will not pick up — read it in the UHF app and copy the number">
+        <Field label="EPC">
+          <input className="input font-mono" autoFocus value={manual}
+            placeholder="E280 1160 6000 0207 2E1B 0C8F"
+            onChange={(e) => setManual(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter') return;
+              e.preventDefault();
+              const v = manual.trim();
+              if (v) { assign(v); setManual(''); setShowManual(false); }
+            }} />
+        </Field>
+        <button className="btn-primary w-full mt-3" disabled={!manual.trim()}
+          onClick={() => { assign(manual.trim()); setManual(''); setShowManual(false); }}>
+          Pair this tag
+        </button>
+      </Modal>
     </>
+  );
+}
+
+/** Pick the product and size a batch is for. */
+function NewBatchModal({ open, onClose, onCreated }) {
+  const toast = useToast();
+  const [q, setQ] = useState('');
+  const [rows, setRows] = useState([]);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!open) { setQ(''); setRows([]); return undefined; }
+    const t = setTimeout(async () => {
+      if (q.trim().length < 2) { setRows([]); return; }
+      try { setRows(await api.get(`/api/products/search${qs({ q: q.trim() })}`)); }
+      catch { setRows([]); }
+    }, 250);
+    return () => clearTimeout(t);
+  }, [q, open]);
+
+  const create = async (row) => {
+    setBusy(true);
+    try {
+      const b = await api.post('/api/rfid/batches', { variant_id: row.variant_id });
+      onCreated({
+        ...b,
+        product_name: row.name, variant_sku: row.sku,
+        size: row.size, color: row.color,
+        remaining: Number(row.stock) || 0,
+      });
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} size="sm" title="New tagging batch"
+      subtitle="Everything you scan next will be paired to this product">
+      <Field label="Find the product">
+        <input className="input" autoFocus value={q} onChange={(e) => setQ(e.target.value)}
+          placeholder="Name, SKU or barcode" />
+      </Field>
+      <div className="mt-3 max-h-72 overflow-y-auto divide-y divide-slate-100">
+        {rows.length === 0 ? (
+          <p className="text-sm text-slate-500 py-6 text-center">
+            {q.trim().length < 2 ? 'Start typing to search.' : 'Nothing matches that.'}
+          </p>
+        ) : rows.map((row) => (
+          <button key={row.variant_id} disabled={busy} onClick={() => create(row)}
+            className="w-full text-left px-1 py-3 hover:bg-slate-50 flex items-center gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="font-medium text-slate-800 truncate">{row.name}</p>
+              <p className="text-xs text-slate-500">{variantLabel(row)} · {row.sku}</p>
+            </div>
+            <Badge status={Number(row.stock) > 0 ? 'found' : undefined}>{num(row.stock)} in stock</Badge>
+          </button>
+        ))}
+      </div>
+    </Modal>
   );
 }

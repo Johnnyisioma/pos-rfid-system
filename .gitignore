@@ -8,3 +8,23 @@ npm-debug.log*
 .DS_Store
 /tmp/
 coverage/
+
+# Android shell
+android-app/node_modules/
+android-app/www/
+android-app/android/.gradle/
+android-app/android/build/
+android-app/android/app/build/
+android-app/android/app/src/main/assets/public/
+android-app/android/local.properties
+android-app/android/capacitor-cordova-android-plugins/
+android-app/android/app/src/main/assets/capacitor.config.json
+android-app/android/app/src/main/assets/capacitor.plugins.json
+android-app/android/app/capacitor.build.gradle
+*.keystore
+*.jks
+
+# Native Android shell
+android-native/build/
+# signing.keystore is deliberately NOT ignored: losing it means Android will
+# refuse to install an update over an existing install.

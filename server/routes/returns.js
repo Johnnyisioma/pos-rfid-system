@@ -3,6 +3,7 @@ import { many, one, tx } from '../db/index.js';
 import { h, bad, notFound, str, num, int, bool, paging, nextRef, money, getSettings } from '../lib/util.js';
 import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
+import { clawbackForReturn } from '../services/commission.js';
 import { moveStock, receiveUnits } from '../services/inventory.js';
 import { createSale, loadSale } from './sales.js';
 import { resolveAccountId } from '../services/accounts.js';
@@ -189,6 +190,21 @@ r.post('/', requirePerm('returns.create'), h(async (req, res) => {
       const fully = Number(remaining[0].left_qty) <= 0.001;
       await c.query('UPDATE sales SET status=$2, updated_at=now() WHERE id=$1',
         [original.id, fully ? 'refunded' : 'partially_refunded']);
+
+      /*
+        Commission clawback.
+
+        This is the half every commission scheme forgets. The rep is paid on
+        the sale; the customer brings the shoes back three weeks later; unless
+        something writes the negative row here, that money is gone and nobody
+        notices until the year-end.
+      */
+      try {
+        await clawbackForReturn(c, {
+          returnId: ret.id, saleId: original.id, refundAmount: totalRefund });
+      } catch (e) {
+        console.error('[commission] clawback failed for return', ret.id, e.message);
+      }
     }
 
     return { ret, totalRefund, exchangeSale, netDue };

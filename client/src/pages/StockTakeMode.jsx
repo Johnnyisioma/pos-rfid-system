@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  X, Play, CheckCircle2, AlertTriangle, XCircle, Radio, RotateCcw, Pause,
+  X, Play, CheckCircle2, AlertTriangle, XCircle, Radio, RotateCcw, Pause, Square, Smartphone,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { num } from '../lib/format.js';
 import { Loading, useToast, Spinner } from '../components/ui.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useRfidScan } from '../lib/useRfidScan.jsx';
 
 /**
  * Full-screen handheld mode, built for a UHF reader held on the trigger.
@@ -29,6 +30,11 @@ import { useAuth } from '../lib/auth.jsx';
  * stock take with a unique constraint per (take, EPC). So walking away, locking
  * the handheld, or closing the app loses nothing — reopening resumes the same
  * count where it left off.
+ *
+ * In the Android build the reads arrive as broadcasts from the UHF app rather
+ * than as typed characters, and the sweep can be started and stopped from this
+ * screen. That is the difference between holding a trigger down for an hour and
+ * putting the handheld in a trolley and walking the shop.
  */
 
 /** Mirrors normalizeEpc() on the server so the local dedupe agrees with it. */
@@ -37,7 +43,6 @@ const normalize = (s) =>
 
 const FLUSH_MS = 400;        // how long a batch is allowed to gather
 const FLUSH_AT = 30;         // …or this many codes, whichever comes first
-const IDLE_TERMINATOR = 120; // treat a pause this long as the end of one read
 const REFRESH_MS = 4000;     // full re-sync cadence while scanning
 
 export default function StockTakeMode() {
@@ -45,11 +50,9 @@ export default function StockTakeMode() {
   const toast = useToast();
   const { locationId, location, user } = useAuth();
 
-  const inputRef = useRef(null);
   const seenRef = useRef(new Set());   // EPCs already sent this session
   const queueRef = useRef([]);         // codes waiting to be sent
   const flushTimer = useRef(null);
-  const idleTimer = useRef(null);
   const takeRef = useRef(null);
   const sendingRef = useRef(false);
   const lastBuzz = useRef(0);
@@ -88,15 +91,6 @@ export default function StockTakeMode() {
       setLoading(false);
     })();
   }, [locationId, refresh]);
-
-  /* ---------- keep the capture input focused ---------- */
-  useEffect(() => {
-    const focus = () => { if (!paused) inputRef.current?.focus(); };
-    focus();
-    const t = setInterval(focus, 1200);
-    document.addEventListener('click', focus);
-    return () => { clearInterval(t); document.removeEventListener('click', focus); };
-  }, [take, paused]);
 
   /* ---------- the reads/sec meter ---------- */
   useEffect(() => {
@@ -182,27 +176,16 @@ export default function StockTakeMode() {
     else if (!flushTimer.current) flushTimer.current = setTimeout(flush, FLUSH_MS);
   }, [flush]);
 
-  /* ---------- wedge input handling ---------- */
-  // Read straight off the DOM node. Some readers send a Return after each tag,
-  // some send nothing at all — the idle timer covers the second kind.
-  const drain = useCallback(() => {
-    clearTimeout(idleTimer.current);
-    idleTimer.current = null;
-    const el = inputRef.current;
-    if (!el) return;
-    const v = el.value;
-    el.value = '';
-    v.split(/[\s,;\n\r]+/).filter(Boolean).forEach(accept);
-  }, [accept]);
-
-  const onInput = useCallback(() => {
-    clearTimeout(idleTimer.current);
-    idleTimer.current = setTimeout(drain, IDLE_TERMINATOR);
-  }, [drain]);
-
-  const onKeyDown = useCallback((e) => {
-    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); drain(); }
-  }, [drain]);
+  /* ---------- where the reads come from ---------- */
+  // Native broadcast in the APK, keyboard/commit capture in a browser. The
+  // hook's own de-duplication is off (dedupeMs: 0) because this screen already
+  // dedupes for the whole count, not for a moment — a tag counted an hour ago
+  // must still not be counted twice.
+  const scan = useRfidScan(accept, {
+    dedupeMs: 0,
+    enabled: !paused && Boolean(take),
+    tagsOnly: false,
+  });
 
   /* ---------- periodic full re-sync ---------- */
   useEffect(() => {
@@ -214,7 +197,7 @@ export default function StockTakeMode() {
   }, [take?.id, refresh]);
 
   // Never walk away with reads still in the queue.
-  useEffect(() => () => { clearTimeout(flushTimer.current); clearTimeout(idleTimer.current); }, []);
+  useEffect(() => () => clearTimeout(flushTimer.current), []);
   useEffect(() => {
     const warn = (e) => {
       if (queueRef.current.length) { e.preventDefault(); e.returnValue = ''; }
@@ -246,12 +229,10 @@ export default function StockTakeMode() {
     : expected ? Math.round(((expected - missing) / expected) * 1000) / 10 : 0;
 
   return (
-    <div className="min-h-screen bg-slate-900 text-white flex flex-col"
-      onClick={() => !paused && inputRef.current?.focus()}>
-      {/* Invisible capture field — uncontrolled on purpose (see the note above). */}
-      <input ref={inputRef} inputMode="none" autoComplete="off" defaultValue=""
-        onInput={onInput} onKeyDown={onKeyDown}
-        className="absolute opacity-0 pointer-events-none h-0 w-0" />
+    <div className="min-h-screen bg-slate-900 text-white flex flex-col">
+      {/* Invisible capture field — uncontrolled on purpose (see the note above).
+          Unused in the APK, where tags arrive as broadcasts. */}
+      <scan.CaptureField />
 
       <header className="flex items-center justify-between px-4 py-3 bg-slate-800/80 shrink-0">
         <div className="min-w-0">
@@ -260,7 +241,8 @@ export default function StockTakeMode() {
             {location?.name} · {user?.name}{take ? ` · ${take.ref}` : ''}
           </p>
         </div>
-        <button onClick={() => navigate('/rfid/stock-take')} className="p-3 -mr-2 rounded-xl hover:bg-slate-700">
+        <button onClick={() => navigate('/rfid/stock-take')} aria-label="Close stock take"
+          className="p-3 -mr-2 rounded-xl hover:bg-slate-700">
           <X size={24} />
         </button>
       </header>
@@ -294,16 +276,49 @@ export default function StockTakeMode() {
               live.rate > 0 ? 'text-emerald-400' : 'text-slate-500'}`}>
               <span className={`h-2 w-2 rounded-full ${
                 live.rate > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
-              {live.rate > 0 ? `${live.rate} reads/s` : paused ? 'Paused' : 'Waiting for trigger'}
+              {live.rate > 0 ? `${live.rate} reads/s`
+                : paused ? 'Paused'
+                : scan.native ? (scan.scanning ? 'Sweeping' : 'Radio off')
+                : 'Waiting for trigger'}
             </span>
             <span className="text-slate-400">{num(live.unique)} unique</span>
             {live.pending > 0 && <span className="text-amber-400">{num(live.pending)} queued</span>}
             {live.sending && <Spinner className="text-slate-400" />}
+            {scan.native && (
+              <span className="flex items-center gap-1 text-brand-300" title="Reading from the handheld directly">
+                <Smartphone size={12} /> native
+              </span>
+            )}
             <button onClick={() => setPaused((p) => !p)}
               className="ml-auto flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-700 hover:bg-slate-600">
               {paused ? <><Play size={12} /> Resume</> : <><Pause size={12} /> Pause</>}
             </button>
           </div>
+
+          {/*
+            Hands-free sweeping, native only.
+
+            In a browser the radio is started by the trigger and nothing else —
+            the page has no way to reach it. In the APK this button is the
+            difference between an hour of holding a trigger down and putting the
+            handheld in a trolley and walking the aisles.
+          */}
+          {scan.native && (
+            <div className="px-3 pb-2 bg-slate-800/60 shrink-0">
+              <button onClick={scan.toggle} disabled={paused}
+                className={`w-full rounded-xl py-3 font-semibold flex items-center justify-center gap-2 ${
+                  scan.scanning
+                    ? 'bg-rose-600 hover:bg-rose-700 text-white'
+                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'}`}>
+                {scan.scanning
+                  ? <><Square size={18} /> Stop sweeping</>
+                  : <><Radio size={18} /> Sweep continuously</>}
+              </button>
+              <p className="text-[11px] text-slate-400 text-center mt-1.5">
+                The trigger still works, and toggles this too.
+              </p>
+            </div>
+          )}
 
           <div className="px-4 py-3 bg-slate-800/60 shrink-0">
             <div className="h-3 rounded-full bg-slate-700 overflow-hidden">
@@ -319,10 +334,12 @@ export default function StockTakeMode() {
             {feed.length === 0 ? (
               <div className="text-center py-12 text-slate-400">
                 <Radio size={40} className="mx-auto mb-3 opacity-40" />
-                <p className="text-lg">Hold the trigger and sweep</p>
+                <p className="text-lg">
+                  {scan.native ? 'Start sweeping, or pull the trigger' : 'Hold the trigger and sweep'}
+                </p>
                 <p className="text-sm mt-1">
-                  Reads appear here as they come in. Let go and walk to the next rack — the count
-                  keeps everything you have already scanned.
+                  Reads appear here as they come in. Walk to the next rack whenever you like — the
+                  count keeps everything you have already scanned.
                 </p>
               </div>
             ) : feed.map((f, i) => (
@@ -331,7 +348,7 @@ export default function StockTakeMode() {
           </div>
 
           <div className="p-3 bg-slate-800 shrink-0">
-            <button onClick={async () => { await flush(); navigate('/rfid/stock-take'); }}
+            <button onClick={async () => { await scan.stop(); await flush(); navigate('/rfid/stock-take'); }}
               className="btn-xl bg-brand-600 hover:bg-brand-700 text-white w-full">
               <CheckCircle2 size={20} /> Reconcile
             </button>

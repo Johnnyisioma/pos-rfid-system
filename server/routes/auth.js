@@ -4,7 +4,7 @@ import { one, many, query } from '../db/index.js';
 import { signToken, requireAuth } from '../middleware/auth.js';
 import { h, bad, HttpError } from '../lib/util.js';
 import { audit } from '../lib/audit.js';
-import { ROLE_PERMISSIONS } from '../lib/permissions.js';
+import { ROLE_PERMISSIONS, effectivePermissions } from '../lib/permissions.js';
 
 const r = Router();
 
@@ -37,7 +37,8 @@ r.post('/login', h(async (req, res) => {
     user: {
       id: user.id, name: user.name, email: user.email, role: user.role,
       max_discount_percent: Number(user.max_discount_percent),
-      permissions: ROLE_PERMISSIONS[user.role],
+      permissions: effectivePermissions(user.role, await many(
+        'SELECT permission, effect FROM user_permissions WHERE user_id=$1', [user.id])),
     },
     locations: allLocations,
   });
@@ -53,7 +54,7 @@ r.get('/me', requireAuth, h(async (req, res) => {
           [req.user.id]
         );
   res.json({
-    user: { ...req.user, permissions: ROLE_PERMISSIONS[req.user.role] },
+    user: { ...req.user, permissions: req.user.permissions },
     locations,
   });
 }));

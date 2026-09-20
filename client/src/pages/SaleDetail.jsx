@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link, useParams, useNavigate } from 'react-router-dom';
 import {
-  ArrowLeft, Printer, Gift, RotateCcw, CreditCard, Radio, FileCode2,
+  ArrowLeft, Printer, Gift, RotateCcw, CreditCard, Radio, FileCode2, Send,
   PencilLine, History, Trash2, Plus, AlertTriangle,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
@@ -11,13 +11,15 @@ import VariantPicker from '../components/VariantPicker.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
 import Receipt from '../components/Receipt.jsx';
+import ShareReceipt from '../components/ShareReceipt.jsx';
 
 export default function SaleDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const toast = useToast();
-  const { can } = useAuth();
+  const { can, feature } = useAuth();
   const [sale, setSale] = useState(null);
+  const [sharing, setSharing] = useState(false);
   const [receipt, setReceipt] = useState(null);
   const [gift, setGift] = useState(false);
   const [payModal, setPayModal] = useState(false);
@@ -65,6 +67,11 @@ export default function SaleDetail() {
             <button className="btn-secondary no-print" onClick={() => setGift((g) => !g)}>
               <Gift size={16} /> {gift ? 'Show prices' : 'Gift receipt'}
             </button>
+            {feature('digital_receipts') && (
+              <button className="btn-secondary no-print" onClick={() => setSharing(true)}>
+                <Send size={16} /> Send to customer
+              </button>
+            )}
             {can('returns.create') && ['completed', 'partially_refunded'].includes(sale.status) && (
               <button className="btn-secondary no-print"
                 onClick={() => navigate(`/returns?invoice=${sale.invoice_no}`)}>
@@ -284,6 +291,8 @@ export default function SaleDetail() {
           </p>
         </Modal>
       )}
+
+      <ShareReceipt sale={sale} open={sharing} onClose={() => setSharing(false)} />
     </>
   );
 }

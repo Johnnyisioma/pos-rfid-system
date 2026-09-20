@@ -1,5 +1,8 @@
+import { useState } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { useAuth } from './lib/auth.jsx';
+import { needsServerSetup } from './lib/platform.js';
+import ServerSetup from './pages/ServerSetup.jsx';
 import { Loading } from './components/ui.jsx';
 import Layout from './components/Layout.jsx';
 
@@ -31,6 +34,9 @@ import Reports from './pages/Reports.jsx';
 import Settings from './pages/Settings.jsx';
 import Devices from './pages/Devices.jsx';
 import AuditLog from './pages/AuditLog.jsx';
+import Quarantine from './pages/Quarantine.jsx';
+import Commissions from './pages/Commissions.jsx';
+import PublicReceipt from './pages/PublicReceipt.jsx';
 
 function Protected({ children }) {
   const { user, loading } = useAuth();
@@ -41,9 +47,17 @@ function Protected({ children }) {
 }
 
 export default function App() {
+  // The Android app has to be told its server's address before anything else
+  // can happen. In a browser this is always false — the server is right there.
+  const [needsServer] = useState(needsServerSetup);
+  if (needsServer) return <ServerSetup />;
+
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
+
+      {/* A customer's receipt. No login — the token in the URL is the credential. */}
+      <Route path="/r/:token" element={<PublicReceipt />} />
 
       {/* Full-screen handheld mode, outside the normal chrome */}
       <Route path="/stock-take-mode" element={<Protected><StockTakeMode /></Protected>} />
@@ -64,6 +78,8 @@ export default function App() {
         <Route path="rfid/tag-stock" element={<TagStock />} />
         <Route path="rfid/stock-take" element={<StockTake />} />
         <Route path="rfid/find" element={<FindItem />} />
+        <Route path="rfid/quarantine" element={<Quarantine />} />
+        <Route path="commissions" element={<Commissions />} />
         <Route path="customers" element={<Customers />} />
         <Route path="customers/:id" element={<CustomerDetail />} />
         <Route path="sales" element={<Sales />} />

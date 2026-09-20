@@ -11,6 +11,7 @@ import { allocateUnits, markUnitsSold, setUnitStatus, moveStock, bundleComponent
 import { many as manyRows } from '../db/index.js';
 import { normalizeEpc } from '../services/epc.js';
 import { resolveAccountId } from '../services/accounts.js';
+import { accrueForSale, clawbackForReturn } from '../services/commission.js';
 
 const r = Router();
 
@@ -200,14 +201,17 @@ export async function createSale(c, body, ctx) {
     `INSERT INTO sales (invoice_no, invoice_seq, location_id, user_id, customer_id, register_session_id,
                         sale_type, status, subtotal, discount_amount, discount_type, discount_value,
                         tax_amount, total, cost_total, amount_paid, change_due, balance_due, is_credit,
-                        points_earned, points_redeemed, note, hold_label, client_uuid)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+                        points_earned, points_redeemed, note, hold_label, client_uuid, sales_rep_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
      RETURNING *`,
     [invoice.invoice_no, invoice.invoice_seq, locationId, user.id, customer?.id || null, sessionId,
      saleType, status, totals.subtotal, totals.discount_amount, cartDiscount.type, cartDiscount.value,
      totals.tax_amount, totals.total, totals.cost_total, paid, changeDue, balanceDue, isCredit && balanceDue > 0,
      pointsEarned, pointsRedeemed, str(body.note), str(body.hold_label) || null,
-     str(body.client_uuid) || null]);
+     str(body.client_uuid) || null,
+     // Whoever served the customer, which is not always whoever is logged into
+     // the till — one person often rings up what another person sold.
+     int(body.sales_rep_id, null) || null]);
   const sale = saleRows[0];
 
   // ---- line items + unit links + stock movements ----
@@ -274,6 +278,25 @@ export async function createSale(c, body, ctx) {
       await c.query('UPDATE customers SET loyalty_points = loyalty_points + $2 WHERE id=$1', [customer.id, pointsEarned]);
       await c.query(`INSERT INTO loyalty_ledger (customer_id, points, type, sale_id) VALUES ($1,$2,'earn',$3)`,
         [customer.id, pointsEarned, sale.id]);
+    }
+  }
+
+  /*
+    Commission, inside the same transaction as the sale.
+
+    A follow-up job would be simpler and would eventually pay somebody for a
+    sale that was rolled back. Doing it here means the commission row and the
+    sale it is for are true together or neither exists.
+  */
+  if (status === 'completed' || status === 'layaway') {
+    const repId = int(body.sales_rep_id, null) || null;
+    if (repId) {
+      try {
+        await accrueForSale(c, { saleId: sale.id, repId });
+      } catch (e) {
+        // A misconfigured commission rule must never stop a shop selling.
+        console.error('[commission] accrual failed for sale', sale.id, e.message);
+      }
     }
   }
 

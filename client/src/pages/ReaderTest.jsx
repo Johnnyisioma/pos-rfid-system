@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Radio, CheckCircle2, XCircle, AlertTriangle, Trash2, ClipboardCopy, Keyboard, Info,
+  Smartphone, Square, Antenna, Globe2,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
-import { Card, Empty, Badge, useToast, Stat } from '../components/ui.jsx';
+import { Card, Empty, Badge, useToast, Stat, Field } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import {
+  hasNativeReader, readerInfo, startScan, stopScan, setReaderSetting, subscribe,
+} from '../lib/rfid.js';
 
 /**
  * Reader test — what is the scanner ACTUALLY sending?
@@ -70,6 +74,16 @@ export default function ReaderTest() {
   const [listening, setListening] = useState(true);
   const [sawInput, setSawInput] = useState(null);
 
+  // Native bridge state. All of this is null in a browser, where the app has no
+  // way to talk to the radio and can only watch what lands in a text field.
+  const [native] = useState(hasNativeReader);
+  const [device, setDevice] = useState(null);
+  const [sweeping, setSweeping] = useState(false);
+  const [power, setPower] = useState(26);
+  const [region, setRegion] = useState('ETSI_NG');
+
+  useEffect(() => { if (native) readerInfo().then(setDevice); }, [native]);
+
   useEffect(() => {
     if (!listening) return undefined;
     const focus = () => inputRef.current?.focus();
@@ -126,6 +140,35 @@ export default function ReaderTest() {
     }
   }, []);
 
+  /*
+    In the APK the reads do not come through a text field at all — they arrive
+    as broadcasts. Feed them into the same log so this screen diagnoses the
+    native path as well as the wedge one, and says which was used.
+  */
+  useEffect(() => {
+    if (!native || !listening) return undefined;
+    return subscribe(async (code) => {
+      const verdict = classify(code);
+      const entry = {
+        id: `${Date.now()}-${Math.random()}`,
+        text: code, chars: code.length, span: 0, perChar: 0,
+        via: 'broadcast', terminator: 'n/a', verdict,
+        typedByHand: false, at: new Date(), resolved: null,
+      };
+      setReads((r) => [entry, ...r].slice(0, 30));
+      setSawInput(Date.now());
+      try {
+        const res = await api.post('/api/rfid/resolve', { codes: [code], context: 'lookup' });
+        const hit = res.results?.[0];
+        setReads((r) => r.map((x) => (x.id === entry.id
+          ? { ...x, resolved: { ok: !!hit?.resolved, message: hit?.message, unit: hit?.unit } } : x)));
+      } catch (e) {
+        setReads((r) => r.map((x) => (x.id === entry.id
+          ? { ...x, resolved: { ok: false, message: `Lookup failed: ${e.message}` } } : x)));
+      }
+    }, { wedge: false, dedupeMs: 0, onState: (st) => setSweeping(Boolean(st.scanning)) });
+  }, [native, listening]);
+
   const onKeyDown = useCallback((e) => {
     if (!listening) return;
     if (e.key === 'Enter' || e.key === 'Tab') {
@@ -161,10 +204,22 @@ export default function ReaderTest() {
 
   const diagnosis = (() => {
     if (!reads.length) {
+      // The advice is completely different in the app and in a browser, and
+      // giving the browser's advice to somebody holding the handheld sends
+      // them to change a setting that will actively break it.
+      if (native) {
+        return {
+          tone: 'idle',
+          title: 'Waiting for a read',
+          body: device && device.uhfAppInstalled === false
+            ? 'The handheld\'s UHF app (com.seuic.uhftool) is not installed on this device. That app owns the radio — without it nothing can read tags. Reinstall it from the handheld\'s own software, then come back here.'
+            : `Pull the trigger, or press Sweep above. The app is listening for ${device?.action || 'the reader broadcast'} directly, so nothing needs to be focused. If nothing arrives, check the UHF app is running and that its Send Mode is Broadcast — which is how it ships.`,
+        };
+      }
       return {
         tone: 'idle',
         title: 'Waiting for a read',
-        body: 'Pull the trigger, or scan a barcode. Nothing at all appearing here means the reader is not sending to the focused field — on a SEUIC handheld that is UHF app → Settings → Send Mode, which must be Focus rather than Broadcast.',
+        body: 'Pull the trigger, or scan a barcode. Nothing at all appearing here means the reader is not sending to the focused field — on a SEUIC handheld that is UHF app → Settings → Send Mode, which must be Focus rather than Broadcast. In the Android app this setting does not matter, because the app hears the reader directly.',
       };
     }
     if (good === 0) {
@@ -181,11 +236,14 @@ export default function ReaderTest() {
         body: 'The reader is set up correctly. These particular tags simply are not registered here — they may be blank inlays, tags from another system, or stock booked in at a different branch. Receive stock to mint EPCs, then read those labels.',
       };
     }
-    const how = commits && !keyed
-      ? 'The reader commits each read as a block of text rather than typing it key by key — that is how a SEUIC handheld behaves in Focus mode, and it is fine.'
-      : keyed && !commits
-        ? 'The reader types each read key by key, like a keyboard.'
-        : 'Reads are arriving both as keystrokes and as committed text.';
+    const broadcasts = reads.filter((r) => r.via === 'broadcast').length;
+    const how = broadcasts
+      ? 'Reads are arriving as broadcasts from the reader straight into this app — no focused field involved, nothing to mistype into. This is the best of the three paths.'
+      : commits && !keyed
+        ? 'The reader commits each read as a block of text rather than typing it key by key — that is how a SEUIC handheld behaves in Focus mode, and it is fine.'
+        : keyed && !commits
+          ? 'The reader types each read key by key, like a keyboard.'
+          : 'Reads are arriving both as keystrokes and as committed text.';
     const term = withTerm === 0
       ? ' No Enter is sent after a read, which is normal for this mode — every scan box here finishes a read on a short pause instead, so nothing is lost.'
       : '';
@@ -254,6 +312,60 @@ export default function ReaderTest() {
           <p className="text-sm mt-1 leading-relaxed">{diagnosis.body}</p>
         </div>
       </div>
+
+      {native && (
+        <Card className="mb-4" title="Handheld reader"
+          subtitle="This app is talking to the radio directly — the browser could only watch a text box"
+          actions={
+            <button onClick={async () => {
+              if (sweeping) { await stopScan(); setSweeping(false); }
+              else { await startScan(); setSweeping(true); }
+            }} className={sweeping ? 'btn-danger' : 'btn-primary'}>
+              {sweeping ? <><Square size={16} /> Stop</> : <><Radio size={16} /> Sweep</>}
+            </button>
+          }>
+          <div className="grid sm:grid-cols-2 gap-4">
+            <dl className="text-sm space-y-1.5">
+              <Line term="Device" value={`${device?.manufacturer || '—'} ${device?.model || ''}`.trim()} />
+              <Line term="Android SDK" value={device?.androidSdk ?? '—'} />
+              <Line term="UHF app" value={
+                device?.uhfAppInstalled === false
+                  ? <span className="text-rose-600 font-medium">not installed</span>
+                  : <span className="text-emerald-600 font-medium">installed</span>} />
+              <Line term="Broadcast" value={<code className="text-xs">{device?.action || '—'}</code>} />
+              <Line term="Data key" value={<code className="text-xs">{device?.dataKey || '—'}</code>} />
+            </dl>
+
+            <div className="space-y-3">
+              {/*
+                These handhelds leave the factory tuned for FCC 902–928 MHz.
+                Nigeria's RAIN RFID allocation is 865.6–867.6 MHz at 2 W ERP —
+                the ETSI band. On the wrong band the reader is both outside its
+                licence and bad at reading, because the tags on the shelf are
+                tuned for the band it is not using.
+              */}
+              <Field label="Region" hint="Nigeria uses the ETSI band, 865.6–867.6 MHz">
+                <select className="input" value={region}
+                  onChange={async (e) => {
+                    setRegion(e.target.value);
+                    await setReaderSetting('region', e.target.value === 'FCC' ? '2' : '1');
+                    toast.success(`Reader set to ${e.target.value === 'FCC' ? 'FCC 902–928 MHz' : 'ETSI 865–868 MHz'}`);
+                  }}>
+                  <option value="ETSI_NG">Nigeria / ETSI — 865.6–867.6 MHz</option>
+                  <option value="FCC">FCC — 902–928 MHz (US)</option>
+                </select>
+              </Field>
+              <Field label={`Transmit power — ${power} dBm`}
+                hint="Lower it when tagging, so the reader does not pick up the whole box of labels">
+                <input type="range" min="5" max="30" value={power} className="w-full"
+                  onChange={(e) => setPower(Number(e.target.value))}
+                  onMouseUp={async () => { await setReaderSetting('power', String(power)); toast.success(`Power set to ${power} dBm`); }}
+                  onTouchEnd={async () => { await setReaderSetting('power', String(power)); toast.success(`Power set to ${power} dBm`); }} />
+              </Field>
+            </div>
+          </div>
+        </Card>
+      )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
         <Stat label="Reads captured" value={reads.length} icon={Radio} />
@@ -362,6 +474,16 @@ function ReadRow({ r }) {
           </Badge>
         )}
       </div>
+    </div>
+  );
+}
+
+/** One label/value row in the handheld panel. */
+function Line({ term, value }) {
+  return (
+    <div className="flex justify-between gap-3">
+      <dt className="text-slate-500 shrink-0">{term}</dt>
+      <dd className="text-slate-800 text-right min-w-0 truncate">{value}</dd>
     </div>
   );
 }

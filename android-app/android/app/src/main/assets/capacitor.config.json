@@ -1,0 +1,19 @@
+{
+	"appId": "ng.millzee.posrfid",
+	"appName": "POS RFID",
+	"webDir": "www",
+	"android": {
+		"allowMixedContent": true,
+		"captureInput": false,
+		"webContentsDebuggingEnabled": true
+	},
+	"server": {
+		"androidScheme": "http",
+		"cleartext": true
+	},
+	"plugins": {
+		"Keyboard": {
+			"resizeOnFullScreen": true
+		}
+	}
+}

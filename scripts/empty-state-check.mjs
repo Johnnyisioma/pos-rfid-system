@@ -37,6 +37,11 @@ const PAGES = [
   ['settings-taxes', '/settings?tab=taxes'], ['settings-roles', '/settings?tab=roles'],
   ['settings-catalog', '/settings?tab=catalog'], ['devices', '/devices'], ['audit', '/audit'],
   ['stock-take-mode', '/stock-take-mode'],
+  // v5
+  ['quarantine', '/rfid/quarantine'], ['commissions', '/commissions'],
+  ['commission-rules', '/commissions?tab=rules'],
+  ['reports-deadstock', '/reports?tab=deadstock'],
+  ['settings-features', '/settings?tab=features'],
 ];
 
 const IGNORE = [/favicon/i, /ServiceWorker/i, /sw\.js/i, /React DevTools/i, /net::ERR_ABORTED/i];

@@ -31,6 +31,11 @@ import auditRoutes from './routes/audit.js';
 import deviceRoutes from './routes/devices.js';
 import accountRoutes from './routes/accounts.js';
 import syncRoutes from './routes/sync.js';
+// v5
+import quarantineRoutes from './routes/quarantine.js';
+import commissionRoutes from './routes/commissions.js';
+import holdRoutes from './routes/holds.js';
+import receiptRoutes, { publicReceiptRouter } from './routes/receipts.js';
 
 dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,7 +44,37 @@ const PORT = process.env.PORT || 3000;
 
 app.set('trust proxy', 1);
 app.use(compression());
-app.use(cors({ origin: process.env.CORS_ORIGIN || true, credentials: true }));
+/**
+ * CORS.
+ *
+ * The web app is same-origin and needs none of this. The Android app does: its
+ * pages are served from inside the APK, so every request it makes is
+ * cross-origin from http://localhost or capacitor://localhost. Those two are
+ * always allowed — they are the app itself, not a third-party site.
+ *
+ * Set CORS_ORIGIN to lock everything else down to a named list; left unset,
+ * other origins are reflected, which is the right default while a shop is
+ * still moving between a Railway URL and its own domain.
+ */
+const NATIVE_ORIGINS = [
+  'capacitor://localhost', 'ionic://localhost',
+  'http://localhost', 'https://localhost',
+];
+const allowList = (process.env.CORS_ORIGIN || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
+app.use(cors({
+  credentials: true,
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);                    // curl, health checks, same-origin
+    if (NATIVE_ORIGINS.includes(origin)) return cb(null, true);
+    if (!allowList.length) return cb(null, true);
+    return cb(allowList.includes(origin) ? null : new Error(`Origin ${origin} is not allowed`),
+      allowList.includes(origin));
+  },
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Location-Id', 'X-Device-Id', 'X-App-Version'],
+  exposedHeaders: ['X-Invoice-No'],
+}));
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
@@ -54,6 +89,15 @@ app.get('/api/health', async (req, res) => {
 
 // Public
 app.use('/api/auth', authRoutes);
+
+/*
+  A customer's receipt link.
+
+  Public on purpose and mounted above requireAuth: the person holding the link
+  is a customer with no login, and the token in the URL is the only thing that
+  grants it. It exposes one sale and nothing else.
+*/
+app.use('/api/r', publicReceiptRouter());
 
 // Everything below needs a valid session
 app.use('/api', requireAuth);
@@ -78,6 +122,10 @@ app.use('/api/audit', auditRoutes);
 app.use('/api/devices', deviceRoutes);
 app.use('/api/accounts', accountRoutes);
 app.use('/api/sync', syncRoutes);
+app.use('/api/quarantine', quarantineRoutes);
+app.use('/api/commissions', commissionRoutes);
+app.use('/api/holds', holdRoutes);
+app.use('/api/receipts', receiptRoutes);
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Unknown endpoint' }));
 

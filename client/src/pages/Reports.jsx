@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Download, BarChart3, TrendingUp, TrendingDown, Receipt, FileCheck2, Coins, FileClock,
-  Users2, AlertTriangle, ShieldCheck, Printer,
+  Users2, AlertTriangle, ShieldCheck, Printer, Boxes,
 } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, compactMoney, num, pct, date, dateTime, daysAgo, today, labelize } from '../lib/format.js';
@@ -49,6 +49,7 @@ export default function Reports() {
         { value: 'aging', label: 'Payment by age' },
         { value: 'contacts', label: 'Supplier & customer' },
         { value: 'shrinkage', label: 'Shrinkage' },
+        { value: 'deadstock', label: 'Deadstock' },
         { value: 'z', label: 'Z report' },
         { value: 'tax', label: 'VAT' },
       ]} />
@@ -60,6 +61,7 @@ export default function Reports() {
       {tab === 'aging' && <AgingReport locationId={locationId} />}
       {tab === 'contacts' && <ContactsBalance />}
       {tab === 'shrinkage' && <ShrinkageReport range={range} locationId={locationId} />}
+      {tab === 'deadstock' && <DeadstockReport locationId={locationId} />}
       {tab === 'z' && <ZReport locationId={locationId} />}
       {tab === 'tax' && <TaxReport range={range} locationId={locationId} />}
     </>
@@ -1052,6 +1054,121 @@ function ZReport({ locationId }) {
           )}
         </div>
       </div>
+    </>
+  );
+}
+
+/* ---------------- deadstock ---------------- */
+
+/**
+ * What money is sitting on the shelf, and for how long.
+ *
+ * Not "what is not selling" — that is a sales report and every system has one.
+ * This is the question that decides whether to discount, transfer or stop
+ * reordering, and it is only answerable because there is a row per physical
+ * unit: a variant restocked every month looks young forever if you age it by
+ * variant, while the three pairs from January sit there unnoticed.
+ */
+function DeadstockReport({ locationId }) {
+  const [minDays, setMinDays] = useState(60);
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    setData(null);
+    api.get(`/api/reports/deadstock${qs({ min_days: minDays, location_id: locationId })}`)
+      .then(setData).catch(() => setData({ rows: [], ageing: [], totals: {} }));
+  }, [minDays, locationId]);
+
+  if (!data) return <Loading />;
+
+  const worst = data.ageing.filter((b) => b.from >= 181)
+    .reduce((s, b) => s + Number(b.tied_up), 0);
+
+  return (
+    <>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+        <Stat label="Units in stock" value={num(data.totals.units)} icon={Boxes} />
+        <Stat label="Money tied up" value={money(data.totals.tied_up)} />
+        <Stat label="Older than six months" value={money(worst)}
+          tone={worst > 0 ? 'warn' : 'good'} />
+        <Stat label="Lines over the threshold" value={num(data.rows.length)} />
+      </div>
+
+      <Card className="mb-4" title="How old the stock is"
+        subtitle="Measured per physical unit from the day it was received, not per product">
+        <div className="space-y-2">
+          {data.ageing.map((b) => {
+            const pct = data.totals.tied_up > 0
+              ? (Number(b.tied_up) / Number(data.totals.tied_up)) * 100 : 0;
+            const old = b.from >= 181;
+            return (
+              <div key={b.key} className="flex items-center gap-3">
+                <span className="text-xs text-slate-600 w-28 shrink-0">{b.label}</span>
+                <div className="flex-1 h-5 rounded-lg bg-slate-100 overflow-hidden">
+                  <div className={`h-full ${old ? 'bg-rose-500' : 'bg-brand-500'}`}
+                    style={{ width: `${Math.max(pct, b.units ? 1.5 : 0)}%` }} />
+                </div>
+                <span className="text-xs tabular-nums text-slate-500 w-16 text-right">
+                  {num(b.units)}
+                </span>
+                <span className="text-xs tabular-nums font-medium text-slate-800 w-28 text-right">
+                  {money(b.tied_up)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      <Card bodyClass="p-0" title="Oldest first"
+        actions={
+          <select className="input w-auto text-xs py-1" value={minDays}
+            onChange={(e) => setMinDays(Number(e.target.value))}>
+            <option value={30}>Held over 30 days</option>
+            <option value={60}>Held over 60 days</option>
+            <option value={90}>Held over 90 days</option>
+            <option value={180}>Held over 6 months</option>
+            <option value={365}>Held over a year</option>
+          </select>
+        }>
+        {data.rows.length === 0 ? (
+          <Empty title="Nothing is sitting that long" icon={Boxes}
+            hint="Every unit in stock is newer than the threshold you picked." />
+        ) : (
+          <div className="table-wrap">
+            <table className="data">
+              <thead><tr>
+                <th>Item</th><th>Branch</th><th className="text-right">Units</th>
+                <th className="text-right">Oldest</th><th className="text-right">Tied up</th>
+                <th>Last sold</th>
+              </tr></thead>
+              <tbody>
+                {data.rows.map((r) => (
+                  <tr key={`${r.variant_id}-${r.location_id}`}>
+                    <td>
+                      <p className="font-medium text-slate-800">{r.product_name}</p>
+                      <p className="text-xs text-slate-500">
+                        {[r.size, r.color].filter(Boolean).join(' / ')} · {r.sku}
+                      </p>
+                    </td>
+                    <td className="text-sm text-slate-600">{r.location_name || '—'}</td>
+                    <td className="text-right tabular-nums">{num(r.units)}</td>
+                    <td className="text-right tabular-nums">
+                      <span className={r.max_days >= 181 ? 'text-rose-700 font-medium' : ''}>
+                        {num(r.max_days)} days
+                      </span>
+                    </td>
+                    <td className="text-right tabular-nums font-medium">{money(r.tied_up)}</td>
+                    <td className="text-xs text-slate-500 whitespace-nowrap">
+                      {r.last_sold_at ? dateTime(r.last_sold_at) : 'never sold here'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
     </>
   );
 }

@@ -7,6 +7,7 @@ import {
   Printer, FileSpreadsheet, ArrowLeftRight, Tags, Tag, Plus, List, FolderTree, Layers,
   TrendingUp, FileText, Store, UserCog, Building2, Percent, Landmark, Bell, PauseCircle,
   FileClock, PiggyBank, SlidersHorizontal, Coins, AlertTriangle, Users2, ScrollText, Keyboard,
+  ShieldAlert, Percent as PercentIcon, Clock,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { initOffline, flushQueue } from '../lib/offline.js';
@@ -33,7 +34,7 @@ const NAV = [
     { label: 'Roles & permissions', to: '/settings?tab=roles', icon: ShieldCheck },
   ]},
 
-  { label: 'Contacts', icon: Users2, perm: 'customers.read', children: [
+  { label: 'Contacts', icon: Users2, perm: 'customers.read', feature: 'customers', children: [
     { label: 'Customers', to: '/customers?tab=customers', icon: Users },
     { label: 'Customer groups', to: '/customers?tab=groups', icon: Tags },
     { label: 'Suppliers', to: '/purchases?tab=suppliers', icon: Store, perm: 'suppliers.read' },
@@ -51,7 +52,7 @@ const NAV = [
     { label: 'Tax rates', to: '/settings?tab=taxes', icon: Percent, perm: 'settings.read' },
   ]},
 
-  { label: 'Purchases', icon: Truck, perm: 'purchases.read', children: [
+  { label: 'Purchases', icon: Truck, perm: 'purchases.read', feature: 'purchases', children: [
     { label: 'Add purchase order', to: '/purchases?tab=new', icon: Plus, perm: 'purchases.write' },
     { label: 'List purchases', to: '/purchases?tab=orders', icon: List },
     { label: 'Purchase returns', to: '/purchases?tab=returns', icon: RotateCcw },
@@ -66,15 +67,15 @@ const NAV = [
     { label: 'Held sales', to: '/sales?status=held', icon: PauseCircle },
     { label: 'Drafts', to: '/sales?status=draft', icon: FileClock },
     { label: 'Quotations', to: '/sales?status=quotation', icon: FileText },
-    { label: 'Layaway', to: '/sales?sale_type=layaway', icon: PiggyBank },
-    { label: 'Unpaid invoices', to: '/sales?credit=true', icon: Coins },
+    { label: 'Layaway', to: '/sales?sale_type=layaway', icon: PiggyBank, feature: 'credit' },
+    { label: 'Unpaid invoices', to: '/sales?credit=true', icon: Coins, feature: 'credit' },
     DIV(),
     { label: 'New return', to: '/returns?tab=new', icon: RotateCcw, perm: 'returns.create' },
     { label: 'Sell returns', to: '/returns?tab=history', icon: List, perm: 'returns.read' },
     { label: 'Cash register', to: '/register', icon: Calculator, perm: 'register.open' },
   ]},
 
-  { label: 'Stock Transfers', icon: ArrowLeftRight, perm: 'transfers.read', children: [
+  { label: 'Stock Transfers', icon: ArrowLeftRight, perm: 'transfers.read', feature: 'transfers', children: [
     { label: 'Add transfer', to: '/transfers?new=1', icon: Plus, perm: 'transfers.write' },
     { label: 'List transfers', to: '/transfers', icon: List },
   ]},
@@ -88,10 +89,11 @@ const NAV = [
     { label: 'Stock valuation', to: '/inventory?tab=valuation', icon: BarChart3 },
   ]},
 
-  { label: 'RFID', icon: Radio, perm: 'rfid.scan', children: [
+  { label: 'RFID', icon: Radio, perm: 'rfid.scan', feature: 'rfid', children: [
     { label: 'Tagged units', to: '/rfid', icon: Radio },
     { label: 'Tags to encode', to: '/rfid?encoded=false', icon: Printer, perm: 'rfid.encode' },
     { label: 'Tag stock', to: '/rfid/tag-stock', icon: Tag, perm: 'rfid.encode' },
+    { label: 'Quarantine', to: '/rfid/quarantine', icon: ShieldAlert, perm: 'quarantine.write', feature: 'quarantine' },
     DIV(),
     { label: 'Tag lookup', to: '/rfid/lookup', icon: ScanLine },
     { label: 'Reader test', to: '/rfid/reader-test', icon: Keyboard },
@@ -99,13 +101,18 @@ const NAV = [
     { label: 'Find an item', to: '/rfid/find', icon: Search, perm: 'rfid.find' },
   ]},
 
-  { label: 'Expenses', icon: Wallet, perm: 'expenses.read', children: [
+  { label: 'Commission', icon: PercentIcon, perm: 'commissions.read', feature: 'commissions', children: [
+    { label: 'Commission ledger', to: '/commissions?tab=ledger', icon: Coins },
+    { label: 'Commission rules', to: '/commissions?tab=rules', icon: PercentIcon, perm: 'commissions.write' },
+  ] },
+
+  { label: 'Expenses', icon: Wallet, perm: 'expenses.read', feature: 'expenses', children: [
     { label: 'Add expense', to: '/expenses?new=1', icon: Plus, perm: 'expenses.write' },
     { label: 'List expenses', to: '/expenses', icon: List },
     { label: 'Expense categories', to: '/settings?tab=catalog', icon: FolderTree, perm: 'expenses.write' },
   ]},
 
-  { label: 'Payment Accounts', icon: Landmark, perm: 'reports.read', children: [
+  { label: 'Payment Accounts', icon: Landmark, perm: 'reports.read', feature: 'accounts', children: [
     { label: 'List accounts', to: '/accounts', icon: Landmark },
     { label: 'Money in & out', to: '/reports?tab=payments', icon: Coins },
   ]},
@@ -174,9 +181,10 @@ function LocationPicker() {
 }
 
 function NavGroup({ group, currentPath, currentSearch, openGroups, toggle }) {
-  const { can } = useAuth();
+  const { can, feature } = useAuth();
   const children = (group.children || []).filter(
-    (c) => c.type === 'divider' || !c.perm || can(c.perm));
+    (c) => c.type === 'divider'
+      || ((!c.perm || can(c.perm)) && (!c.feature || feature(c.feature))));
 
   const isChildActive = (child) => {
     if (child.type === 'divider') return false;
@@ -402,7 +410,7 @@ function TodaysProfit() {
 /* ---------------- shell ---------------- */
 
 export default function Layout() {
-  const { user, logout, can } = useAuth();
+  const { user, logout, can, feature } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [net, setNet] = useState({ online: navigator.onLine, queued: 0 });
   const [calcOpen, setCalcOpen] = useState(false);
@@ -431,7 +439,17 @@ export default function Layout() {
     else toast.info('Nothing waiting to sync');
   };
 
-  const visible = useMemo(() => NAV.filter((g) => !g.perm || can(g.perm)), [can]);
+  // A menu entry has to pass both gates: the person is allowed to use it, and
+  // the shop has that part of the system switched on. A group whose children
+  // have all been filtered out is dropped too — an empty dropdown is worse
+  // than no dropdown.
+  const visible = useMemo(() => NAV.filter((g) => {
+    if (g.perm && !can(g.perm)) return false;
+    if (g.feature && !feature(g.feature)) return false;
+    if (!g.children) return true;
+    return g.children.some((c) => c.type !== 'divider'
+      && (!c.perm || can(c.perm)) && (!c.feature || feature(c.feature)));
+  }), [can, feature]);
 
   const sidebar = (
     <div className="flex h-full flex-col bg-slate-900">

@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
-import { X, Loader2, Inbox, AlertTriangle, CheckCircle2, Info } from 'lucide-react';
+import { X, Loader2, Inbox, AlertTriangle, CheckCircle2, Info, PowerOff } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { statusColor, labelize } from '../lib/format.js';
 
 /* ---------------- toasts ---------------- */
@@ -254,5 +255,32 @@ export function ScanInput({
         className="input font-mono" placeholder={placeholder} autoComplete="off" />
       <button type="submit" className="btn-primary">Scan</button>
     </form>
+  );
+}
+
+/**
+ * A page for a feature this shop has switched off.
+ *
+ * The menu already hides it and the API already refuses it, but a bookmarked
+ * URL still lands here. Without this the page fires requests that come back
+ * 403 and renders an empty screen with a console error — which looks like a
+ * fault rather than a setting.
+ */
+export function FeatureOff({ title, feature, hint }) {
+  return (
+    <div className="grid place-items-center py-20 px-6 text-center">
+      <div className="max-w-sm">
+        <div className="w-12 h-12 rounded-xl bg-slate-100 grid place-items-center mx-auto mb-3">
+          <PowerOff size={22} className="text-slate-400" />
+        </div>
+        <h2 className="text-lg font-semibold text-slate-900">{title} is switched off</h2>
+        <p className="text-sm text-slate-500 mt-1.5 leading-relaxed">
+          {hint || 'Nothing has been deleted. Turning it back on brings this screen back exactly as it was.'}
+        </p>
+        <Link to="/settings?tab=features" className="btn-secondary mt-4 inline-flex">
+          Turn it on under Settings → Features
+        </Link>
+      </div>
+    </div>
   );
 }

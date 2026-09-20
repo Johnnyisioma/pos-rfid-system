@@ -2,11 +2,13 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import {
   Search, Plus, Minus, Trash2, ScanLine, User, PauseCircle, PlayCircle, Percent,
   CreditCard, Banknote, Smartphone, Landmark, Wallet, Gift, Receipt as ReceiptIcon,
-  X, Check, WifiOff, FileText, Star, PackageSearch,
+  X, Check, WifiOff, FileText, Star, PackageSearch, Send,
 } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, variantLabel, labelize } from '../lib/format.js';
 import { Card, Modal, Loading, Empty, Badge, useToast, Field, Spinner, ScanInput } from '../components/ui.jsx';
+import { useRfidScan } from '../lib/useRfidScan.jsx';
+import ShareReceipt from '../components/ShareReceipt.jsx';
 import { useAuth } from '../lib/auth.jsx';
 import { queueSale, uuid, refreshSnapshot, loadSnapshot } from '../lib/offline.js';
 import Receipt from '../components/Receipt.jsx';
@@ -20,7 +22,7 @@ const PAYMENT_METHODS = [
 ];
 
 export default function POS() {
-  const { settings, locationId, user } = useAuth();
+  const { settings, locationId, user, feature } = useAuth();
   const toast = useToast();
   const searchRef = useRef(null);
 
@@ -31,6 +33,12 @@ export default function POS() {
 
   const [cart, setCart] = useState([]);
   const [customer, setCustomer] = useState(null);
+  // Who SERVED the customer, which is not always who is at the keyboard — one
+  // person often rings up what another person sold, and commission follows the
+  // person who sold it.
+  const [salesRep, setSalesRep] = useState(null);
+  const [reps, setReps] = useState([]);
+  const [sharing, setSharing] = useState(false);
   const [cartDiscount, setCartDiscount] = useState({ type: 'percent', value: 0 });
   const [note, setNote] = useState('');
 
@@ -191,7 +199,44 @@ export default function POS() {
     }
   };
 
+  /**
+   * Sweep-to-cart.
+   *
+   * On the APK the reader talks to this screen directly, so a customer can put
+   * a basket on the counter and the whole basket goes into the cart in one
+   * sweep — which is the thing RFID is actually for at a till, and the thing a
+   * barcode scanner cannot do.
+   *
+   * dedupeMs is deliberately long: a tag sitting in the antenna's field is read
+   * dozens of times a second, and each of those reads is the same shoe.
+   * tagsOnly keeps a stray keypress out of the cart.
+   *
+   * keepFocus is off because the product search box owns focus on this screen;
+   * in a browser a committed read lands there and is intercepted in its
+   * onChange, which is the path that has always worked.
+   */
+  const scan = useRfidScan(handleScan, {
+    dedupeMs: 8000,
+    tagsOnly: true,
+    keepFocus: false,
+  });
+
   /* ---------- completing the sale ---------- */
+  // Only loaded when the shop actually runs commission, so a shop that does
+  // not gets no extra request and no extra control on the till.
+  useEffect(() => {
+    if (!feature('commissions')) return;
+    api.get('/api/users')
+      .then((rows) => {
+        const list = (rows || []).filter((u) => u.is_active);
+        setReps(list);
+        // Default to whoever is logged in — the common case is that the person
+        // at the till is the person who sold it.
+        setSalesRep((cur) => cur ?? (list.some((u) => u.id === user?.id) ? String(user.id) : null));
+      })
+      .catch(() => setReps([]));
+  }, [feature, user?.id]);
+
   const submitSale = async ({ payments, status = 'completed', pointsRedeem = 0, isCredit = false }) => {
     setBusy(true);
     const clientUuid = uuid();
@@ -199,6 +244,7 @@ export default function POS() {
       client_uuid: clientUuid,
       location_id: locationId,
       customer_id: customer?.id || null,
+      sales_rep_id: salesRep ? Number(salesRep) : null,
       items: cart.map((l) => ({
         variant_id: l.variant_id, quantity: l.quantity, unit_price: l.unit_price,
         discount_amount: l.discount_amount || 0, epcs: l.epcs || [],
@@ -254,6 +300,7 @@ export default function POS() {
 
   return (
     <div className="grid lg:grid-cols-[1fr_400px] gap-4 -m-4 sm:-m-6 p-4 sm:p-6 min-h-[calc(100vh-3.5rem)]">
+      <scan.CaptureField />
       {/* ---------------- catalog side ---------------- */}
       <div className="flex flex-col gap-4 min-w-0">
         <div className="flex gap-2">
@@ -282,9 +329,21 @@ export default function POS() {
               </button>
             )}
           </div>
-          <button onClick={() => setShowScan(true)} className="btn-secondary px-4" title="Scan an RFID tag">
-            <ScanLine size={18} /> <span className="hidden sm:inline">Scan</span>
-          </button>
+          {scan.native ? (
+            <button onClick={scan.toggle}
+              className={`px-4 rounded-xl font-medium flex items-center gap-2 ${
+                scan.scanning
+                  ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                  : 'btn-secondary'}`}
+              title="Read every tag on the counter into the cart">
+              <ScanLine size={18} className={scan.scanning ? 'animate-pulse' : ''} />
+              <span className="hidden sm:inline">{scan.scanning ? 'Sweeping' : 'Sweep'}</span>
+            </button>
+          ) : (
+            <button onClick={() => setShowScan(true)} className="btn-secondary px-4" title="Scan an RFID tag">
+              <ScanLine size={18} /> <span className="hidden sm:inline">Scan</span>
+            </button>
+          )}
           <button onClick={() => setShowHeld(true)} className="btn-secondary px-4" title="Parked sales">
             <PlayCircle size={18} /> <span className="hidden sm:inline">Parked</span>
           </button>
@@ -331,6 +390,17 @@ export default function POS() {
             <button onClick={clearCart} className="btn-ghost text-xs text-rose-600 px-2">Clear</button>
           )}
         </div>
+
+        {feature('commissions') && reps.length > 0 && (
+          <div className="px-4 py-2 border-b border-slate-100 flex items-center gap-2">
+            <Percent size={13} className="text-slate-400 shrink-0" />
+            <select className="input py-1 text-xs border-0 bg-transparent px-0 focus:ring-0"
+              value={salesRep || ''} onChange={(e) => setSalesRep(e.target.value || null)}>
+              <option value="">No sales rep on this sale</option>
+              {reps.map((u) => <option key={u.id} value={u.id}>Sold by {u.name}</option>)}
+            </select>
+          </div>
+        )}
 
         {customer && (
           <div className="px-4 py-2 bg-brand-50 text-xs text-brand-900 flex flex-wrap gap-x-4 gap-y-1 border-b border-brand-100">
@@ -455,11 +525,21 @@ export default function POS() {
               <button className="btn-secondary" onClick={() => setReceipt({ ...receipt, gift: !receipt.gift })}>
                 <Gift size={16} /> {receipt.gift ? 'Show prices' : 'Gift receipt'}
               </button>
+              {feature('digital_receipts') && receipt.sale?.id && (
+                <button className="btn-secondary" onClick={() => setSharing(true)}>
+                  <Send size={16} /> Send
+                </button>
+              )}
               <button className="btn-primary" onClick={() => setReceipt(null)}>Done</button>
             </>
           }>
           <Receipt data={receipt} />
         </Modal>
+      )}
+
+      {receipt?.sale?.id && (
+        <ShareReceipt open={sharing} onClose={() => setSharing(false)}
+          sale={{ ...receipt.sale, customer_phone: customer?.phone, customer_whatsapp: customer?.whatsapp }} />
       )}
     </div>
   );

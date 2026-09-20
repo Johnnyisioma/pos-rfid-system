@@ -66,18 +66,35 @@ export function AuthProvider({ children }) {
     window.dispatchEvent(new CustomEvent('pos:location-changed', { detail: id }));
   };
 
+  /**
+   * Mirrors the server's rules, including the deny form.
+   *
+   * A per-user deny arrives as "!sales.discount" and beats everything else,
+   * wildcard included — if a manager has switched one thing off for one person,
+   * inheriting it back through a role would be a surprise, and a surprise in a
+   * permission system is how money goes missing.
+   */
   const can = useCallback((permission) => {
     if (!user) return false;
     const list = user.permissions || [];
+    const area = `${permission.split('.')[0]}.*`;
+    if (list.includes(`!${permission}`) || list.includes(`!${area}`)) return false;
     if (list.includes('*') || list.includes(permission)) return true;
-    return list.includes(`${permission.split('.')[0]}.*`);
+    return list.includes(area);
   }, [user]);
+
+  /** Is this part of the system switched on for this shop? */
+  const feature = useCallback((key) => {
+    const flags = settings?.features;
+    if (!flags || flags[key] === undefined) return true;
+    return Boolean(flags[key]);
+  }, [settings]);
 
   const value = useMemo(() => ({
     user, locations, locationId, settings, loading,
     location: locations.find((l) => l.id === locationId) || null,
-    login, logout, switchLocation, can, reloadSettings: loadSettings,
-  }), [user, locations, locationId, settings, loading, can, loadSettings]);
+    login, logout, switchLocation, can, feature, reloadSettings: loadSettings,
+  }), [user, locations, locationId, settings, loading, can, feature, loadSettings]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

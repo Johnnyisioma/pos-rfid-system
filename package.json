@@ -1,6 +1,6 @@
 {
   "name": "pos-rfid-system",
-  "version": "1.0.0",
+  "version": "5.0.0",
   "description": "Multi-location retail POS + RFID inventory management system",
   "private": true,
   "type": "module",
@@ -18,7 +18,16 @@
     "check": "node scripts/check-refs.mjs",
     "bootstrap": "node server/db/bootstrap.js",
     "fixtures": "ALLOW_DEMO_DATA=1 node scripts/demo-fixtures.js",
-    "reset:test": "node server/db/migrate.js --fresh && node server/db/bootstrap.js && ALLOW_DEMO_DATA=1 node scripts/demo-fixtures.js"
+    "reset:test": "node server/db/migrate.js --fresh && node server/db/bootstrap.js && ALLOW_DEMO_DATA=1 node scripts/demo-fixtures.js",
+    "check:ui": "node scripts/ui-check.mjs",
+    "check:empty": "node scripts/empty-state-check.mjs",
+    "check:sweep": "node scripts/sweep-check.mjs",
+    "check:reader": "node scripts/reader-test-check.mjs",
+    "check:commit": "node scripts/commit-delivery-check.mjs",
+    "check:native": "node scripts/native-bridge-check.mjs",
+    "android": "npm --prefix android-app run sync",
+    "android:apk": "npm --prefix android-app run apk",
+    "apk": "bash android-native/build.sh"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

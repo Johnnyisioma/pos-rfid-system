@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">POS RFID</string>
+    <string name="title_activity_main">POS RFID</string>
+    <string name="package_name">ng.millzee.posrfid</string>
+    <string name="custom_url_scheme">ng.millzee.posrfid</string>
+</resources>
