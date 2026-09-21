@@ -966,7 +966,91 @@ function TaxRates() {
           </div>
         </Modal>
       )}
+      <div className="lg:col-span-3"><TaxGroups can={can} rates={rows} /></div>
     </div>
+  );
+}
+
+/**
+ * Tax groups — a single selectable tax made of several rates (VAT + a levy),
+ * whose combined rate is the sum of its members. For a shop that has to charge
+ * more than one tax on the same line.
+ */
+function TaxGroups({ can, rates }) {
+  const toast = useToast();
+  const [rows, setRows] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const load = useCallback(() => api.get('/api/catalog/tax-groups?all=1').then(setRows).catch(() => setRows([])), []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (form) => {
+    try {
+      const body = { name: form.name, description: form.description,
+        tax_rate_ids: form.tax_rate_ids || [], is_active: form.is_active };
+      if (form.id) await api.put(`/api/catalog/tax-groups/${form.id}`, body);
+      else await api.post('/api/catalog/tax-groups', body);
+      toast.success('Tax group saved'); setEditing(null); load();
+    } catch (e) { toast.error(e.message); }
+  };
+  if (!rows) return null;
+  return (
+    <Card bodyClass="p-0" title="Tax groups"
+      subtitle="Combine two or more rates into one selectable tax — its rate is the sum of the members"
+      actions={can('settings.write') && (
+        <button className="btn-primary text-xs" onClick={() => setEditing({ tax_rate_ids: [] })}>
+          <Plus size={14} /> New group</button>)}>
+      {rows.length === 0
+        ? <Empty title="No tax groups" icon={Percent}
+            hint="Most shops need only single rates; add a group only when a line attracts two taxes." />
+        : (
+          <table className="data">
+            <thead><tr><th>Name</th><th>Members</th><th className="text-right">Combined</th><th></th></tr></thead>
+            <tbody>
+              {rows.map((g) => (
+                <tr key={g.id} className={g.is_active ? '' : 'opacity-50'}>
+                  <td className="font-medium">{g.name}</td>
+                  <td className="text-sm text-slate-600">{(g.members || []).map((m) => m.name).join(' + ') || '—'}</td>
+                  <td className="text-right tabular-nums font-medium">{Number(g.rate).toFixed(2)}%</td>
+                  <td className="text-right">{can('settings.write') && (
+                    <button className="btn-ghost text-xs"
+                      onClick={() => setEditing({ ...g, tax_rate_ids: (g.members || []).map((m) => m.id) })}>Edit</button>)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>)}
+      {editing && (
+        <Modal open onClose={() => setEditing(null)} size="sm"
+          title={editing.id ? 'Edit tax group' : 'New tax group'}
+          footer={<><button className="btn-secondary" onClick={() => setEditing(null)}>Cancel</button>
+            <button className="btn-primary" onClick={() => save(editing)}>Save</button></>}>
+          <div className="space-y-3">
+            <Field label="Name"><input className="input" value={editing.name || ''}
+              onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="VAT + State levy" autoFocus /></Field>
+            <Field label="Rates in this group">
+              <div className="space-y-1.5 max-h-48 overflow-y-auto rounded-lg ring-1 ring-slate-200 p-2">
+                {(rates || []).map((t) => {
+                  const on = (editing.tax_rate_ids || []).includes(t.id);
+                  return (
+                    <label key={t.id} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={on}
+                        onChange={() => setEditing((f) => ({ ...f,
+                          tax_rate_ids: on ? f.tax_rate_ids.filter((x) => x !== t.id) : [...(f.tax_rate_ids || []), t.id] }))} />
+                      {t.name} <span className="text-slate-400">({Number(t.rate).toFixed(2)}%)</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </Field>
+            <div className="text-sm text-slate-500">
+              Combined rate: <strong>{(rates || []).filter((t) => (editing.tax_rate_ids || []).includes(t.id))
+                .reduce((s, t) => s + Number(t.rate), 0).toFixed(2)}%</strong></div>
+            {editing.id && (
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={editing.is_active !== false}
+                  onChange={(e) => setEditing({ ...editing, is_active: e.target.checked })} /> Active</label>)}
+          </div>
+        </Modal>)}
+    </Card>
   );
 }
 

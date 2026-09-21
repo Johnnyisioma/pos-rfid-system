@@ -28,10 +28,18 @@ export async function requireAuth(req, res, next) {
   if (!payload) return res.status(401).json({ error: 'Not authenticated' });
 
   const user = await one(
-    'SELECT id, name, email, role, is_active, max_discount_percent FROM users WHERE id=$1',
+    'SELECT id, name, email, role, is_active, max_discount_percent, custom_role_id FROM users WHERE id=$1',
     [payload.uid]
   );
   if (!user || !user.is_active) return res.status(401).json({ error: 'Account inactive' });
+
+  // A custom role supplies its own base permission list; hold it on the request
+  // so requirePerm and the /me payload use it instead of the built-in preset.
+  user.customBase = null;
+  if (user.custom_role_id) {
+    const cr = await one('SELECT permissions FROM custom_roles WHERE id=$1', [user.custom_role_id]);
+    if (cr) user.customBase = Array.isArray(cr.permissions) ? cr.permissions : [];
+  }
 
   const locs = await many('SELECT location_id FROM user_locations WHERE user_id=$1', [user.id]);
   user.location_ids = locs.map((l) => l.location_id);
@@ -41,14 +49,16 @@ export async function requireAuth(req, res, next) {
   // effect on their next tap and not at their next login.
   user.overrides = await many(
     'SELECT permission, effect FROM user_permissions WHERE user_id=$1', [user.id]);
-  user.permissions = effectivePermissions(user.role, user.overrides);
+  user.permissions = effectivePermissions(user.role, user.overrides, user.customBase);
 
   req.user = user;
 
   // Location the client is operating in (header set by the app shell).
   const requested = Number(req.headers['x-location-id'] || req.query.location_id || 0);
   if (requested) {
-    if (user.role === 'admin' || user.location_ids.includes(requested)) {
+    const anyLocation = user.role === 'admin' || user.permissions.includes('*')
+      || user.permissions.includes('locations.all');
+    if (anyLocation || user.location_ids.includes(requested)) {
       req.locationId = requested;
     } else {
       return res.status(403).json({ error: 'You are not assigned to that location' });
@@ -62,7 +72,7 @@ export async function requireAuth(req, res, next) {
 export function requirePerm(permission) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
-    if (!can(req.user.role, permission, req.user.overrides)) {
+    if (!can(req.user.role, permission, req.user.overrides, req.user.customBase)) {
       const denied = (req.user.overrides || []).some(
         (o) => o.effect === 'deny' && (o.permission === permission
           || o.permission === `${permission.split('.')[0]}.*`));
@@ -101,7 +111,10 @@ export function requireFeature(key) {
   };
 }
 
-/** Admins may read across all locations; everyone else is scoped. */
+/** Admins, and anyone with locations.all, may read across every branch. */
 export function allowedLocationIds(user) {
-  return user.role === 'admin' ? null : user.location_ids;
+  const all = user.role === 'admin'
+    || (user.permissions || []).includes('*')
+    || (user.permissions || []).includes('locations.all');
+  return all ? null : user.location_ids;
 }

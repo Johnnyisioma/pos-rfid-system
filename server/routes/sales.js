@@ -12,6 +12,8 @@ import { many as manyRows } from '../db/index.js';
 import { normalizeEpc } from '../services/epc.js';
 import { resolveAccountId } from '../services/accounts.js';
 import { accrueForSale, clawbackForReturn } from '../services/commission.js';
+import { postSale, postSalesReturn } from '../services/autopost.js';
+import { queueSaleNotification } from '../services/notify.js';
 
 const r = Router();
 
@@ -136,6 +138,12 @@ export async function createSale(c, body, ctx) {
         throw bad(`Payment is short by ${balanceDue}. Mark it as a credit sale or collect the balance.`);
       }
       if (!customer) throw bad('Credit sales need a customer on file');
+
+      // A customer blocked for overdue debt cannot take more credit until they
+      // pay. This is the auto-blocking half of payment terms.
+      if (customer.credit_blocked) {
+        throw bad(`${customer.name} is blocked from credit${customer.credit_block_reason ? ` — ${customer.credit_block_reason}` : ''}. Collect the balance first.`);
+      }
       const newBalance = Number(customer.balance) + balanceDue;
       if (Number(customer.credit_limit) > 0 && newBalance > Number(customer.credit_limit))
         throw bad(`This would put ${customer.name} at ${newBalance.toFixed(2)}, over their ${customer.credit_limit} credit limit`);
@@ -213,6 +221,14 @@ export async function createSale(c, body, ctx) {
      // the till — one person often rings up what another person sold.
      int(body.sales_rep_id, null) || null]);
   const sale = saleRows[0];
+
+  // Payment terms: a credit sale gets a due date from the customer's term, so
+  // the aged-debt report and the auto-block sweep know when it turned overdue.
+  if (isCredit && balanceDue > 0 && customer && Number(customer.payment_term_days) > 0) {
+    await c.query(
+      "UPDATE sales SET due_date = CURRENT_DATE + ($2 || ' days')::interval WHERE id=$1",
+      [sale.id, String(customer.payment_term_days)]);
+  }
 
   // ---- line items + unit links + stock movements ----
   for (let i = 0; i < totals.lines.length; i++) {
@@ -298,6 +314,38 @@ export async function createSale(c, body, ctx) {
         console.error('[commission] accrual failed for sale', sale.id, e.message);
       }
     }
+  }
+
+  /*
+    Warranty registration, in the same transaction.
+
+    Every sold unit whose product carries a warranty policy gets its clock
+    started here, keyed to the exact EPC. A claim later is checked against the
+    tag, not a paper receipt. One INSERT...SELECT so it costs nothing when no
+    product has a warranty.
+  */
+  if (status === 'completed') {
+    try {
+      await c.query(
+        `INSERT INTO warranty_registrations
+           (unit_id, variant_id, warranty_id, sale_id, customer_id, epc, starts_at, expires_at)
+         SELECT su.id, su.variant_id, p.warranty_id, $1, $2, su.epc, CURRENT_DATE,
+                CURRENT_DATE + (w.duration || ' ' || w.duration_unit)::interval
+           FROM sale_item_units siu
+           JOIN sale_items si ON si.id=siu.sale_item_id
+           JOIN stock_units su ON su.id=siu.unit_id
+           JOIN product_variants v ON v.id=su.variant_id
+           JOIN products p ON p.id=v.product_id
+           JOIN warranties w ON w.id=p.warranty_id
+          WHERE si.sale_id=$1 AND p.warranty_id IS NOT NULL`,
+        [sale.id, customer?.id || null]);
+    } catch (e) {
+      console.error('[warranty] registration failed for sale', sale.id, e.message);
+    }
+
+    // Book the sale to the ledger in the same transaction (revenue, VAT, COGS).
+    try { await postSale(c, sale.id); }
+    catch (e) { console.error('[ledger] sale posting failed', sale.id, e.message); }
   }
 
   return sale;
@@ -627,6 +675,20 @@ r.post('/', requirePerm('sales.create'), h(async (req, res) => {
     createSale(c, req.body, { user: req.user, locationId: req.locationId, settings }));
   await audit(req, 'create', 'sale', sale.id, {
     invoice: sale.invoice_no, total: sale.total, status: sale.status });
+
+  // Phase 4: if the shop turned on auto notifications and the sale has a
+  // contactable customer, queue a receipt message. Best-effort — a queue
+  // failure never fails the sale.
+  if (sale.status === 'completed' && sale.customer_id) {
+    try {
+      const ns = await one('SELECT * FROM notification_settings WHERE id=1');
+      if (ns?.auto_on_sale) {
+        const channel = ns.whatsapp_enabled ? 'whatsapp' : ns.sms_enabled ? 'sms' : ns.email_enabled ? 'email' : null;
+        if (channel) await queueSaleNotification({ saleId: sale.id, key: 'sale_complete', channel, userId: req.user.id, req });
+      }
+    } catch (e) { console.error('[notify] auto sale notification failed', sale.id, e.message); }
+  }
+
   res.status(201).json(await loadSale(sale.id));
 }));
 

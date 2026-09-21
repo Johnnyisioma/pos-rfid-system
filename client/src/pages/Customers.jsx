@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, Search, Users, Star, Wallet, CreditCard, Tag } from 'lucide-react';
+import { Plus, Search, Users, Star, Wallet, CreditCard, Tag, Clock } from 'lucide-react';
 import { api, qs } from '../lib/api.js';
 import { money, num, date } from '../lib/format.js';
 import {
@@ -75,6 +75,14 @@ function CustomerList() {
             <option value="false">Settled</option>
           </select>
           <ExportButtons report="customers" title="Customers" />
+          {can('customers.credit') && (
+            <button className="btn-secondary" onClick={async () => {
+              try {
+                const r = await api.post('/api/customers/enforce-terms', {});
+                toast.success(`${r.blocked?.length ?? 0} blocked, ${r.cleared?.length ?? 0} cleared`); load();
+              } catch (e) { toast.error(e.message); }
+            }}><Clock size={16} /> Enforce terms</button>
+          )}
           {can('customers.write') && (
             <button className="btn-primary" onClick={() => setEditing({})}><Plus size={16} /> New customer</button>
           )}
@@ -128,7 +136,8 @@ function CustomerList() {
 
 export function CustomerModal({ customer, groups, onClose, onSave }) {
   const [form, setForm] = useState({
-    name: '', phone: '', email: '', address: '', group_id: '', credit_limit: 0, notes: '', ...customer,
+    name: '', phone: '', email: '', address: '', group_id: '', credit_limit: 0,
+    payment_term_days: 0, notes: '', ...customer,
   });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   return (
@@ -153,6 +162,10 @@ export function CustomerModal({ customer, groups, onClose, onSave }) {
             <input type="number" className="input" value={form.credit_limit} onChange={set('credit_limit')} />
           </Field>
         </div>
+        <Field label="Payment terms (days)" hint="Net-N: credit sales fall due this many days later. 0 = due immediately">
+          <input type="number" min="0" className="input" value={form.payment_term_days ?? 0}
+            onChange={set('payment_term_days')} placeholder="e.g. 30 for Net-30" />
+        </Field>
         <Field label="Notes"><textarea className="input" rows="2" value={form.notes || ''} onChange={set('notes')} /></Field>
       </div>
     </Modal>

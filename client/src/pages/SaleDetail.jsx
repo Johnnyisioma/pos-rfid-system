@@ -12,6 +12,7 @@ import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
 import Receipt from '../components/Receipt.jsx';
 import ShareReceipt from '../components/ShareReceipt.jsx';
+import Attachments from '../components/Attachments.jsx';
 
 export default function SaleDetail() {
   const { id } = useParams();
@@ -52,6 +53,16 @@ export default function SaleDetail() {
       load();
     } catch (e) { toast.error(e.message); }
     finally { setBusy(false); }
+  };
+
+  // Render the sale through the chosen layout (letterhead, QR, A4/thermal) and
+  // open it ready to print. Needs the auth header, so fetch then write it out.
+  const openStyledDoc = async () => {
+    try {
+      const r = await api.get(`/api/documents/render/sale/${id}?format=json`);
+      const w = window.open('', '_blank');
+      if (w) { w.document.open(); w.document.write(r.html); w.document.close(); }
+    } catch (e) { toast.error(e.message); }
   };
 
   return (
@@ -184,7 +195,12 @@ export default function SaleDetail() {
               <button className="btn-secondary w-full mt-3 text-xs" onClick={() => setEinvoice(true)}>
                 <FileCode2 size={14} /> View e-invoice payload
               </button>
+              <button className="btn-secondary w-full mt-2 text-xs" onClick={openStyledDoc}>
+                <Printer size={14} /> Print styled invoice / receipt
+              </button>
             </Card>
+
+            <Attachments entityType="sale" entityId={sale.id} canWrite={can('sales.create')} />
           </div>
 
           {Number(sale.edit_count) > 0 && (

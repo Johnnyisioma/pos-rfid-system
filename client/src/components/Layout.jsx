@@ -7,7 +7,8 @@ import {
   Printer, FileSpreadsheet, ArrowLeftRight, Tags, Tag, Plus, List, FolderTree, Layers,
   TrendingUp, FileText, Store, UserCog, Building2, Percent, Landmark, Bell, PauseCircle,
   FileClock, PiggyBank, SlidersHorizontal, Coins, AlertTriangle, Users2, ScrollText, Keyboard,
-  ShieldAlert, Percent as PercentIcon, Clock,
+  ShieldAlert, Percent as PercentIcon, Clock, Ruler, ClipboardList, Send, Wrench,
+  BookOpen, ListTree, Scale, MessageSquare, Settings2,
 } from 'lucide-react';
 import { useAuth } from '../lib/auth.jsx';
 import { initOffline, flushQueue } from '../lib/offline.js';
@@ -49,13 +50,17 @@ const NAV = [
     DIV('Taxonomy'),
     { label: 'Categories & brands', to: '/settings?tab=catalog', icon: FolderTree, perm: 'products.write' },
     { label: 'Variation templates', to: '/settings?tab=catalog', icon: Layers, perm: 'products.write' },
+    { label: 'Units & price tiers', to: '/catalog-setup?tab=units', icon: Ruler, perm: 'products.write' },
+    { label: 'Bin locations', to: '/catalog-setup?tab=bins', icon: MapPin, perm: 'products.write' },
+    { label: 'Label templates', to: '/catalog-setup?tab=labels', icon: Tags, perm: 'products.write' },
     { label: 'Tax rates', to: '/settings?tab=taxes', icon: Percent, perm: 'settings.read' },
   ]},
 
   { label: 'Purchases', icon: Truck, perm: 'purchases.read', feature: 'purchases', children: [
+    { label: 'Requisitions', to: '/requisitions', icon: ClipboardCheck, perm: 'purchases.read' },
     { label: 'Add purchase order', to: '/purchases?tab=new', icon: Plus, perm: 'purchases.write' },
     { label: 'List purchases', to: '/purchases?tab=orders', icon: List },
-    { label: 'Purchase returns', to: '/purchases?tab=returns', icon: RotateCcw },
+    { label: 'Purchase returns / debit notes', to: '/purchases?tab=returns', icon: RotateCcw },
     DIV(),
     { label: 'Reorder suggestions', to: '/purchases?tab=reorder', icon: TrendingUp },
   ]},
@@ -63,6 +68,8 @@ const NAV = [
   { label: 'Sell', icon: ShoppingCart, perm: 'sales.read', children: [
     { label: 'Point of Sale', to: '/pos', icon: ShoppingCart, perm: 'sales.create' },
     { label: 'All sales', to: '/sales', icon: Receipt },
+    { label: 'Sales orders', to: '/sales-orders?tab=orders', icon: ClipboardList, perm: 'sales_orders.read', feature: 'sales_orders' },
+    { label: 'Shipments', to: '/sales-orders?tab=shipments', icon: Send, perm: 'shipments.read', feature: 'sales_orders' },
     DIV('Open documents'),
     { label: 'Held sales', to: '/sales?status=held', icon: PauseCircle },
     { label: 'Drafts', to: '/sales?status=draft', icon: FileClock },
@@ -72,6 +79,7 @@ const NAV = [
     DIV(),
     { label: 'New return', to: '/returns?tab=new', icon: RotateCcw, perm: 'returns.create' },
     { label: 'Sell returns', to: '/returns?tab=history', icon: List, perm: 'returns.read' },
+    { label: 'Services & warranties', to: '/services?tab=services', icon: Wrench, perm: 'products.read', feature: 'warranties' },
     { label: 'Cash register', to: '/register', icon: Calculator, perm: 'register.open' },
   ]},
 
@@ -108,13 +116,30 @@ const NAV = [
 
   { label: 'Expenses', icon: Wallet, perm: 'expenses.read', feature: 'expenses', children: [
     { label: 'Add expense', to: '/expenses?new=1', icon: Plus, perm: 'expenses.write' },
-    { label: 'List expenses', to: '/expenses', icon: List },
+    { label: 'List expenses', to: '/expenses?tab=list', icon: List },
+    { label: 'Recurring expenses', to: '/expenses?tab=recurring', icon: Clock, perm: 'expenses.write' },
     { label: 'Expense categories', to: '/settings?tab=catalog', icon: FolderTree, perm: 'expenses.write' },
   ]},
 
   { label: 'Payment Accounts', icon: Landmark, perm: 'reports.read', feature: 'accounts', children: [
     { label: 'List accounts', to: '/accounts', icon: Landmark },
     { label: 'Money in & out', to: '/reports?tab=payments', icon: Coins },
+  ]},
+
+  { label: 'Accounting', icon: BookOpen, perm: 'accounts.balance_sheet', children: [
+    { label: 'Chart of accounts', to: '/accounting?tab=coa', icon: ListTree },
+    { label: 'Journal', to: '/accounting?tab=journal', icon: BookOpen },
+    { label: 'Trial balance', to: '/accounting?tab=trial', icon: Scale },
+    { label: 'Balance sheet', to: '/accounting?tab=balance', icon: Building2 },
+    { label: 'Profit & loss', to: '/accounting?tab=pl', icon: TrendingUp },
+    { label: 'Tax groups', to: '/settings?tab=taxes', icon: Percent, perm: 'settings.read' },
+  ]},
+
+  { label: 'Documents & Messages', icon: FileText, perm: 'sales.read', children: [
+    { label: 'Invoice designer', to: '/documents?tab=layouts', icon: FileText, perm: 'settings.read' },
+    { label: 'Message templates', to: '/documents?tab=templates', icon: MessageSquare, perm: 'settings.read' },
+    { label: 'Delivery settings', to: '/documents?tab=settings', icon: Settings2, perm: 'settings.write' },
+    { label: 'Message log', to: '/documents?tab=log', icon: ScrollText },
   ]},
 
   { label: 'Reports', icon: BarChart3, perm: 'reports.read', children: [

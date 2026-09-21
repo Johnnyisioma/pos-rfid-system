@@ -14,13 +14,15 @@ const r = Router();
 r.get('/', requirePerm('users.read'), h(async (req, res) => {
   const rows = await many(
     `SELECT u.id,u.name,u.email,u.role,u.phone,u.is_active,u.max_discount_percent,
-            u.last_login_at,u.created_at,
+            u.last_login_at,u.created_at,u.custom_role_id,u.is_sales_rep,
+            cr.name AS custom_role_name,
             COALESCE(json_agg(json_build_object('id',l.id,'name',l.name))
                      FILTER (WHERE l.id IS NOT NULL), '[]') AS locations
        FROM users u
        LEFT JOIN user_locations ul ON ul.user_id=u.id
        LEFT JOIN locations l ON l.id=ul.location_id
-      GROUP BY u.id ORDER BY u.name`
+       LEFT JOIN custom_roles cr ON cr.id=u.custom_role_id
+      GROUP BY u.id, cr.name ORDER BY u.name`
   );
   res.json(rows);
 }));
@@ -200,11 +202,17 @@ r.put('/:id', requirePerm('users.write'), h(async (req, res) => {
     const { rows } = await c.query(
       `UPDATE users SET name=COALESCE($2,name), role=COALESCE($3,role), phone=COALESCE($4,phone),
               max_discount_percent=COALESCE($5,max_discount_percent),
-              is_active=COALESCE($6,is_active), updated_at=now()
-        WHERE id=$1 RETURNING id,name,email,role,phone,is_active,max_discount_percent`,
+              is_active=COALESCE($6,is_active),
+              custom_role_id = CASE WHEN $7::text IS NULL THEN custom_role_id
+                                    WHEN $7 = '' THEN NULL ELSE $7::int END,
+              is_sales_rep = COALESCE($8, is_sales_rep),
+              updated_at=now()
+        WHERE id=$1 RETURNING id,name,email,role,phone,is_active,max_discount_percent,custom_role_id,is_sales_rep`,
       [id, req.body.name ?? null, req.body.role ?? null, req.body.phone ?? null,
        req.body.max_discount_percent ?? null,
-       'is_active' in req.body ? bool(req.body.is_active) : null]
+       'is_active' in req.body ? bool(req.body.is_active) : null,
+       'custom_role_id' in req.body ? String(req.body.custom_role_id ?? '') : null,
+       'is_sales_rep' in req.body ? bool(req.body.is_sales_rep) : null]
     );
     if (req.body.password) {
       if (String(req.body.password).length < 6) throw bad('Password must be at least 6 characters');

@@ -37,8 +37,12 @@ r.post('/login', h(async (req, res) => {
     user: {
       id: user.id, name: user.name, email: user.email, role: user.role,
       max_discount_percent: Number(user.max_discount_percent),
-      permissions: effectivePermissions(user.role, await many(
-        'SELECT permission, effect FROM user_permissions WHERE user_id=$1', [user.id])),
+      permissions: effectivePermissions(
+        user.role,
+        await many('SELECT permission, effect FROM user_permissions WHERE user_id=$1', [user.id]),
+        user.custom_role_id
+          ? (await one('SELECT permissions FROM custom_roles WHERE id=$1', [user.custom_role_id]))?.permissions
+          : null),
     },
     locations: allLocations,
   });

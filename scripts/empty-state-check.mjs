@@ -42,6 +42,17 @@ const PAGES = [
   ['commission-rules', '/commissions?tab=rules'],
   ['reports-deadstock', '/reports?tab=deadstock'],
   ['settings-features', '/settings?tab=features'],
+  ['catalog-units', '/catalog-setup?tab=units'], ['catalog-bins', '/catalog-setup?tab=bins'],
+  ['catalog-labels', '/catalog-setup?tab=labels'], ['catalog-lots', '/catalog-setup?tab=lots'],
+  // v6 phase 2 + 3
+  ['sales-orders', '/sales-orders?tab=orders'], ['services', '/services?tab=services'],
+  ['warranty-check', '/services?tab=check'],
+  ['requisitions', '/requisitions'],
+  ['accounting-coa', '/accounting?tab=coa'], ['accounting-journal', '/accounting?tab=journal'],
+  ['accounting-balance', '/accounting?tab=balance'], ['accounting-pl', '/accounting?tab=pl'],
+  ['expenses-recurring', '/expenses?tab=recurring'],
+  ['documents-layouts', '/documents?tab=layouts'], ['documents-templates', '/documents?tab=templates'],
+  ['documents-settings', '/documents?tab=settings'], ['documents-log', '/documents?tab=log'],
 ];
 
 const IGNORE = [/favicon/i, /ServiceWorker/i, /sw\.js/i, /React DevTools/i, /net::ERR_ABORTED/i];

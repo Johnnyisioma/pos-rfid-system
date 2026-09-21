@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
-import { Save, Plus, Trash2, Wand2, ArrowLeft, Radio, Tag } from 'lucide-react';
+import { Save, Plus, Trash2, Wand2, ArrowLeft, Radio, Tag, Layers } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { money, num, variantLabel } from '../lib/format.js';
 import { Card, Loading, useToast, Field, Badge, Modal, Spinner } from '../components/ui.jsx';
@@ -14,7 +14,8 @@ export default function ProductEditor() {
   const isNew = !id;
   const navigate = useNavigate();
   const toast = useToast();
-  const { settings, can, locationId, locations } = useAuth();
+  const { settings, can, feature, locationId, locations } = useAuth();
+  const [warranties, setWarranties] = useState([]);
 
   const [catalog, setCatalog] = useState({ brands: [], categories: [], templates: [], taxRates: [] });
   const [product, setProduct] = useState(null);
@@ -22,8 +23,12 @@ export default function ProductEditor() {
   const [saving, setSaving] = useState(false);
   const [matrix, setMatrix] = useState(false);
   const [priceModal, setPriceModal] = useState(null);
+  const [tierModal, setTierModal] = useState(null);
 
   useEffect(() => { api.get('/api/catalog').then(setCatalog).catch(() => {}); }, []);
+  useEffect(() => {
+    if (feature('warranties')) api.get('/api/svc/warranties').then(setWarranties).catch(() => {});
+  }, [feature]);
 
   useEffect(() => {
     if (isNew) {
@@ -175,6 +180,18 @@ export default function ProductEditor() {
                 <input type="number" className="input" value={product.reorder_point}
                   onChange={(e) => setP({ reorder_point: e.target.value })} />
               </Field>
+              {feature('warranties') && (
+                <Field label="Warranty"
+                  hint="Registers to each unit's serial when sold — check coverage later by scanning the tag">
+                  <select className="input" value={product.warranty_id || ''}
+                    onChange={(e) => setP({ warranty_id: e.target.value })}>
+                    <option value="">No warranty</option>
+                    {warranties.map((w) => (
+                      <option key={w.id} value={w.id}>{w.name} ({w.duration} {w.duration_unit})</option>
+                    ))}
+                  </select>
+                </Field>
+              )}
               <Field label="Image URL" className="sm:col-span-2">
                 <input className="input" value={product.image_url || ''} placeholder="https://…"
                   onChange={(e) => setP({ image_url: e.target.value })} />
@@ -246,9 +263,15 @@ export default function ProductEditor() {
                         </td>
                       )}
                       <td className="text-right whitespace-nowrap">
-                        {!isNew && v.id && locations.length > 1 && (
-                          <button className="btn-ghost p-1.5" title="Location price override"
-                            onClick={() => setPriceModal(v)}><Tag size={14} /></button>
+                        {!isNew && v.id && (
+                          <>
+                            {locations.length > 1 && (
+                              <button className="btn-ghost p-1.5" title="Location price override"
+                                onClick={() => setPriceModal(v)}><Tag size={14} /></button>
+                            )}
+                            <button className="btn-ghost p-1.5" title="Price tiers"
+                              onClick={() => setTierModal(v)}><Layers size={14} /></button>
+                          </>
                         )}
                         <button className="btn-ghost p-1.5 text-rose-600" title="Remove"
                           onClick={() => setVariants((vs) => vs.filter((_, x) => x !== i))}>
@@ -328,6 +351,7 @@ export default function ProductEditor() {
           setMatrix(false);
         }} />
 
+      {tierModal && <TierPriceModal variant={tierModal} onClose={() => setTierModal(null)} />}
       <LocationPriceModal variant={priceModal} onClose={() => setPriceModal(null)} locations={locations}
         currentLocation={locationId} />
     </>
@@ -553,5 +577,61 @@ function CascadeBar({ variants, setVariants }) {
           : 'Nothing is saved until you press Save — this only fills the rows below.'}
       </p>
     </div>
+  );
+}
+
+/**
+ * Set this variant's price in each selling tier.
+ *
+ * Blank means "no tier price" — the till falls back to the shelf price, so a
+ * shop that has not set wholesale numbers is unaffected. The tag can also carry
+ * its own tier, which wins over these.
+ */
+function TierPriceModal({ variant, onClose }) {
+  const toast = useToast();
+  const [rows, setRows] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.get(`/api/catalog-ext/variants/${variant.id}/prices`)
+      .then((r) => setRows(r.map((x) => ({ ...x, price: x.price ?? '' }))))
+      .catch(() => setRows([]));
+  }, [variant.id]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.put(`/api/catalog-ext/variants/${variant.id}/prices`, {
+        prices: rows.map((r) => ({ group_id: r.group_id, price: r.price === '' ? null : Number(r.price) })),
+      });
+      toast.success('Tier prices saved');
+      onClose();
+    } catch (e) { toast.error(e.message); } finally { setBusy(false); }
+  };
+
+  return (
+    <Modal open onClose={onClose} size="sm"
+      title="Price tiers"
+      subtitle={`${variantLabel(variant)} · shelf ${money(variant.selling_price)}`}
+      footer={<><button className="btn-secondary" onClick={onClose}>Cancel</button>
+        <button className="btn-primary" onClick={save} disabled={busy || !rows}>Save tiers</button></>}>
+      {!rows ? <Loading /> : rows.length === 0 ? (
+        <p className="text-sm text-slate-500">
+          No price tiers exist yet. Create them under Catalogue setup → Price tiers.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((r, i) => (
+            <div key={r.group_id} className="flex items-center gap-3">
+              <span className="text-sm text-slate-700 w-32">{r.name}</span>
+              <input type="number" className="input py-1 text-right flex-1"
+                placeholder={`shelf ${money(variant.selling_price)}`}
+                value={r.price}
+                onChange={(e) => setRows((x) => x.map((y, idx) => (idx === i ? { ...y, price: e.target.value } : y)))} />
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
   );
 }

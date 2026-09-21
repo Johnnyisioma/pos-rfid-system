@@ -36,6 +36,15 @@ import quarantineRoutes from './routes/quarantine.js';
 import commissionRoutes from './routes/commissions.js';
 import holdRoutes from './routes/holds.js';
 import receiptRoutes, { publicReceiptRouter } from './routes/receipts.js';
+// v6
+import roleRoutes from './routes/roles.js';
+import catalogExtRoutes from './routes/catalog-ext.js';
+import salesOrderRoutes from './routes/sales-orders.js';
+import servicesWarrantyRoutes from './routes/services-warranty.js';
+import accountingRoutes from './routes/accounting.js';
+import requisitionRoutes from './routes/requisitions.js';
+import documentRoutes from './routes/documents.js';
+import notificationRoutes from './routes/notifications.js';
 
 dotenv.config();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -126,6 +135,14 @@ app.use('/api/quarantine', quarantineRoutes);
 app.use('/api/commissions', commissionRoutes);
 app.use('/api/holds', holdRoutes);
 app.use('/api/receipts', receiptRoutes);
+app.use('/api/roles', roleRoutes);
+app.use('/api/catalog-ext', catalogExtRoutes);
+app.use('/api/sales-orders', salesOrderRoutes);
+app.use('/api/svc', servicesWarrantyRoutes);
+app.use('/api/accounting', accountingRoutes);
+app.use('/api/requisitions', requisitionRoutes);
+app.use('/api/documents', documentRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Unknown endpoint' }));
 

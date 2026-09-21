@@ -159,14 +159,14 @@ r.post('/', requirePerm('products.write'), h(async (req, res) => {
 
     const { rows } = await c.query(
       `INSERT INTO products (name,sku,type,brand_id,category_id,sub_category_id,unit,description,
-                             image_url,tax_rate,reorder_point,track_rfid,is_active,created_by,tax_rate_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+                             image_url,tax_rate,reorder_point,track_rfid,is_active,created_by,tax_rate_id,warranty_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
       [name, sku, type, body.brand_id || null, body.category_id || null, body.sub_category_id || null,
        str(body.unit, 'pair'), str(body.description), str(body.image_url),
        num(body.tax_rate, settings.vat_rate), int(body.reorder_point, settings.low_stock_default),
        body.track_rfid === undefined ? true : bool(body.track_rfid),
        body.is_active === undefined ? true : bool(body.is_active), req.user.id,
-       int(body.tax_rate_id) || null]
+       int(body.tax_rate_id) || null, int(body.warranty_id) || null]
     );
     const p = rows[0];
 
@@ -214,14 +214,17 @@ r.put('/:id', requirePerm('products.write'), h(async (req, res) => {
               unit=COALESCE($6,unit), description=COALESCE($7,description), image_url=COALESCE($8,image_url),
               tax_rate=COALESCE($9,tax_rate), reorder_point=COALESCE($10,reorder_point),
               track_rfid=COALESCE($11,track_rfid), is_active=COALESCE($12,is_active),
-              type=COALESCE($13,type), tax_rate_id=COALESCE($14,tax_rate_id), updated_at=now()
+              type=COALESCE($13,type), tax_rate_id=COALESCE($14,tax_rate_id),
+              warranty_id = CASE WHEN $15::int = 0 THEN NULL ELSE COALESCE($15,warranty_id) END,
+              updated_at=now()
         WHERE id=$1`,
       [id, body.name ?? null, body.brand_id ?? null, body.category_id ?? null, body.sub_category_id ?? null,
        body.unit ?? null, body.description ?? null, body.image_url ?? null,
        body.tax_rate ?? null, body.reorder_point ?? null,
        'track_rfid' in body ? bool(body.track_rfid) : null,
        'is_active' in body ? bool(body.is_active) : null, body.type ?? null,
-       int(body.tax_rate_id) || null]
+       int(body.tax_rate_id) || null,
+       'warranty_id' in body ? (int(body.warranty_id) || 0) : null]
     );
 
     if (Array.isArray(body.variants)) {

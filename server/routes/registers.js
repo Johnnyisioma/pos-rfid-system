@@ -357,6 +357,8 @@ r.post('/sessions/:id(\\d+)/close', requirePerm('register.close'), h(async (req,
          FROM register_sessions WHERE location_id=$1`, [locked[0].location_id]);
     const zNumber = Number(seq[0].next);
 
+    const denominations = req.body.denominations && typeof req.body.denominations === 'object'
+      ? JSON.stringify(req.body.denominations) : null;
     const { rows } = await c.query(
       `UPDATE register_sessions
           SET status='closed', closed_at=now(), counted_cash=$2, expected_cash=$3,
@@ -364,9 +366,10 @@ r.post('/sessions/:id(\\d+)/close', requirePerm('register.close'), h(async (req,
               counted_at = COALESCE(counted_at, now()),
               counted_by = COALESCE(counted_by, $6),
               variance_reason = CASE WHEN $7='' THEN variance_reason ELSE $7 END,
-              notes = CASE WHEN $8='' THEN notes ELSE $8 END
+              notes = CASE WHEN $8='' THEN notes ELSE $8 END,
+              denominations = COALESCE($9::jsonb, denominations)
         WHERE id=$1 RETURNING *`,
-      [id, counted, expected, difference, zNumber, req.user.id, reason, str(req.body.notes)]);
+      [id, counted, expected, difference, zNumber, req.user.id, reason, str(req.body.notes), denominations]);
     return rows[0];
   });
 

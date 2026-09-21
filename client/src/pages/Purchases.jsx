@@ -546,22 +546,27 @@ function PurchaseReturns() {
           <>
             <div className="table-wrap">
               <table className="data">
-                <thead><tr><th>Reference</th><th>Supplier</th><th>Against PO</th><th>Reason</th>
+                <thead><tr><th>Reference</th><th>Debit note</th><th>Supplier</th><th>Reason</th>
                   <th className="text-right">Units</th><th className="text-right">Value</th>
-                  <th>Credit note</th><th>Date</th></tr></thead>
+                  <th>Status</th><th>Date</th></tr></thead>
                 <tbody>
-                  {data.data.map((r) => (
+                  {data.data.map((r) => {
+                    const settled = Number(r.settled_amount) || 0;
+                    return (
                     <tr key={r.id} className="cursor-pointer" onClick={() => setOpen(r.id)}>
                       <td className="font-mono text-xs font-medium text-brand-700">{r.ref}</td>
+                      <td className="font-mono text-xs">{r.debit_note_no || '—'}</td>
                       <td>{r.supplier_name || '—'}</td>
-                      <td className="font-mono text-xs text-slate-500">{r.po_number || '—'}</td>
                       <td className="text-slate-600 text-sm">{r.reason}</td>
                       <td className="text-right tabular-nums">{num(r.total_qty)}</td>
-                      <td className="text-right tabular-nums">{money(r.total)}</td>
-                      <td className="text-xs text-slate-500">{r.credit_note || '—'}</td>
+                      <td className="text-right tabular-nums">{money(r.total)}
+                        {settled > 0 && settled < Number(r.total) &&
+                          <div className="text-xs text-slate-400">{money(settled)} settled</div>}</td>
+                      <td><Badge status={r.status === 'settled' ? 'success' : r.status === 'cancelled' ? 'muted' : 'warning'}>
+                        {r.status || 'issued'}</Badge></td>
                       <td className="text-slate-500 text-xs whitespace-nowrap">{date(r.created_at)}</td>
                     </tr>
-                  ))}
+                  ); })}
                 </tbody>
               </table>
             </div>
@@ -574,7 +579,7 @@ function PurchaseReturns() {
         <ReturnEditor onClose={() => setCreating(false)}
           onDone={() => { setCreating(false); load(); }} />
       )}
-      {open && <ReturnDetail id={open} onClose={() => setOpen(null)} />}
+      {open && <ReturnDetail id={open} onClose={() => setOpen(null)} onChanged={load} />}
     </>
   );
 }
@@ -708,20 +713,39 @@ function ReturnEditor({ onClose, onDone }) {
   );
 }
 
-function ReturnDetail({ id, onClose }) {
+function ReturnDetail({ id, onClose, onChanged }) {
+  const { can } = useAuth();
+  const toast = useToast();
   const [ret, setRet] = useState(null);
-  useEffect(() => { api.get(`/api/purchases/returns/${id}`).then(setRet).catch(() => {}); }, [id]);
+  const load = () => api.get(`/api/purchases/returns/${id}`).then(setRet).catch(() => {});
+  useEffect(() => { load(); }, [id]); // eslint-disable-line
   if (!ret) return <Modal open onClose={onClose} title="Purchase return"><Loading /></Modal>;
+
+  const settled = Number(ret.settled_amount) || 0;
+  const outstanding = Math.max(0, Number(ret.total) - settled);
+  const settle = async () => {
+    const amt = window.prompt(`Settlement amount (outstanding ${money(outstanding)}):`, String(outstanding));
+    if (amt == null) return;
+    try {
+      await api.post(`/api/purchases/returns/${id}/settle`, { amount: Number(amt) });
+      toast.success('Debit note settled'); load(); onChanged?.();
+    } catch (e) { toast.error(e.message); }
+  };
 
   return (
     <Modal open onClose={onClose} size="lg" title={ret.ref}
       subtitle={`${ret.supplier_name || 'No supplier'} · ${ret.location_name} · ${dateTime(ret.created_at)}`}
-      footer={<><span className="mr-auto text-sm font-medium text-slate-700">Value {money(ret.total)}</span>
+      footer={<>
+        <span className="mr-auto text-sm font-medium text-slate-700">
+          Value {money(ret.total)}{settled > 0 && ` · ${money(settled)} settled`}</span>
+        {can('purchases.payment') && ret.status !== 'settled' && ret.status !== 'cancelled' && outstanding > 0 && (
+          <button className="btn-secondary" onClick={settle}>Settle debit note</button>)}
         <button className="btn-primary" onClick={onClose}>Close</button></>}>
       <div className="flex flex-wrap gap-2 mb-4">
         <Badge>{ret.reason}</Badge>
-        {ret.po_number && <Badge status="found">Against {ret.po_number}</Badge>}
-        {ret.credit_note && <Badge>Credit note {ret.credit_note}</Badge>}
+        {ret.debit_note_no && <Badge status="found">Debit note {ret.debit_note_no}</Badge>}
+        <Badge status={ret.status === 'settled' ? 'success' : 'warning'}>{ret.status || 'issued'}</Badge>
+        {ret.po_number && <Badge>Against {ret.po_number}</Badge>}
         {ret.user_name && <Badge>By {ret.user_name}</Badge>}
       </div>
 

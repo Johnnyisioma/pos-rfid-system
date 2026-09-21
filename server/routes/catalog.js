@@ -139,4 +139,66 @@ r.delete('/tax-rates/:id', requirePerm('settings.write'), h(async (req, res) => 
   res.json({ ok: true });
 }));
 
+/* ═══════════════════ tax groups ═══════════════════
+   A single tax made of several rates — VAT + a state levy, say — so a line that
+   attracts both is one selectable group whose rate is the sum of its members. */
+r.get('/tax-groups', h(async (req, res) => {
+  const groups = await many('SELECT * FROM tax_groups WHERE is_active OR $1 ORDER BY name',
+    [String(req.query.all) === '1' || String(req.query.all) === 'true']);
+  for (const g of groups) {
+    g.members = await many(
+      `SELECT tr.id, tr.name, tr.rate FROM tax_group_members m
+         JOIN tax_rates tr ON tr.id=m.tax_rate_id WHERE m.group_id=$1 ORDER BY tr.name`, [g.id]);
+  }
+  res.json(groups);
+}));
+
+async function syncGroupMembers(groupId, memberIds) {
+  await query('DELETE FROM tax_group_members WHERE group_id=$1', [groupId]);
+  let rate = 0;
+  for (const id of memberIds) {
+    const tr = await one('SELECT rate FROM tax_rates WHERE id=$1', [id]);
+    if (!tr) continue;
+    await query('INSERT INTO tax_group_members (group_id, tax_rate_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [groupId, id]);
+    rate += Number(tr.rate);
+  }
+  await query('UPDATE tax_groups SET rate=$2 WHERE id=$1', [groupId, rate]);
+  return rate;
+}
+
+r.post('/tax-groups', requirePerm('settings.write'), h(async (req, res) => {
+  const name = str(req.body.name).trim();
+  if (!name) throw bad('Name the tax group.');
+  const memberIds = (Array.isArray(req.body.tax_rate_ids) ? req.body.tax_rate_ids : []).map(Number).filter(Boolean);
+  if (!memberIds.length) throw bad('Add at least one tax rate to the group.');
+  const row = await one(
+    'INSERT INTO tax_groups (name, description) VALUES ($1,$2) RETURNING *',
+    [name, str(req.body.description)]).catch((e) => {
+      if (/unique/i.test(e.message)) throw bad(`Tax group "${name}" already exists.`);
+      throw e;
+    });
+  const rate = await syncGroupMembers(row.id, memberIds);
+  await audit(req, 'create', 'tax_group', row.id, { name });
+  res.status(201).json({ ...row, rate });
+}));
+
+r.put('/tax-groups/:id', requirePerm('settings.write'), h(async (req, res) => {
+  const row = await one(
+    `UPDATE tax_groups SET name=COALESCE($2,name), description=COALESCE($3,description),
+            is_active=COALESCE($4,is_active) WHERE id=$1 RETURNING *`,
+    [req.params.id, str(req.body.name) || null, req.body.description ?? null,
+     'is_active' in req.body ? (req.body.is_active === true || req.body.is_active === 'true') : null]);
+  if (!row) throw bad('Tax group not found');
+  if (Array.isArray(req.body.tax_rate_ids)) {
+    row.rate = await syncGroupMembers(row.id, req.body.tax_rate_ids.map(Number).filter(Boolean));
+  }
+  await audit(req, 'update', 'tax_group', row.id, {});
+  res.json(row);
+}));
+
+r.delete('/tax-groups/:id', requirePerm('settings.write'), h(async (req, res) => {
+  await query('DELETE FROM tax_groups WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+}));
+
 export default r;

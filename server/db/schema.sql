@@ -1008,3 +1008,553 @@ CREATE OR REPLACE VIEW deadstock_units AS
          u.last_seen_at
     FROM stock_units u
    WHERE u.status = 'in_stock';
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  VERSION 6 — retail-parity build
+--
+--  Brings the system up to the feature breadth of a general commercial POS,
+--  while staying a footwear shop's POS by default. The pivot is business_type:
+--  the admin picks what kind of shop this is, and whole families of features
+--  (restaurant tables, pharmacy batches) appear or stay dormant accordingly.
+--  A footwear shop never sees a kitchen screen.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ---------- business type ----------
+-- 'retail' covers a boutique/footwear/general shop; 'restaurant' turns on
+-- tables, kitchen and modifiers; 'pharmacy' turns on batch/expiry. The default
+-- is retail, so an existing shop is unchanged on upgrade.
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS business_type TEXT NOT NULL DEFAULT 'retail'
+  CHECK (business_type IN ('retail','restaurant','pharmacy','supermarket','service'));
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS enable_price_groups   BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS enable_warranty       BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS enable_sub_units      BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS default_unit_id       INT;
+
+-- ---------- custom roles ----------
+-- Until now a user's rights were their role preset plus per-user exceptions.
+-- A real shop wants named roles of its own making — "Senior cashier", "Floor
+-- supervisor" — with a saved permission set, so a new hire is one dropdown
+-- rather than forty checkboxes. The four built-ins stay; these are additions.
+CREATE TABLE IF NOT EXISTS custom_roles (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL UNIQUE,
+  description  TEXT DEFAULT '',
+  permissions  JSONB NOT NULL DEFAULT '[]',
+  is_system    BOOLEAN NOT NULL DEFAULT FALSE,
+  business_type TEXT,       -- NULL = every shop type; else only that type
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- A user may hold a built-in role (users.role) OR a custom one. When custom_role_id
+-- is set it wins, and users.role holds the nearest built-in for anything that
+-- still keys off it.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_role_id INT REFERENCES custom_roles(id) ON DELETE SET NULL;
+
+-- ---------- units of measure ----------
+CREATE TABLE IF NOT EXISTS units (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,          -- "Pair", "Box", "Dozen"
+  short_name   TEXT NOT NULL,          -- "pr", "box", "dz"
+  allow_decimal BOOLEAN NOT NULL DEFAULT FALSE,
+  base_unit_id INT REFERENCES units(id) ON DELETE SET NULL,
+  base_multiple NUMERIC(14,4),         -- 1 box = 12 pairs → base_multiple 12
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE products ADD COLUMN IF NOT EXISTS unit_id INT REFERENCES units(id) ON DELETE SET NULL;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS secondary_unit_id INT REFERENCES units(id) ON DELETE SET NULL;
+
+-- ---------- selling price groups (price tiers) ----------
+-- Retail, wholesale, staff. A tier is chosen per sale, or defaults per customer
+-- group. Prices per variant per tier live in variant_group_prices.
+CREATE TABLE IF NOT EXISTS price_groups (
+  id          SERIAL PRIMARY KEY,
+  name        TEXT NOT NULL UNIQUE,
+  description TEXT DEFAULT '',
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS variant_group_prices (
+  variant_id  INT NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+  group_id    INT NOT NULL REFERENCES price_groups(id) ON DELETE CASCADE,
+  price       NUMERIC(14,2) NOT NULL,
+  PRIMARY KEY (variant_id, group_id)
+);
+ALTER TABLE customer_groups ADD COLUMN IF NOT EXISTS price_group_id INT REFERENCES price_groups(id) ON DELETE SET NULL;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS price_group_id INT REFERENCES price_groups(id) ON DELETE SET NULL;
+
+-- ---------- tax groups ----------
+-- A single selectable rate that is the sum of several — e.g. "VAT+Levy" = 7.5 + 2.
+CREATE TABLE IF NOT EXISTS tax_groups (
+  id          SERIAL PRIMARY KEY,
+  name        TEXT NOT NULL UNIQUE,
+  rate        NUMERIC(6,3) NOT NULL DEFAULT 0,     -- cached sum of the members
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS tax_group_members (
+  group_id    INT NOT NULL REFERENCES tax_groups(id) ON DELETE CASCADE,
+  tax_rate_id INT NOT NULL REFERENCES tax_rates(id) ON DELETE CASCADE,
+  PRIMARY KEY (group_id, tax_rate_id)
+);
+
+-- ---------- invoice schemes and layouts ----------
+CREATE TABLE IF NOT EXISTS invoice_schemes (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,
+  prefix       TEXT DEFAULT '',
+  digits       INT NOT NULL DEFAULT 4,
+  start_number BIGINT NOT NULL DEFAULT 1,
+  next_number  BIGINT NOT NULL DEFAULT 1,
+  is_default   BOOLEAN NOT NULL DEFAULT FALSE,
+  location_id  INT REFERENCES locations(id) ON DELETE CASCADE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS invoice_layouts (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,
+  header_text  TEXT DEFAULT '',
+  sub_header   TEXT DEFAULT '',
+  footer_text  TEXT DEFAULT '',
+  show_logo    BOOLEAN NOT NULL DEFAULT TRUE,
+  show_tax     BOOLEAN NOT NULL DEFAULT TRUE,
+  show_barcode BOOLEAN NOT NULL DEFAULT TRUE,
+  paper        TEXT NOT NULL DEFAULT '80mm',
+  fields_json  JSONB NOT NULL DEFAULT '{}',
+  is_default   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------- warranties ----------
+CREATE TABLE IF NOT EXISTS warranties (
+  id          SERIAL PRIMARY KEY,
+  name        TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  duration    INT NOT NULL DEFAULT 0,
+  duration_unit TEXT NOT NULL DEFAULT 'months' CHECK (duration_unit IN ('days','months','years')),
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE products ADD COLUMN IF NOT EXISTS warranty_id INT REFERENCES warranties(id) ON DELETE SET NULL;
+
+-- ---------- scheduled discounts ----------
+CREATE TABLE IF NOT EXISTS scheduled_discounts (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,
+  scope        TEXT NOT NULL DEFAULT 'all' CHECK (scope IN ('all','category','brand','product','variant')),
+  scope_id     INT,
+  discount_type TEXT NOT NULL DEFAULT 'percent' CHECK (discount_type IN ('percent','fixed')),
+  value        NUMERIC(14,2) NOT NULL DEFAULT 0,
+  location_id  INT REFERENCES locations(id) ON DELETE CASCADE,
+  price_group_id INT REFERENCES price_groups(id) ON DELETE SET NULL,
+  starts_at    TIMESTAMPTZ,
+  ends_at      TIMESTAMPTZ,
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------- barcode label settings ----------
+CREATE TABLE IF NOT EXISTS barcode_settings (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,
+  width_mm     NUMERIC(6,2) NOT NULL DEFAULT 50,
+  height_mm    NUMERIC(6,2) NOT NULL DEFAULT 25,
+  cols         INT NOT NULL DEFAULT 2,
+  rows         INT NOT NULL DEFAULT 7,
+  show_name    BOOLEAN NOT NULL DEFAULT TRUE,
+  show_price   BOOLEAN NOT NULL DEFAULT TRUE,
+  show_variant BOOLEAN NOT NULL DEFAULT TRUE,
+  show_business BOOLEAN NOT NULL DEFAULT FALSE,
+  barcode_type TEXT NOT NULL DEFAULT 'CODE128',
+  is_default   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------- notification templates ----------
+CREATE TABLE IF NOT EXISTS notification_templates (
+  id           SERIAL PRIMARY KEY,
+  key          TEXT NOT NULL,              -- 'sale_complete', 'payment_due', ...
+  channel      TEXT NOT NULL DEFAULT 'whatsapp' CHECK (channel IN ('whatsapp','sms','email')),
+  subject      TEXT DEFAULT '',
+  body         TEXT NOT NULL DEFAULT '',
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (key, channel)
+);
+
+-- ---------- documents & notes on transactions ----------
+CREATE TABLE IF NOT EXISTS transaction_documents (
+  id           BIGSERIAL PRIMARY KEY,
+  entity_type  TEXT NOT NULL,              -- 'sale','purchase','customer','product'
+  entity_id    BIGINT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'note' CHECK (kind IN ('note','document')),
+  title        TEXT DEFAULT '',
+  body         TEXT DEFAULT '',
+  file_name    TEXT,
+  file_data    TEXT,                       -- small files as data URL; large ones stay external
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_txn_docs_entity ON transaction_documents(entity_type, entity_id);
+
+-- ---------- sales orders & shipments ----------
+CREATE TABLE IF NOT EXISTS sales_orders (
+  id           SERIAL PRIMARY KEY,
+  ref          TEXT NOT NULL UNIQUE,
+  location_id  INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  customer_id  INT REFERENCES customers(id) ON DELETE SET NULL,
+  status       TEXT NOT NULL DEFAULT 'open'
+               CHECK (status IN ('open','partial','fulfilled','cancelled')),
+  order_date   DATE NOT NULL DEFAULT CURRENT_DATE,
+  due_date     DATE,
+  subtotal     NUMERIC(14,2) NOT NULL DEFAULT 0,
+  total        NUMERIC(14,2) NOT NULL DEFAULT 0,
+  notes        TEXT DEFAULT '',
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS sales_order_items (
+  id           SERIAL PRIMARY KEY,
+  order_id     INT NOT NULL REFERENCES sales_orders(id) ON DELETE CASCADE,
+  variant_id   INT REFERENCES product_variants(id) ON DELETE SET NULL,
+  quantity     NUMERIC(14,3) NOT NULL,
+  fulfilled_quantity NUMERIC(14,3) NOT NULL DEFAULT 0,
+  unit_price   NUMERIC(14,2) NOT NULL DEFAULT 0
+);
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS sales_order_id INT REFERENCES sales_orders(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS shipments (
+  id           SERIAL PRIMARY KEY,
+  ref          TEXT NOT NULL UNIQUE,
+  sale_id      BIGINT REFERENCES sales(id) ON DELETE SET NULL,
+  sales_order_id INT REFERENCES sales_orders(id) ON DELETE SET NULL,
+  status       TEXT NOT NULL DEFAULT 'pending'
+               CHECK (status IN ('pending','packed','shipped','delivered','cancelled')),
+  carrier      TEXT DEFAULT '',
+  tracking_no  TEXT DEFAULT '',
+  address      TEXT DEFAULT '',
+  shipped_at   TIMESTAMPTZ,
+  delivered_at TIMESTAMPTZ,
+  notes        TEXT DEFAULT '',
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------- purchase requisitions ----------
+CREATE TABLE IF NOT EXISTS purchase_requisitions (
+  id           SERIAL PRIMARY KEY,
+  ref          TEXT NOT NULL UNIQUE,
+  location_id  INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  status       TEXT NOT NULL DEFAULT 'pending'
+               CHECK (status IN ('pending','approved','ordered','received','rejected')),
+  required_by  DATE,
+  notes        TEXT DEFAULT '',
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  approved_by  INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS purchase_requisition_items (
+  id           SERIAL PRIMARY KEY,
+  requisition_id INT NOT NULL REFERENCES purchase_requisitions(id) ON DELETE CASCADE,
+  variant_id   INT REFERENCES product_variants(id) ON DELETE SET NULL,
+  quantity     NUMERIC(14,3) NOT NULL
+);
+
+-- ---------- restaurant module (dormant unless business_type='restaurant') ----------
+CREATE TABLE IF NOT EXISTS restaurant_tables (
+  id           SERIAL PRIMARY KEY,
+  location_id  INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  name         TEXT NOT NULL,
+  seats        INT NOT NULL DEFAULT 2,
+  status       TEXT NOT NULL DEFAULT 'free' CHECK (status IN ('free','occupied','reserved','cleaning')),
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS modifier_sets (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,             -- "Size", "Extras", "Spice level"
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS modifiers (
+  id           SERIAL PRIMARY KEY,
+  set_id       INT NOT NULL REFERENCES modifier_sets(id) ON DELETE CASCADE,
+  name         TEXT NOT NULL,
+  price_delta  NUMERIC(14,2) NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS restaurant_bookings (
+  id           SERIAL PRIMARY KEY,
+  location_id  INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  table_id     INT REFERENCES restaurant_tables(id) ON DELETE SET NULL,
+  customer_id  INT REFERENCES customers(id) ON DELETE SET NULL,
+  customer_name TEXT DEFAULT '',
+  party_size   INT NOT NULL DEFAULT 1,
+  starts_at    TIMESTAMPTZ NOT NULL,
+  ends_at      TIMESTAMPTZ,
+  status       TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked','seated','completed','no_show','cancelled')),
+  notes        TEXT DEFAULT '',
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- A kitchen ticket is a sale that is not yet paid; these columns let the POS
+-- treat a sale as a running table order and route lines to a kitchen screen.
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS table_id INT REFERENCES restaurant_tables(id) ON DELETE SET NULL;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS kitchen_status TEXT
+  CHECK (kitchen_status IN ('new','preparing','ready','served'));
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS modifiers_json JSONB;
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS kitchen_status TEXT
+  CHECK (kitchen_status IN ('new','preparing','ready','served'));
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  PHASE 1 — core catalog × RFID synergy
+--
+--  The EPC is the join key. These columns and two tables make the ERP catalog
+--  features (price tiers, sub-units, bin locations, lots) resolve off a tag
+--  rather than off a cashier's memory.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ---------- A. price tier + B. sub-unit, on the physical tag ----------
+-- What this tag IS: a single retail unit, an inner pack, or a carton. A sweep
+-- can then bill a carton at Wholesale and a pair at Retail in one pass.
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS pack_level TEXT NOT NULL DEFAULT 'unit'
+  CHECK (pack_level IN ('unit','inner','carton'));
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS unit_id INT REFERENCES units(id) ON DELETE SET NULL;
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS price_group_id INT REFERENCES price_groups(id) ON DELETE SET NULL;
+-- A carton tag that physically contains child piece tags. Dormant for footwear
+-- (pairs are tagged, cartons are not) — ready when suppliers tag cartons.
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS parent_unit_id BIGINT REFERENCES stock_units(id) ON DELETE SET NULL;
+
+-- ---------- C. bin / shelf / rack ----------
+CREATE TABLE IF NOT EXISTS bin_locations (
+  id           SERIAL PRIMARY KEY,
+  location_id  INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  zone         TEXT DEFAULT '',
+  aisle        TEXT DEFAULT '',
+  rack         TEXT DEFAULT '',
+  shelf        TEXT DEFAULT '',
+  bin          TEXT DEFAULT '',
+  label        TEXT NOT NULL,           -- "A-3-2" for the shelf edge
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (location_id, label)
+);
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS bin_location_id INT REFERENCES bin_locations(id) ON DELETE SET NULL;
+
+-- ---------- D. lot & expiry ----------
+CREATE TABLE IF NOT EXISTS product_lots (
+  id           SERIAL PRIMARY KEY,
+  variant_id   INT NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+  lot_no       TEXT NOT NULL,
+  mfg_date     DATE,
+  expiry_date  DATE,
+  cost_price   NUMERIC(14,2) NOT NULL DEFAULT 0,
+  received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (variant_id, lot_no)
+);
+ALTER TABLE stock_units ADD COLUMN IF NOT EXISTS lot_id INT REFERENCES product_lots(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_lots_expiry ON product_lots(expiry_date);
+
+-- ---------- E. label template elements ----------
+ALTER TABLE barcode_settings ADD COLUMN IF NOT EXISTS elements_json JSONB NOT NULL DEFAULT '[]';
+
+-- ---------- F. membership card + audit synergy ----------
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS rfid_card_epc TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_card ON customers(rfid_card_epc)
+  WHERE rfid_card_epc IS NOT NULL;
+ALTER TABLE stock_adjustments ADD COLUMN IF NOT EXISTS stock_take_id INT REFERENCES stock_takes(id) ON DELETE SET NULL;
+ALTER TABLE stock_adjustments ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+--  PHASE 2 — advanced sales & POS
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ---------- service types (Courier, Pickup, Tailoring) ----------
+CREATE TABLE IF NOT EXISTS service_types (
+  id           SERIAL PRIMARY KEY,
+  name         TEXT NOT NULL,
+  charge_type  TEXT NOT NULL DEFAULT 'fixed' CHECK (charge_type IN ('fixed','percent')),
+  charge_value NUMERIC(14,2) NOT NULL DEFAULT 0,
+  taxable      BOOLEAN NOT NULL DEFAULT TRUE,
+  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- A service charge applied to a sale (a line that is a service, not stock).
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS service_type_id INT REFERENCES service_types(id) ON DELETE SET NULL;
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS is_service BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ---------- warranty registrations (warranty × RFID unit) ----------
+-- A sold serialized unit gets its warranty clock started here, so a return or
+-- a claim can be checked against the exact tag rather than a paper receipt.
+CREATE TABLE IF NOT EXISTS warranty_registrations (
+  id           BIGSERIAL PRIMARY KEY,
+  unit_id      BIGINT REFERENCES stock_units(id) ON DELETE SET NULL,
+  variant_id   INT REFERENCES product_variants(id) ON DELETE SET NULL,
+  warranty_id  INT REFERENCES warranties(id) ON DELETE SET NULL,
+  sale_id      BIGINT REFERENCES sales(id) ON DELETE SET NULL,
+  customer_id  INT REFERENCES customers(id) ON DELETE SET NULL,
+  epc          TEXT,
+  starts_at    DATE NOT NULL DEFAULT CURRENT_DATE,
+  expires_at   DATE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_warranty_reg_epc ON warranty_registrations(epc);
+CREATE INDEX IF NOT EXISTS idx_warranty_reg_unit ON warranty_registrations(unit_id);
+
+-- ---------- customer payment terms (Net 30) ----------
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS payment_term_days INT NOT NULL DEFAULT 0;
+-- When a credit sale's balance ages past the term, the customer is auto-blocked
+-- from further credit until they pay. This column records why, for the till.
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS credit_block_reason TEXT;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS due_date DATE;
+
+/* ══════════════════════════════════════════════════════════════════════
+   VERSION 6 — PHASE 3: Purchasing & double-entry accounting
+   ══════════════════════════════════════════════════════════════════════ */
+
+-- ---------- chart of accounts ----------
+-- The five roots of double-entry bookkeeping. Every posting lands under one of
+-- these, so a balance sheet and a P&L come from the same ledger rather than
+-- being recomputed from sales and expenses separately.
+CREATE TABLE IF NOT EXISTS chart_of_accounts (
+  id             SERIAL PRIMARY KEY,
+  code           TEXT NOT NULL UNIQUE,
+  name           TEXT NOT NULL,
+  type           TEXT NOT NULL CHECK (type IN ('asset','liability','equity','income','expense')),
+  normal_balance TEXT NOT NULL CHECK (normal_balance IN ('debit','credit')),
+  parent_id      INT REFERENCES chart_of_accounts(id) ON DELETE SET NULL,
+  is_system      BOOLEAN NOT NULL DEFAULT FALSE,   -- seeded accounts the engine posts to
+  is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+  description    TEXT DEFAULT '',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_coa_type ON chart_of_accounts(type);
+
+-- ---------- journal entries (the ledger) ----------
+CREATE TABLE IF NOT EXISTS journal_entries (
+  id           BIGSERIAL PRIMARY KEY,
+  ref          TEXT NOT NULL UNIQUE,
+  entry_date   DATE NOT NULL DEFAULT CURRENT_DATE,
+  memo         TEXT DEFAULT '',
+  source_type  TEXT DEFAULT 'manual',   -- sale | purchase | expense | purchase_return | payment | manual
+  source_id    BIGINT,
+  location_id  INT REFERENCES locations(id) ON DELETE SET NULL,
+  is_posted    BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_journal_source ON journal_entries(source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_journal_date ON journal_entries(entry_date);
+
+CREATE TABLE IF NOT EXISTS journal_lines (
+  id          BIGSERIAL PRIMARY KEY,
+  entry_id    BIGINT NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
+  account_id  INT NOT NULL REFERENCES chart_of_accounts(id) ON DELETE RESTRICT,
+  debit       NUMERIC(14,2) NOT NULL DEFAULT 0,
+  credit      NUMERIC(14,2) NOT NULL DEFAULT 0,
+  memo        TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_journal_lines_entry ON journal_lines(entry_id);
+CREATE INDEX IF NOT EXISTS idx_journal_lines_account ON journal_lines(account_id);
+
+-- Which system account a thing posts to. One row per well-known key, mapped to
+-- a COA account, so the engine never hard-codes an account id.
+CREATE TABLE IF NOT EXISTS account_mappings (
+  mapping_key TEXT PRIMARY KEY,   -- cash, bank, ar, ap, sales_income, cogs, inventory, vat_payable, expense, sales_returns
+  account_id  INT REFERENCES chart_of_accounts(id) ON DELETE SET NULL
+);
+
+-- ---------- purchase returns → debit notes ----------
+-- A purchase return IS the debit note: sending goods back debits the supplier
+-- (they now owe us). These columns turn the existing return into a first-class
+-- debit-note document with its own number and settlement state.
+ALTER TABLE purchase_returns ADD COLUMN IF NOT EXISTS debit_note_no TEXT;
+ALTER TABLE purchase_returns ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'issued'
+  CHECK (status IN ('draft','issued','settled','cancelled'));
+ALTER TABLE purchase_returns ADD COLUMN IF NOT EXISTS settled_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE purchase_returns ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
+
+-- ---------- purchase requisitions: line costs + PO link ----------
+ALTER TABLE purchase_requisition_items ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE purchase_requisitions ADD COLUMN IF NOT EXISTS supplier_id INT REFERENCES suppliers(id) ON DELETE SET NULL;
+ALTER TABLE purchase_requisitions ADD COLUMN IF NOT EXISTS po_id INT REFERENCES purchase_orders(id) ON DELETE SET NULL;
+ALTER TABLE purchase_requisitions ADD COLUMN IF NOT EXISTS rejected_reason TEXT;
+
+-- ---------- recurring expenses ----------
+CREATE TABLE IF NOT EXISTS recurring_expenses (
+  id            SERIAL PRIMARY KEY,
+  name          TEXT NOT NULL,
+  location_id   INT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  category_id   INT REFERENCES expense_categories(id) ON DELETE SET NULL,
+  account_id    INT REFERENCES payment_accounts(id) ON DELETE SET NULL,
+  amount        NUMERIC(14,2) NOT NULL,
+  cadence       TEXT NOT NULL DEFAULT 'monthly' CHECK (cadence IN ('weekly','monthly','quarterly','yearly')),
+  next_due      DATE NOT NULL DEFAULT CURRENT_DATE,
+  last_generated DATE,
+  note          TEXT DEFAULT '',
+  is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by    INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS recurring_id INT REFERENCES recurring_expenses(id) ON DELETE SET NULL;
+
+-- ---------- tax groups: cache a description of members ----------
+ALTER TABLE tax_groups ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
+
+/* ══════════════════════════════════════════════════════════════════════
+   VERSION 6 — PHASE 4: documents, invoice designer & notifications
+   ══════════════════════════════════════════════════════════════════════ */
+
+-- ---------- invoice layouts: richer design + which document they render ----------
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS doc_type TEXT NOT NULL DEFAULT 'receipt'
+  CHECK (doc_type IN ('receipt','invoice','quotation','delivery'));
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS logo_url TEXT DEFAULT '';
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS accent_color TEXT DEFAULT '#0f172a';
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS show_qr BOOLEAN NOT NULL DEFAULT FALSE;   -- e-invoice QR
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS show_signature BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS show_customer BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS show_payment BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS terms_text TEXT DEFAULT '';
+ALTER TABLE invoice_layouts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- ---------- notification log (every dispatch, queued or sent) ----------
+CREATE TABLE IF NOT EXISTS notification_log (
+  id           BIGSERIAL PRIMARY KEY,
+  channel      TEXT NOT NULL CHECK (channel IN ('whatsapp','sms','email')),
+  template_key TEXT DEFAULT '',
+  recipient    TEXT DEFAULT '',              -- phone or email
+  subject      TEXT DEFAULT '',
+  body         TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'queued'
+               CHECK (status IN ('queued','sent','failed','skipped')),
+  error        TEXT DEFAULT '',
+  link         TEXT DEFAULT '',              -- wa.me / mailto / receipt link the UI can open
+  entity_type  TEXT DEFAULT '',
+  entity_id    BIGINT,
+  customer_id  INT REFERENCES customers(id) ON DELETE SET NULL,
+  created_by   INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_notif_log_entity ON notification_log(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_notif_log_created ON notification_log(created_at DESC);
+
+-- ---------- notification provider settings (one row) ----------
+CREATE TABLE IF NOT EXISTS notification_settings (
+  id              INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  whatsapp_enabled BOOLEAN NOT NULL DEFAULT TRUE,   -- wa.me links, no gateway needed
+  sms_enabled     BOOLEAN NOT NULL DEFAULT FALSE,
+  email_enabled   BOOLEAN NOT NULL DEFAULT FALSE,
+  sms_gateway_url TEXT DEFAULT '',                  -- provider-agnostic HTTP gateway
+  sms_sender_id   TEXT DEFAULT '',
+  email_from      TEXT DEFAULT '',
+  auto_on_sale    BOOLEAN NOT NULL DEFAULT FALSE,   -- queue a receipt notification on every sale
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO notification_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- ---------- transaction_documents: file typing + size ----------
+ALTER TABLE transaction_documents ADD COLUMN IF NOT EXISTS content_type TEXT DEFAULT '';
+ALTER TABLE transaction_documents ADD COLUMN IF NOT EXISTS file_size INT NOT NULL DEFAULT 0;

@@ -1,11 +1,14 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, Star, Wallet, CreditCard, Receipt, Plus, Minus } from 'lucide-react';
+import {
+  ArrowLeft, Star, Wallet, CreditCard, Receipt, Plus, Minus, Radio, Square, Ban, ShieldCheck, Clock,
+} from 'lucide-react';
 import { api } from '../lib/api.js';
 import { money, num, date, dateTime, labelize } from '../lib/format.js';
 import { Card, Loading, Empty, Badge, Stat, Modal, useToast, Field, Tabs } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
+import { useRfidScan } from '../lib/useRfidScan.jsx';
 import { CustomerModal } from './Customers.jsx';
 
 export default function CustomerDetail() {
@@ -34,6 +37,13 @@ export default function CustomerDetail() {
     } catch (e) { toast.error(e.message); }
   };
 
+  const unblock = async () => {
+    try {
+      await api.post(`/api/customers/${id}/credit-block`, { blocked: false });
+      toast.success('Credit unblocked'); load();
+    } catch (e) { toast.error(e.message); }
+  };
+
   return (
     <>
       <PageHeader title={c.name}
@@ -44,15 +54,42 @@ export default function CustomerDetail() {
             {can('customers.write') && (
               <>
                 <button className="btn-secondary" onClick={() => setEditing(true)}>Edit</button>
+                <button className="btn-secondary" onClick={() => setModal('card')}>
+                  <Radio size={16} /> {c.rfid_card_epc ? 'Card linked' : 'Link card'}
+                </button>
                 {Number(c.balance) > 0 && (
                   <button className="btn-primary" onClick={() => setModal('payment')}>
                     <CreditCard size={16} /> Take payment
                   </button>
                 )}
+                {can('customers.credit') && (
+                  c.credit_blocked ? (
+                    <button className="btn-secondary" onClick={() => unblock()}>
+                      <ShieldCheck size={16} /> Unblock credit
+                    </button>
+                  ) : (
+                    <button className="btn-secondary" onClick={() => setModal('block')}>
+                      <Ban size={16} /> Block credit
+                    </button>
+                  )
+                )}
               </>
             )}
           </>
         } />
+
+      {c.credit_blocked && (
+        <div className="mb-4 flex items-center gap-2 rounded-lg bg-rose-50 ring-1 ring-rose-200 px-4 py-3 text-sm text-rose-800">
+          <Ban size={16} />
+          <span className="font-medium">Credit blocked.</span>
+          <span>{c.credit_block_reason || 'This customer cannot buy on credit until cleared.'}</span>
+        </div>
+      )}
+      {!c.credit_blocked && Number(c.payment_term_days) > 0 && (
+        <div className="mb-4 flex items-center gap-2 text-xs text-slate-500">
+          <Clock size={13} /> Credit sales are Net-{c.payment_term_days}: due {c.payment_term_days} days after purchase.
+        </div>
+      )}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
         <Stat label="Lifetime value"
@@ -177,7 +214,16 @@ export default function CustomerDetail() {
           }} />
       )}
 
-      {modal && (
+      {modal === 'card' && (
+        <CardModal customer={c} onClose={() => setModal(null)} onDone={() => { setModal(null); load(); }} />
+      )}
+
+      {modal === 'block' && (
+        <BlockModal customer={c} onClose={() => setModal(null)}
+          onSubmit={(reason) => action('credit-block', { blocked: true, reason }, 'Credit blocked')} />
+      )}
+
+      {modal && modal !== 'card' && modal !== 'block' && (
         <AdjustModal kind={modal} customer={c} onClose={() => setModal(null)}
           onSubmit={(body) => {
             if (modal === 'payment') return action('payments', body, 'Payment recorded');
@@ -186,6 +232,24 @@ export default function CustomerDetail() {
           }} />
       )}
     </>
+  );
+}
+
+function BlockModal({ customer, onClose, onSubmit }) {
+  const [reason, setReason] = useState('');
+  return (
+    <Modal open onClose={onClose} size="sm" title="Block credit" subtitle={customer.name}
+      footer={<><button className="btn-secondary" onClick={onClose}>Cancel</button>
+        <button className="btn-danger" onClick={() => onSubmit(reason)}>
+          <Ban size={15} /> Block</button></>}>
+      <p className="text-sm text-slate-600 mb-3">
+        While blocked, this customer's credit sales are refused at the till. Existing balances are unaffected.
+      </p>
+      <Field label="Reason" hint="Shown on the customer and in the audit log">
+        <input className="input" value={reason} onChange={(e) => setReason(e.target.value)}
+          placeholder="Overdue invoice, disputed balance…" autoFocus />
+      </Field>
+    </Modal>
   );
 }
 
@@ -234,6 +298,61 @@ function AdjustModal({ kind, customer, onClose, onSubmit }) {
           </Field>
         )}
       </div>
+    </Modal>
+  );
+}
+
+/**
+ * Link a membership card to this customer.
+ *
+ * The card is an EPC like any tag. Once bound, scanning it at the till pulls
+ * this customer — loyalty, credit, block status — before the first item rings
+ * up. That is the sales half of the RFID synergy.
+ */
+function CardModal({ customer, onClose, onDone }) {
+  const toast = useToast();
+  const [epc, setEpc] = useState(customer.rfid_card_epc || '');
+  const [busy, setBusy] = useState(false);
+  const scan = useRfidScan((c) => setEpc(c), { dedupeMs: 500, tagsOnly: true });
+
+  const save = async (value) => {
+    setBusy(true);
+    try {
+      await api.post(`/api/customers/${customer.id}/card`, { epc: value });
+      toast.success(value ? 'Card linked' : 'Card removed');
+      onDone();
+    } catch (e) { toast.error(e.message); } finally { setBusy(false); }
+  };
+
+  return (
+    <Modal open onClose={onClose} size="sm" title="Membership card"
+      subtitle={customer.name}
+      footer={
+        <>
+          {customer.rfid_card_epc && (
+            <button className="btn-secondary mr-auto text-rose-600" onClick={() => save('')} disabled={busy}>
+              Remove card
+            </button>
+          )}
+          <button className="btn-secondary" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={() => save(epc.trim())} disabled={busy || !epc.trim()}>
+            Link card
+          </button>
+        </>
+      }>
+      <scan.CaptureField />
+      <Field label="Card code" hint="Pull the trigger on the card, or type the number">
+        <input className="input font-mono" autoFocus value={epc}
+          onChange={(e) => setEpc(e.target.value)} placeholder="Scan the membership card" />
+      </Field>
+      {scan.native && (
+        <button onClick={scan.toggle} className={`${scan.scanning ? 'btn-danger' : 'btn-secondary'} w-full mt-2`}>
+          {scan.scanning ? <><Square size={16} /> Stop reading</> : <><Radio size={16} /> Read a card</>}
+        </button>
+      )}
+      <p className="text-xs text-slate-500 mt-3">
+        Anyone who scans this card at the counter pulls up {customer.name} automatically.
+      </p>
     </Modal>
   );
 }

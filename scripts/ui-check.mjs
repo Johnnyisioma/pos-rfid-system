@@ -78,6 +78,31 @@ const PAGES = [
   ['commission-rules', '/commissions?tab=rules'],
   ['reports-deadstock', '/reports?tab=deadstock'],
   ['settings-features', '/settings?tab=features'],
+  // v6 phase 1
+  ['catalog-units', '/catalog-setup?tab=units'],
+  ['catalog-tiers', '/catalog-setup?tab=tiers'],
+  ['catalog-bins', '/catalog-setup?tab=bins'],
+  ['catalog-labels', '/catalog-setup?tab=labels'],
+  ['catalog-lots', '/catalog-setup?tab=lots'],
+  // v6 phase 2
+  ['sales-orders', '/sales-orders?tab=orders'],
+  ['shipments', '/sales-orders?tab=shipments'],
+  ['services', '/services?tab=services'],
+  ['warranties', '/services?tab=warranties'],
+  ['warranty-check', '/services?tab=check'],
+  // v6 phase 3
+  ['requisitions', '/requisitions'],
+  ['accounting-coa', '/accounting?tab=coa'],
+  ['accounting-journal', '/accounting?tab=journal'],
+  ['accounting-trial', '/accounting?tab=trial'],
+  ['accounting-balance', '/accounting?tab=balance'],
+  ['accounting-pl', '/accounting?tab=pl'],
+  ['expenses-recurring', '/expenses?tab=recurring'],
+  // v6 phase 4
+  ['documents-layouts', '/documents?tab=layouts'],
+  ['documents-templates', '/documents?tab=templates'],
+  ['documents-settings', '/documents?tab=settings'],
+  ['documents-log', '/documents?tab=log'],
 ];
 
 const IGNORE = [

@@ -28,7 +28,41 @@ r.get('/', h(async (req, res) => {
   res.json({ data: rows, page, limit, total: total.n });
 }));
 
-r.get('/:id', h(async (req, res) => {
+/**
+ * Scan a membership card at the till.
+ *
+ * The card is an EPC like any tag, so this closes the sales synergy: one scan
+ * at the counter pulls the customer, their loyalty balance, their credit limit
+ * and whether they are blocked — before the first item is rung up.
+ */
+r.get('/by-card/:epc', h(async (req, res) => {
+  const epc = String(req.params.epc || '').trim().toUpperCase();
+  if (!epc) throw bad('No card code.');
+  const c = await one(
+    `SELECT c.*, g.name AS group_name, g.discount_percent, g.price_group_id
+       FROM customers c LEFT JOIN customer_groups g ON g.id=c.group_id
+      WHERE c.rfid_card_epc = $1`, [epc]);
+  if (!c) throw notFound('No customer is linked to that card.');
+  res.json(c);
+}));
+
+/** Bind (or clear) a membership card on a customer. */
+r.post('/:id(\\d+)/card', requirePerm('customers.write'), h(async (req, res) => {
+  const epc = str(req.body.epc).trim().toUpperCase() || null;
+  if (epc) {
+    const clash = await one(
+      'SELECT id, name FROM customers WHERE rfid_card_epc=$1 AND id<>$2', [epc, req.params.id]);
+    if (clash) throw bad(`That card is already ${clash.name}'s. Use a different card.`);
+  }
+  const row = await one(
+    'UPDATE customers SET rfid_card_epc=$2 WHERE id=$1 RETURNING id, name, rfid_card_epc',
+    [req.params.id, epc]);
+  if (!row) throw notFound('Customer not found');
+  await audit(req, epc ? 'link_card' : 'unlink_card', 'customer', row.id, {});
+  res.json(row);
+}));
+
+r.get("/:id(\\d+)", h(async (req, res) => {
   const c = await one(
     `SELECT c.*, g.name AS group_name, g.discount_percent
        FROM customers c LEFT JOIN customer_groups g ON g.id=c.group_id WHERE c.id=$1`, [req.params.id]);
@@ -53,10 +87,11 @@ r.post('/', requirePerm('customers.write'), h(async (req, res) => {
   const name = str(req.body.name).trim();
   if (!name) throw bad('Customer name is required');
   const row = await one(
-    `INSERT INTO customers (name, phone, email, address, group_id, credit_limit, notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    `INSERT INTO customers (name, phone, email, address, group_id, credit_limit, notes, payment_term_days)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
     [name, str(req.body.phone) || null, str(req.body.email) || null, str(req.body.address),
-     req.body.group_id || null, num(req.body.credit_limit, 0), str(req.body.notes)]);
+     req.body.group_id || null, num(req.body.credit_limit, 0), str(req.body.notes),
+     int(req.body.payment_term_days, 0)]);
   await audit(req, 'create', 'customer', row.id, { name });
   res.status(201).json(row);
 }));
@@ -65,11 +100,13 @@ r.put('/:id', requirePerm('customers.write'), h(async (req, res) => {
   const row = await one(
     `UPDATE customers SET name=COALESCE($2,name), phone=$3, email=$4, address=COALESCE($5,address),
             group_id=$6, credit_limit=COALESCE($7,credit_limit), notes=COALESCE($8,notes),
-            is_active=COALESCE($9,is_active)
+            is_active=COALESCE($9,is_active),
+            payment_term_days=COALESCE($10,payment_term_days)
       WHERE id=$1 RETURNING *`,
     [req.params.id, req.body.name ?? null, str(req.body.phone) || null, str(req.body.email) || null,
      req.body.address ?? null, req.body.group_id || null, req.body.credit_limit ?? null,
-     req.body.notes ?? null, 'is_active' in req.body ? bool(req.body.is_active) : null]);
+     req.body.notes ?? null, 'is_active' in req.body ? bool(req.body.is_active) : null,
+     req.body.payment_term_days != null ? int(req.body.payment_term_days, 0) : null]);
   if (!row) throw notFound('Customer not found');
   await audit(req, 'update', 'customer', row.id, { fields: Object.keys(req.body) });
   res.json(row);
@@ -137,6 +174,49 @@ r.post('/:id/loyalty', requirePerm('customers.write'), h(async (req, res) => {
     [req.params.id, points]);
   await audit(req, 'loyalty_adjust', 'customer', req.params.id, { points });
   res.json(row);
+}));
+
+/**
+ * Block or unblock a customer's credit by hand.
+ *
+ * The auto-block sweep below does this automatically for overdue debt, but a
+ * manager also needs the manual switch — a customer who bounced a transfer, say.
+ */
+r.post('/:id(\\d+)/credit-block', requirePerm('customers.credit'), h(async (req, res) => {
+  const blocked = req.body.blocked !== false;
+  const row = await one(
+    `UPDATE customers SET credit_blocked=$2,
+            credit_block_reason = CASE WHEN $2 THEN $3 ELSE NULL END WHERE id=$1
+     RETURNING id, name, credit_blocked, credit_block_reason`,
+    [req.params.id, blocked, str(req.body.reason) || 'Blocked by a manager']);
+  if (!row) throw notFound('Customer not found');
+  await audit(req, blocked ? 'credit_block' : 'credit_unblock', 'customer', row.id, {});
+  res.json(row);
+}));
+
+/**
+ * Auto-block everyone whose credit sale is past its due date, and unblock
+ * anyone who has since cleared their balance.
+ *
+ * Run from the app (a manager opening the receivables report), not a cron, so
+ * it happens when someone is looking and can act on the result.
+ */
+r.post('/enforce-terms', requirePerm('customers.credit'), h(async (req, res) => {
+  const blocked = await many(
+    `UPDATE customers c SET credit_blocked=TRUE,
+            credit_block_reason='Overdue invoice past payment term'
+      WHERE c.credit_blocked=FALSE AND c.balance > 0
+        AND EXISTS (SELECT 1 FROM sales s
+                     WHERE s.customer_id=c.id AND s.balance_due > 0
+                       AND s.due_date IS NOT NULL AND s.due_date < CURRENT_DATE)
+      RETURNING c.id, c.name`);
+  const cleared = await many(
+    `UPDATE customers c SET credit_blocked=FALSE, credit_block_reason=NULL
+      WHERE c.credit_blocked=TRUE AND c.balance <= 0
+      RETURNING c.id, c.name`);
+  await audit(req, 'enforce_terms', 'customers', 0,
+    { blocked: blocked.length, cleared: cleared.length });
+  res.json({ blocked, cleared });
 }));
 
 export default r;

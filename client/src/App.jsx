@@ -36,6 +36,12 @@ import Devices from './pages/Devices.jsx';
 import AuditLog from './pages/AuditLog.jsx';
 import Quarantine from './pages/Quarantine.jsx';
 import Commissions from './pages/Commissions.jsx';
+import CatalogSetup from './pages/CatalogSetup.jsx';
+import SalesOrders from './pages/SalesOrders.jsx';
+import ServicesWarranties from './pages/ServicesWarranties.jsx';
+import Accounting from './pages/Accounting.jsx';
+import Requisitions from './pages/Requisitions.jsx';
+import Documents from './pages/Documents.jsx';
 import PublicReceipt from './pages/PublicReceipt.jsx';
 
 function Protected({ children }) {
@@ -80,14 +86,20 @@ export default function App() {
         <Route path="rfid/find" element={<FindItem />} />
         <Route path="rfid/quarantine" element={<Quarantine />} />
         <Route path="commissions" element={<Commissions />} />
+        <Route path="catalog-setup" element={<CatalogSetup />} />
         <Route path="customers" element={<Customers />} />
         <Route path="customers/:id" element={<CustomerDetail />} />
         <Route path="sales" element={<Sales />} />
         <Route path="sales/:id" element={<SaleDetail />} />
+        <Route path="sales-orders" element={<SalesOrders />} />
+        <Route path="services" element={<ServicesWarranties />} />
         <Route path="returns" element={<Returns />} />
         <Route path="register" element={<Register />} />
         <Route path="expenses" element={<Expenses />} />
         <Route path="accounts" element={<Accounts />} />
+        <Route path="accounting" element={<Accounting />} />
+        <Route path="requisitions" element={<Requisitions />} />
+        <Route path="documents" element={<Documents />} />
         <Route path="reports" element={<Reports />} />
         <Route path="settings" element={<Settings />} />
         <Route path="devices" element={<Devices />} />

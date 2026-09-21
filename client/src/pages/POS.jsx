@@ -169,7 +169,12 @@ export default function POS() {
 
   const handleScan = async (code) => {
     try {
-      const res = await api.post('/api/rfid/resolve', { codes: [code], context: 'checkout' });
+      const res = await api.post('/api/rfid/resolve', {
+        codes: [code], context: 'checkout',
+        // Catalog synergy: the customer's group carries a price tier, so the
+        // same tag rings up at Retail or Wholesale automatically.
+        price_group_id: customer?.price_group_id || null,
+      });
       const hit = res.results[0];
       if (hit.resolved) {
         const u = hit.unit;
@@ -183,7 +188,7 @@ export default function POS() {
         }
         addToCart({
           variant_id: u.variant_id, name: u.product_name, size: u.size, color: u.color,
-          sku: u.variant_sku, price: u.selling_price, tax_rate: vatRate, stock: 1,
+          sku: u.variant_sku, price: u.effective_price ?? u.selling_price, tax_rate: vatRate, stock: 1,
         }, { epc: u.epc });
         toast.success(`Added ${u.product_name} — unit #${u.serial}`);
         return;

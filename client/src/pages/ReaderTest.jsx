@@ -28,20 +28,39 @@ import {
  * lost afternoon.
  */
 
-const EPC_LEN = 24;
+const EPC_MINTED_LEN = 24;   // what this system mints: 96-bit
+const EPC_MIN = 16;          // 64-bit, the smallest Gen2 EPC in the wild
+const EPC_MAX = 62;          // the Gen2 EPC bank tops out around 496 bits
 const IDLE_MS = 300;   // generous here — this screen is diagnosing, not counting
 
 const classify = (raw) => {
   const s = String(raw).trim();
   const stripped = s.replace(/^epc[:=]/i, '').replace(/[\s:\-_.]/g, '').toUpperCase();
+  const isHex = /^[0-9A-F]+$/.test(stripped);
 
-  if (/^[0-9A-F]+$/.test(stripped) && stripped.length === EPC_LEN) {
-    return { kind: 'epc', label: 'Valid EPC', tone: 'good',
-      note: 'A 96-bit EPC. This is what the RFID chip holds.' };
+  // A usable Gen2 EPC is any even-length hex string from 64 to 496 bits — NOT
+  // only the 96-bit ones this system mints. Factory-encoded inlays are very
+  // often 128-bit (32 chars), and reporting those as "unrecognised" is exactly
+  // the false alarm this line exists to prevent. Mirrors isEpcHex() on the
+  // server, which is the check the till and the stock take actually use.
+  if (isHex && stripped.length >= EPC_MIN && stripped.length <= EPC_MAX && stripped.length % 2 === 0) {
+    const bits = stripped.length * 4;
+    const minted = stripped.length === EPC_MINTED_LEN;
+    return { kind: 'epc', label: `Valid EPC · ${bits}-bit`, tone: 'good',
+      note: minted
+        ? 'A 96-bit EPC, the size this system mints. This is what the RFID chip holds.'
+        : `A ${bits}-bit EPC — a factory-encoded tag. Read correctly; it just was not minted here.` };
   }
-  if (/^[0-9A-F]+$/.test(stripped) && stripped.length > 8) {
+  // Hex, but a length a Gen2 EPC never has: odd, too short, or past the bank.
+  // The likeliest cause is the reader sending TID rather than the EPC bank.
+  if (isHex && stripped.length > 8) {
+    const why = stripped.length % 2
+      ? `${stripped.length} characters — an odd length, which no EPC has`
+      : stripped.length < EPC_MIN
+        ? `only ${stripped.length} characters`
+        : `${stripped.length} characters — longer than an EPC bank holds`;
     return { kind: 'hex', label: `Hex, ${stripped.length} chars`, tone: 'warn',
-      note: `Looks like a tag but is ${stripped.length} characters, not ${EPC_LEN}. The reader may be sending TID or a different memory bank instead of EPC.` };
+      note: `Looks like a tag but is ${why}. The reader may be sending TID or a different memory bank instead of EPC.` };
   }
   // A printed label is the variant SKU plus a zero-padded serial, and the SKU
   // itself contains dashes — "MF-OXFORD-41-BLACK-000014", not just "SKU-000014".
@@ -413,9 +432,10 @@ export default function ReaderTest() {
               suffix to Enter / CR. Without it, fast reads can run into each other.
             </p>
             <p>
-              <strong className="text-slate-800">Wrong length.</strong> A tag should arrive as
-              exactly {EPC_LEN} hex characters. More or fewer usually means the reader is sending
-              the TID rather than the EPC bank.
+              <strong className="text-slate-800">Wrong length.</strong> An EPC arrives as an even
+              number of hex characters, anywhere from 16 (64-bit) to 62. A 96-bit tag is 24 and a
+              factory 128-bit tag is 32 — both are fine. An odd length, or one far outside that
+              range, usually means the reader is sending the TID rather than the EPC bank.
             </p>
             <p>
               <strong className="text-slate-800">Right format, no match.</strong> The reader is

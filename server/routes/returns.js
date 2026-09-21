@@ -4,6 +4,7 @@ import { h, bad, notFound, str, num, int, bool, paging, nextRef, money, getSetti
 import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
 import { clawbackForReturn } from '../services/commission.js';
+import { postSalesReturn } from '../services/autopost.js';
 import { moveStock, receiveUnits } from '../services/inventory.js';
 import { createSale, loadSale } from './sales.js';
 import { resolveAccountId } from '../services/accounts.js';
@@ -206,6 +207,12 @@ r.post('/', requirePerm('returns.create'), h(async (req, res) => {
         console.error('[commission] clawback failed for return', ret.id, e.message);
       }
     }
+
+    // Book the refund to the ledger (Dr Sales returns, Cr Cash).
+    try {
+      await postSalesReturn(c, ret.id, totalRefund,
+        { locationId: ret.location_id, userId: req.user.id, ref: ret.ref });
+    } catch (e) { console.error('[ledger] return posting failed', ret.id, e.message); }
 
     return { ret, totalRefund, exchangeSale, netDue };
   });

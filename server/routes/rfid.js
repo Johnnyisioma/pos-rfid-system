@@ -386,7 +386,7 @@ r.get('/units/:id/zpl', h(async (req, res) => {
 }));
 
 /* ---------------- resolve a scanned code ---------------- */
-async function resolveOne(epcRaw, { locationId = null, context = 'lookup', userId = null, deviceId = null, rssi = null }) {
+async function resolveOne(epcRaw, { locationId = null, context = 'lookup', userId = null, deviceId = null, rssi = null, priceGroupId = null }) {
   const epc = normalizeEpc(epcRaw);
   const parts = parseEpc(epc);
 
@@ -409,6 +409,25 @@ async function resolveOne(epcRaw, { locationId = null, context = 'lookup', userI
     [epc || String(epcRaw), unit?.id || null, locationId, deviceId, context, rssi, !!unit, userId]);
 
   if (unit) await query('UPDATE stock_units SET last_seen_at=now() WHERE id=$1', [unit.id]);
+
+  /*
+    Catalog synergy: resolve the price this tag should ring up at.
+
+    A tag carries its own tier (stock_units.price_group_id) and its pack level.
+    Failing that, the customer's tier (priceGroupId, from a scanned membership
+    card) applies. The tier price falls back to the variant's shelf price when
+    no override exists — so a shop that never sets tiers is unaffected.
+  */
+  if (unit) {
+    const tier = unit.price_group_id || priceGroupId || null;
+    if (tier) {
+      const tp = await one(
+        'SELECT price FROM variant_group_prices WHERE variant_id=$1 AND group_id=$2',
+        [unit.variant_id, tier]);
+      if (tp) { unit.tier_price = Number(tp.price); unit.price_group_id = tier; }
+    }
+    unit.effective_price = unit.tier_price != null ? unit.tier_price : Number(unit.selling_price);
+  }
 
   return {
     input: String(epcRaw),
@@ -436,6 +455,7 @@ r.post('/resolve', h(async (req, res) => {
   for (const code of codes.slice(0, 2000)) {
     results.push(await resolveOne(code, {
       locationId: req.locationId, context: str(req.body.context, 'lookup'), userId: req.user.id,
+      priceGroupId: req.body.price_group_id ? int(req.body.price_group_id, null) : null,
     }));
   }
   res.json({ count: results.length, resolved: results.filter((x) => x.resolved).length, results });
@@ -687,11 +707,16 @@ r.post('/stock-takes/:id/reconcile', requirePerm('rfid.stocktake'), h(async (req
     let wroteOff = 0;
     if (writeOff && missing.length) {
       const ref = await nextRef(c, 'stock_adjustments', 'ADJ');
+      // Audit synergy: the adjustment is traceable to the sweep that spawned it
+      // (stock_take_id) and marked as machine-drafted (source) rather than a
+      // clerk's manual entry, so a manager reviewing shrinkage can tell the two
+      // apart and drill from the number straight back to the count.
       const { rows: adjRows } = await c.query(
-        `INSERT INTO stock_adjustments (ref,location_id,reason,notes,user_id)
-         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        `INSERT INTO stock_adjustments (ref,location_id,reason,notes,user_id,stock_take_id,source)
+         VALUES ($1,$2,$3,$4,$5,$6,'stock_take') RETURNING *`,
         [ref, take.location_id, 'Stock take shortage',
-         `Units not found during ${take.ref}`, req.user.id]);
+         `Auto-drafted from ${take.ref}: units counted short during the sweep.`,
+         req.user.id, id]);
       const adj = adjRows[0];
       const byVariant = new Map();
       for (const u of missing) byVariant.set(u.variant_id, (byVariant.get(u.variant_id) || 0) + 1);

@@ -5,6 +5,7 @@ import { requirePerm } from '../middleware/auth.js';
 import { audit } from '../lib/audit.js';
 import { receiveUnits, allocateUnits, setUnitStatus, moveStock } from '../services/inventory.js';
 import { nextRef } from '../lib/util.js';
+import { postPurchaseReceipt, postPurchaseReturn } from '../services/autopost.js';
 
 const r = Router();
 
@@ -134,6 +135,7 @@ r.post('/:id/receive', requirePerm('purchases.write'), h(async (req, res) => {
     if (po.status === 'cancelled') throw bad('That purchase order was cancelled');
 
     const createdUnits = [];
+    let receivedValue = 0;
     for (const line of lines) {
       const itemId = int(line.item_id);
       const qty = Math.round(num(line.quantity, 0));
@@ -154,6 +156,7 @@ r.post('/:id/receive', requirePerm('purchases.write'), h(async (req, res) => {
         userId: req.user.id, type: 'purchase', reason: `Received on ${po.po_number}`,
       });
       createdUnits.push(...units);
+      receivedValue += qty * unitCost;
 
       await c.query(
         'UPDATE purchase_order_items SET received_quantity = received_quantity + $2, unit_cost=$3 WHERE id=$1',
@@ -170,6 +173,11 @@ r.post('/:id/receive', requirePerm('purchases.write'), h(async (req, res) => {
       : Number(totals[0].received) > 0 ? 'partial' : po.status;
     await c.query('UPDATE purchase_orders SET status=$2 WHERE id=$1', [po.id, status]);
     await recalcPo(c, po.id);
+    // Book goods received into inventory against accounts payable.
+    try {
+      await postPurchaseReceipt(c, po.id, receivedValue,
+        { locationId: po.location_id, userId: req.user.id, memo: `Goods received (${po.po_number})` });
+    } catch (e) { console.error('[ledger] purchase receipt posting failed', po.id, e.message); }
     return { po, units: createdUnits, status };
   });
 
@@ -211,11 +219,14 @@ r.post('/returns', requirePerm('purchases.write'), h(async (req, res) => {
 
   const out = await tx(async (c) => {
     const ref = await nextRef(c, 'purchase_returns', 'PRT');
+    // The return doubles as a debit note to the supplier — numbered off the
+    // same unique sequence (PRT-2026-000005 → DN-2026-000005).
+    const debitNoteNo = `DN-${ref.replace(/^PRT-/, '')}`;
     const { rows } = await c.query(
-      `INSERT INTO purchase_returns (ref, po_id, supplier_id, location_id, reason, notes, credit_note, user_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      `INSERT INTO purchase_returns (ref, po_id, supplier_id, location_id, reason, notes, credit_note, user_id, debit_note_no, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'issued') RETURNING *`,
       [ref, int(req.body.po_id) || null, int(req.body.supplier_id) || null, locationId,
-       reason, str(req.body.notes), str(req.body.credit_note), req.user.id]);
+       reason, str(req.body.notes), str(req.body.credit_note), req.user.id, debitNoteNo]);
     const ret = rows[0];
 
     let total = 0;
@@ -263,12 +274,16 @@ r.post('/returns', requirePerm('purchases.write'), h(async (req, res) => {
       await c.query('UPDATE suppliers SET amount_due = GREATEST(0, amount_due - $2) WHERE id=$1',
         [ret.supplier_id, total]);
     }
-    return { ret, total };
+    // Book the debit note: Dr Accounts payable, Cr Inventory.
+    try { await postPurchaseReturn(c, ret.id); }
+    catch (e) { console.error('[ledger] purchase return posting failed', ret.id, e.message); }
+    return { ret, total, debitNoteNo };
   });
 
   await audit(req, 'create', 'purchase_return', out.ret.id, {
     ref: out.ret.ref, total: out.total, reason });
-  res.status(201).json({ ok: true, ref: out.ret.ref, id: out.ret.id, total: out.total });
+  res.status(201).json({ ok: true, ref: out.ret.ref, id: out.ret.id, total: out.total,
+    debit_note_no: out.debitNoteNo });
 }));
 
 r.get('/returns', h(async (req, res) => {
@@ -313,6 +328,24 @@ r.get('/returns/:id', h(async (req, res) => {
        JOIN product_variants v ON v.id=su.variant_id
        JOIN products p ON p.id=v.product_id WHERE pru.return_id=$1`, [req.params.id]);
   res.json(ret);
+}));
+
+/**
+ * Settle a debit note — the supplier has credited us (refund, or set against
+ * the next invoice). Records how much and closes the note when fully settled.
+ */
+r.post('/returns/:id(\\d+)/settle', requirePerm('purchases.payment'), h(async (req, res) => {
+  const amount = num(req.body.amount, 0);
+  if (amount <= 0) throw bad('Enter a settlement amount.');
+  const row = await one(
+    `UPDATE purchase_returns
+        SET settled_amount = LEAST(total, settled_amount + $2),
+            status = CASE WHEN settled_amount + $2 >= total THEN 'settled' ELSE status END,
+            settled_at = CASE WHEN settled_amount + $2 >= total THEN now() ELSE settled_at END
+      WHERE id=$1 AND status <> 'cancelled' RETURNING *`, [req.params.id, amount]);
+  if (!row) throw notFound('Debit note not found');
+  await audit(req, 'settle', 'purchase_return', row.id, { amount, status: row.status });
+  res.json(row);
 }));
 
 /** Suggested reorder list from reorder points, grouped by supplier's last price. */

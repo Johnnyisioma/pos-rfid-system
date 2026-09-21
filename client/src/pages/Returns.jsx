@@ -1,10 +1,13 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useSearchParams, Link } from 'react-router-dom';
-import { RotateCcw, Search, Plus, Trash2, ScanLine, ArrowRight } from 'lucide-react';
-import { api, qs } from '../lib/api.js';
-import { money, num, dateTime, labelize, variantLabel } from '../lib/format.js';
 import {
-  Card, Loading, Empty, Badge, Modal, Pagination, useToast, Field, Spinner, Tabs,
+  RotateCcw, Search, Plus, Trash2, ScanLine, ArrowRight, ShieldCheck, ShieldX, Radio, Square,
+} from 'lucide-react';
+import { api, qs } from '../lib/api.js';
+import { money, num, dateTime, labelize, variantLabel, date } from '../lib/format.js';
+import { useRfidScan } from '../lib/useRfidScan.jsx';
+import {
+  Card, Loading, Empty, Badge, Modal, Pagination, useToast, Field, Spinner, Tabs, ScanInput,
 } from '../components/ui.jsx';
 import { PageHeader } from '../components/Layout.jsx';
 import { useAuth } from '../lib/auth.jsx';
@@ -30,7 +33,7 @@ export default function Returns() {
 
 function NewReturn({ initialInvoice, onDone }) {
   const toast = useToast();
-  const { can } = useAuth();
+  const { can, feature } = useAuth();
   const [invoice, setInvoice] = useState(initialInvoice);
   const [sale, setSale] = useState(null);
   const [lines, setLines] = useState([]);
@@ -122,6 +125,8 @@ function NewReturn({ initialInvoice, onDone }) {
             No receipt? Process without one <ArrowRight size={13} />
           </button>
 
+          {feature('warranties') && <WarrantyScan onSale={(inv) => { setInvoice(inv); }} />}
+
           {sale && (
             <div className="mt-4 rounded-lg bg-slate-50 p-3 text-sm">
               <div className="flex flex-wrap gap-x-6 gap-y-1">
@@ -187,6 +192,52 @@ function NewReturn({ initialInvoice, onDone }) {
           </button>
         </Card>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Warranty × RFID for returns: scan the item coming back and the exact serial
+ * says whether it is still covered — and, if the tag was sold here, which
+ * invoice it came off, which the cashier can load with one click.
+ */
+function WarrantyScan({ onSale }) {
+  const [res, setRes] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const check = useCallback(async (epc) => {
+    const code = String(epc || '').trim();
+    if (!code) return;
+    setBusy(true);
+    try { setRes(await api.get(`/api/svc/warranty-check/${encodeURIComponent(code)}`)); }
+    catch (e) { setRes({ registered: false, epc: code, error: e.message }); }
+    finally { setBusy(false); }
+  }, []);
+  const scan = useRfidScan(check, { dedupeMs: 2000, tagsOnly: true });
+
+  return (
+    <div className="mt-3 border-t border-slate-100 pt-3">
+      <scan.CaptureField />
+      <div className="flex items-center gap-2">
+        <ScanInput onScan={check} placeholder="Or scan the item to check its warranty…" className="flex-1" />
+        {scan.native && (
+          <button className={scan.scanning ? 'btn-danger' : 'btn-secondary'} onClick={scan.toggle}>
+            {scan.scanning ? <Square size={14} /> : <Radio size={14} />}</button>)}
+      </div>
+      {busy && <div className="mt-2"><Spinner /></div>}
+      {!busy && res?.registered && (
+        <div className={`mt-2 flex items-center gap-2 rounded-lg px-3 py-2 text-sm ring-1 ${res.active
+          ? 'bg-emerald-50 ring-emerald-200 text-emerald-800' : 'bg-rose-50 ring-rose-200 text-rose-800'}`}>
+          {res.active ? <ShieldCheck size={16} /> : <ShieldX size={16} />}
+          <span className="font-medium">{res.active ? 'Under warranty' : 'Warranty expired'}</span>
+          <span className="text-xs opacity-80">
+            {res.warranty_name}{res.expires_at ? ` · until ${date(res.expires_at)}` : ''}</span>
+          {res.invoice_no && (
+            <button className="btn-ghost text-xs ml-auto" onClick={() => onSale(res.invoice_no)}>
+              Load {res.invoice_no} <ArrowRight size={12} /></button>)}
+        </div>)}
+      {!busy && res && !res.registered && (
+        <div className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500 ring-1 ring-slate-200">
+          No warranty on record for <span className="font-mono">{res.epc}</span>.</div>)}
     </div>
   );
 }

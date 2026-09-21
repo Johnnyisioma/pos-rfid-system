@@ -112,10 +112,78 @@ export async function bootstrap({ quiet = false } = {}) {
        ON CONFLICT DO NOTHING`,
       ['Retail', 'Standard walk-in pricing']);
 
+    // The units a footwear shop always reaches for. Rename or add freely.
+    for (const [name, short, dec] of [['Pair', 'pr', false], ['Piece', 'pc', false],
+                                      ['Box', 'box', false], ['Dozen', 'dz', false]]) {
+      await c.query(
+        `INSERT INTO units (name, short_name, allow_decimal) VALUES ($1,$2,$3)
+         ON CONFLICT DO NOTHING`, [name, short, dec]);
+    }
+    // The default retail price tier, so price-groups can be switched on without
+    // a blank screen.
+    await c.query(
+      `INSERT INTO price_groups (name, description) VALUES ('Retail', 'Standard shelf price')
+       ON CONFLICT DO NOTHING`);
+
     /* ---------- point the till account at this location ---------- */
     await c.query(
       `UPDATE payment_accounts SET location_id = $1
         WHERE type = 'cash' AND location_id IS NULL`, [locationId]);
+
+    /* ---------- chart of accounts (double-entry skeleton) ----------
+       Enough for a retail shop to produce a real balance sheet and P&L. The
+       engine posts to the accounts flagged is_system via account_mappings, so
+       these must exist before any sale is booked. Renamable, not deletable. */
+    const COA = [
+      // code, name, type, normal_balance, system, mapping_key
+      ['1000', 'Cash on hand',            'asset',     'debit',  true,  'cash'],
+      ['1010', 'Bank',                    'asset',     'debit',  true,  'bank'],
+      ['1100', 'Accounts receivable',     'asset',     'debit',  true,  'ar'],
+      ['1200', 'Inventory',               'asset',     'debit',  true,  'inventory'],
+      ['2000', 'Accounts payable',        'liability', 'credit', true,  'ap'],
+      ['2100', 'VAT payable',             'liability', 'credit', true,  'vat_payable'],
+      ['3000', 'Owner equity',            'equity',    'credit', true,  'equity'],
+      ['3900', 'Retained earnings',       'equity',    'credit', true,  'retained'],
+      ['4000', 'Sales income',            'income',    'credit', true,  'sales_income'],
+      ['4100', 'Sales returns',           'income',    'debit',  true,  'sales_returns'],
+      ['5000', 'Cost of goods sold',      'expense',   'debit',  true,  'cogs'],
+      ['6000', 'Operating expenses',      'expense',   'debit',  true,  'expense'],
+    ];
+    for (const [code, name, type, nb, sys, key] of COA) {
+      const { rows: acc } = await c.query(
+        `INSERT INTO chart_of_accounts (code, name, type, normal_balance, is_system)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (code) DO UPDATE SET is_system=EXCLUDED.is_system
+         RETURNING id`, [code, name, type, nb, sys]);
+      if (key) {
+        await c.query(
+          `INSERT INTO account_mappings (mapping_key, account_id) VALUES ($1,$2)
+           ON CONFLICT (mapping_key) DO UPDATE SET account_id=COALESCE(account_mappings.account_id, EXCLUDED.account_id)`,
+          [key, acc[0].id]);
+      }
+    }
+
+    /* ---------- a default receipt layout + notification templates ---------- */
+    const { rows: haveLayout } = await c.query('SELECT 1 FROM invoice_layouts LIMIT 1');
+    if (!haveLayout.length) {
+      await c.query(
+        `INSERT INTO invoice_layouts (name, doc_type, header_text, footer_text, is_default, paper)
+         VALUES ('Standard receipt','receipt','', 'Thank you for your patronage', TRUE, '80mm')`);
+      await c.query(
+        `INSERT INTO invoice_layouts (name, doc_type, header_text, footer_text, is_default, paper, show_customer, show_payment)
+         VALUES ('A4 invoice','invoice','', 'Goods remain our property until paid in full', TRUE, 'A4', TRUE, TRUE)`);
+    }
+    // The message templates a shop actually sends. {name} {invoice} {total}
+    // {balance} {link} {shop} are filled at send time.
+    for (const [key, channel, subject, body] of [
+      ['sale_complete', 'whatsapp', '', 'Hi {name}, thank you for shopping at {shop}! Your receipt {invoice} for {total} is here: {link}'],
+      ['payment_due', 'whatsapp', '', 'Hi {name}, a reminder from {shop}: {balance} is outstanding on invoice {invoice}. Thank you.'],
+      ['sale_complete', 'email', 'Your receipt from {shop}', 'Hi {name},\n\nThank you for your purchase. Your receipt {invoice} for {total} is attached / available at {link}.\n\n{shop}'],
+    ]) {
+      await c.query(
+        `INSERT INTO notification_templates (key, channel, subject, body)
+         VALUES ($1,$2,$3,$4) ON CONFLICT (key, channel) DO NOTHING`, [key, channel, subject, body]);
+    }
   });
 
   if (created.length) log(`created: ${created.join(', ')}`);
